@@ -1,5 +1,8 @@
 # ORBenchLab
 
+[![CI](https://github.com/OptHuang/ORBenchLab/actions/workflows/ci.yml/badge.svg)](https://github.com/OptHuang/ORBenchLab/actions/workflows/ci.yml)
+[![Integration contract](https://github.com/OptHuang/ORBenchLab/actions/workflows/integration-contract.yml/badge.svg)](https://github.com/OptHuang/ORBenchLab/actions/workflows/integration-contract.yml)
+
 A control plane for running operations-research agent benchmarks and reporting
 what they actually showed.
 
@@ -82,6 +85,26 @@ handles one shape is not an integration layer.
 `docs/integrations.md` has the full comparison, the exact secrets and runner
 labels, and the local smoke commands.
 
+## GitHub Actions readiness
+
+The zero-cost paths are live and observed on GitHub: the Python 3.11/3.13 CI
+matrix, both pinned-upstream contract inspections, ORAgentBench and FrontierOR
+`validate-only` smoke dispatches, and report rendering have all completed
+successfully. See [Actions](https://github.com/OptHuang/ORBenchLab/actions).
+
+Actual agent execution is intentionally not run on a shared GitHub-hosted
+machine. Configure the repository secret/variable listed below and attach a
+self-hosted runner with the required labels:
+
+| Integration | Repository configuration | Runner |
+| --- | --- | --- |
+| ORAgentBench | secret `MODEL_API_KEY`; variable `MODEL_BASE_URL` | `self-hosted`, `orbench-exec`; Docker + Harbor |
+| FrontierOR | secret `OPENROUTER_API_KEY` | the above plus `perf-isolated`, Gurobi licence, pinned cores and upstream images |
+
+Then dispatch `benchmark-smoke` with `mode=agent`, a pinned model id, and the
+literal acknowledgement `i-accept-model-costs`. The protected
+`benchmark-agent` environment adds a separate approval click before model spend.
+
 ## Evidence labels
 
 Every report carries one of three labels, and the renderer lowers it when its
@@ -108,11 +131,10 @@ absent one:
 * No ingest of raw job bundles into a warehouse. Reports are built from a small
   normalized slice; producing that slice from raw bundles is not yet implemented.
 * No durability verification, so no `validated` reports.
-* No observed hosted CI run, and no paid agent run. The workflows are
-  syntactically valid, their guards are unit-tested, and their steps have been
-  executed locally — including upstream's own dry run accepting the compiled
-  job config. Nobody has watched them execute on GitHub, and no model call has
-  been made from here.
+* No paid agent run has been performed from this repository. Hosted CI,
+  integration inspection, zero-cost smoke preflight and report rendering have
+  been observed; the self-hosted model-calling jobs remain deliberately
+  unexecuted until credentials, runner capabilities and cost approval exist.
 
 ## Repository layout
 
