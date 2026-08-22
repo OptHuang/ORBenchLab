@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/OptHuang/ORBenchLab/schemas/normalized_rollout.schema.json",
+  "title": "Normalized rollout slice",
+  "description": "Small, machine-readable slice of campaign results. This is what report.yml uploads and rebuilds from. Raw Harbor job bundles are never included: no trajectories, no verifier stdout, no hidden reference data.",
+  "type": "object",
+  "required": [
+    "normalized_schema_version",
+    "campaign_id",
+    "integration",
+    "evidence_intent",
+    "site",
+    "scoring",
+    "trials"
+  ],
+  "properties": {
+    "normalized_schema_version": { "type": "string", "const": "1.0" },
+    "campaign_id": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+    "integration": { "type": "string" },
+    "evidence_intent": { "type": "string", "enum": ["exploratory", "partial", "validated"] },
+    "site": {
+      "type": "object",
+      "required": ["name", "perf_isolated", "load_source"],
+      "properties": {
+        "name": { "type": "string" },
+        "perf_isolated": { "type": "boolean" },
+        "load_source": { "type": "string", "enum": ["external_supervisor", "none"] },
+        "cpus": { "type": ["integer", "null"] }
+      }
+    },
+    "scoring": {
+      "type": "object",
+      "required": ["reward_keys", "strict_pass_rule"],
+      "properties": {
+        "reward_keys": { "type": "array", "items": { "type": "string" } },
+        "strict_pass_rule": {
+          "type": "object",
+          "required": ["description", "feasibility_key", "quality_key", "quality_threshold"],
+          "properties": {
+            "description": { "type": "string" },
+            "feasibility_key": { "type": "string" },
+            "quality_key": { "type": "string" },
+            "quality_threshold": { "type": "number" }
+          }
+        }
+      }
+    },
+    "durability": {
+      "type": "object",
+      "properties": {
+        "min_replica_count": { "type": "integer", "minimum": 0 },
+        "verified": { "type": "boolean" }
+      }
+    },
+    "orphan_trials": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["trial_name", "reason"],
+        "properties": {
+          "trial_name": { "type": "string" },
+          "reason": { "type": "string" }
+        }
+      }
+    },
+    "trials": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "run_id",
+          "task_name",
+          "agent_id",
+          "scaffold",
+          "seed",
+          "attempt",
+          "attribution",
+          "counts_toward_capability",
+          "infra_suspect",
+          "trace_status",
+          "scores"
+        ],
+        "properties": {
+          "run_id": { "type": "string", "pattern": "^[0-9a-f]{16}$" },
+          "task_name": { "type": "string" },
+          "agent_id": { "type": "string" },
+          "scaffold": { "type": "string" },
+          "seed": { "type": "integer" },
+          "attempt": { "type": "integer", "minimum": 1 },
+          "attribution": {
+            "type": "string",
+            "enum": ["agent", "task", "verifier", "infra", "provider", "unknown"]
+          },
+          "counts_toward_capability": { "type": "boolean" },
+          "infra_suspect": { "type": "boolean" },
+          "exclusion_basis": {
+            "type": ["string", "null"],
+            "enum": [
+              "hard_infra_evidence",
+              "repetition_controlled",
+              "provider_or_verifier_error",
+              null
+            ]
+          },
+          "trace_status": { "type": "string", "enum": ["complete", "partial", "missing"] },
+          "replica_count": { "type": "integer", "minimum": 0 },
+          "cost_usd": { "type": "number", "minimum": 0 },
+          "scores": {
+            "type": "object",
+            "description": "Numeric reward keys as emitted by the upstream verifier. Keys are not renamed here.",
+            "properties": {
+              "feasibility": { "type": "number" },
+              "quality": { "type": "number" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

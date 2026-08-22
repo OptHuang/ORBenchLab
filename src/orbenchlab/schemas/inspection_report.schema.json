@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/OptHuang/ORBenchLab/schemas/inspection_report.schema.json",
+  "title": "Integration inspection report",
+  "description": "Output of 'orbench integration inspect'. A static read of an upstream checkout: no model calls, no benchmark execution.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "integration",
+    "integration_kind",
+    "source",
+    "status",
+    "counts",
+    "execution",
+    "checks",
+    "facts",
+    "decisions"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "integration": { "type": "string" },
+    "integration_kind": {
+      "type": "string",
+      "enum": ["harbor-native", "official-external-harness", "harbor-adapter"]
+    },
+    "source": { "type": "string" },
+    "source_revision": { "type": "object" },
+    "status": { "type": "string", "enum": ["ok", "degraded", "failed"] },
+    "counts": {
+      "type": "object",
+      "required": ["pass", "fail", "warn", "skip"],
+      "properties": {
+        "pass": { "type": "integer", "minimum": 0 },
+        "fail": { "type": "integer", "minimum": 0 },
+        "warn": { "type": "integer", "minimum": 0 },
+        "skip": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "required": ["model_calls", "benchmark_executed", "network_access", "reads_credentials"],
+      "properties": {
+        "model_calls": { "type": "integer", "minimum": 0, "maximum": 0 },
+        "benchmark_executed": { "type": "boolean", "const": false },
+        "network_access": { "type": "boolean", "const": false },
+        "reads_credentials": { "type": "boolean", "const": false }
+      }
+    },
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "status", "detail", "evidence"],
+        "properties": {
+          "id": { "type": "string" },
+          "status": { "type": "string", "enum": ["pass", "fail", "warn", "skip"] },
+          "detail": { "type": "string" },
+          "evidence": { "type": "object" }
+        }
+      }
+    },
+    "facts": { "type": "object" },
+    "decisions": { "type": "object" }
+  }
+}

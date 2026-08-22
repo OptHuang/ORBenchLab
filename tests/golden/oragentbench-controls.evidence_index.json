@@ -1,0 +1,265 @@
+{
+  "campaign_id": "oragentbench-controls-20260822-7a6d8ee1",
+  "claims": [
+    {
+      "claim_id": "C001",
+      "definition": "count(feasibility >= 1) / count(capability trials)",
+      "evidence_grade": "E-V",
+      "metric": "feasibility_rate",
+      "repetition_class": "R0",
+      "run_ids": [
+        "0c7fc04b30865917",
+        "142a991ec1d791d9",
+        "1ba0b62afd776251",
+        "4612e9d18d66e9c2",
+        "6c57962b2ac50194",
+        "752887f0f699ed6e",
+        "b481ef1ce1f85e9c",
+        "fda64fef4d8d194a"
+      ],
+      "strength": "E-V/R0",
+      "supports_comparison": false,
+      "value": 0.0
+    },
+    {
+      "claim_id": "C002",
+      "definition": "strict pass = feasibility >= 1 and quality >= 1.0, where quality is the upstream ORAgentBench reward key (0-2, 1.0 means the reference objective was matched)",
+      "evidence_grade": "E-V",
+      "metric": "strict_pass_rate",
+      "repetition_class": "R0",
+      "run_ids": [
+        "0c7fc04b30865917",
+        "142a991ec1d791d9",
+        "1ba0b62afd776251",
+        "4612e9d18d66e9c2",
+        "6c57962b2ac50194",
+        "752887f0f699ed6e",
+        "b481ef1ce1f85e9c",
+        "fda64fef4d8d194a"
+      ],
+      "strength": "E-V/R0",
+      "supports_comparison": false,
+      "value": 0.0
+    },
+    {
+      "claim_id": "C003",
+      "definition": "mean(quality) over trials with feasibility >= 1",
+      "evidence_grade": "E-V",
+      "metric": "mean_quality_when_feasible",
+      "repetition_class": "R0",
+      "run_ids": [
+        "0c7fc04b30865917",
+        "142a991ec1d791d9",
+        "1ba0b62afd776251",
+        "4612e9d18d66e9c2",
+        "6c57962b2ac50194",
+        "752887f0f699ed6e",
+        "b481ef1ce1f85e9c",
+        "fda64fef4d8d194a"
+      ],
+      "strength": "E-V/R0",
+      "supports_comparison": false,
+      "value": null
+    },
+    {
+      "claim_id": "C004",
+      "definition": "sum(cost_usd) / count(strict pass)",
+      "evidence_grade": "E-V",
+      "metric": "cost_per_strict_pass_usd",
+      "repetition_class": "R0",
+      "run_ids": [
+        "0c7fc04b30865917",
+        "142a991ec1d791d9",
+        "1ba0b62afd776251",
+        "4612e9d18d66e9c2",
+        "6c57962b2ac50194",
+        "752887f0f699ed6e",
+        "b481ef1ce1f85e9c",
+        "fda64fef4d8d194a"
+      ],
+      "strength": "E-V/R0",
+      "supports_comparison": false,
+      "value": null
+    },
+    {
+      "claim_id": "C005",
+      "definition": "count(feasibility >= 1) / count(capability trials)",
+      "evidence_grade": "E-V",
+      "metric": "feasibility_rate",
+      "repetition_class": "R1",
+      "run_ids": [
+        "14606cb212837f2e",
+        "245ebfcd8856bfa0",
+        "62f75181b1ecaf18",
+        "70fc971b131f4760",
+        "a76861434bc5535e",
+        "ca45171464d5dc38",
+        "db9699a598107f82",
+        "ef1b959f66fd5cdb",
+        "ff0cf18c4f5279e8"
+      ],
+      "strength": "E-V/R1",
+      "supports_comparison": true,
+      "value": 1.0
+    },
+    {
+      "claim_id": "C006",
+      "definition": "strict pass = feasibility >= 1 and quality >= 1.0, where quality is the upstream ORAgentBench reward key (0-2, 1.0 means the reference objective was matched)",
+      "evidence_grade": "E-V",
+      "metric": "strict_pass_rate",
+      "repetition_class": "R1",
+      "run_ids": [
+        "14606cb212837f2e",
+        "245ebfcd8856bfa0",
+        "62f75181b1ecaf18",
+        "70fc971b131f4760",
+        "a76861434bc5535e",
+        "ca45171464d5dc38",
+        "db9699a598107f82",
+        "ef1b959f66fd5cdb",
+        "ff0cf18c4f5279e8"
+      ],
+      "strength": "E-V/R1",
+      "supports_comparison": true,
+      "value": 1.0
+    },
+    {
+      "claim_id": "C007",
+      "definition": "mean(quality) over trials with feasibility >= 1",
+      "evidence_grade": "E-V",
+      "metric": "mean_quality_when_feasible",
+      "repetition_class": "R1",
+      "run_ids": [
+        "14606cb212837f2e",
+        "245ebfcd8856bfa0",
+        "62f75181b1ecaf18",
+        "70fc971b131f4760",
+        "a76861434bc5535e",
+        "ca45171464d5dc38",
+        "db9699a598107f82",
+        "ef1b959f66fd5cdb",
+        "ff0cf18c4f5279e8"
+      ],
+      "strength": "E-V/R1",
+      "supports_comparison": true,
+      "value": 1.138889
+    },
+    {
+      "claim_id": "C008",
+      "definition": "sum(cost_usd) / count(strict pass)",
+      "evidence_grade": "E-V",
+      "metric": "cost_per_strict_pass_usd",
+      "repetition_class": "R1",
+      "run_ids": [
+        "14606cb212837f2e",
+        "245ebfcd8856bfa0",
+        "62f75181b1ecaf18",
+        "70fc971b131f4760",
+        "a76861434bc5535e",
+        "ca45171464d5dc38",
+        "db9699a598107f82",
+        "ef1b959f66fd5cdb",
+        "ff0cf18c4f5279e8"
+      ],
+      "strength": "E-V/R1",
+      "supports_comparison": true,
+      "value": 0.0
+    },
+    {
+      "claim_id": "C009",
+      "definition": "count(oracle strict pass) / count(oracle trials); a healthy task set is 1.0",
+      "evidence_grade": "E-V",
+      "metric": "oracle_pass_rate",
+      "repetition_class": "R1",
+      "run_ids": [
+        "14606cb212837f2e",
+        "245ebfcd8856bfa0",
+        "62f75181b1ecaf18",
+        "70fc971b131f4760",
+        "a76861434bc5535e",
+        "ca45171464d5dc38",
+        "db9699a598107f82",
+        "ef1b959f66fd5cdb",
+        "ff0cf18c4f5279e8"
+      ],
+      "strength": "E-V/R1",
+      "supports_comparison": true,
+      "value": 1.0
+    },
+    {
+      "claim_id": "C010",
+      "definition": "count(nop non-pass) / count(nop trials); a task passable by doing nothing is broken",
+      "evidence_grade": "E-V",
+      "metric": "nop_fail_rate",
+      "repetition_class": "R1",
+      "run_ids": [
+        "0c7fc04b30865917",
+        "142a991ec1d791d9",
+        "1ba0b62afd776251",
+        "4612e9d18d66e9c2",
+        "6c57962b2ac50194",
+        "752887f0f699ed6e",
+        "a75cedf3d7a14cb4",
+        "b481ef1ce1f85e9c",
+        "fda64fef4d8d194a"
+      ],
+      "strength": "E-V/R1",
+      "supports_comparison": true,
+      "value": 1.0
+    },
+    {
+      "claim_id": "C011",
+      "definition": "count(infra_suspect) / count(trials); these trials stay in the capability denominator — a soft signal lowers confidence, it does not reassign blame",
+      "evidence_grade": "E-T",
+      "metric": "infra_suspect_share",
+      "repetition_class": "R0",
+      "run_ids": [
+        "0c7fc04b30865917",
+        "142a991ec1d791d9",
+        "14606cb212837f2e",
+        "1ba0b62afd776251",
+        "245ebfcd8856bfa0",
+        "4612e9d18d66e9c2",
+        "62f75181b1ecaf18",
+        "6c57962b2ac50194",
+        "70fc971b131f4760",
+        "752887f0f699ed6e",
+        "a75cedf3d7a14cb4",
+        "a76861434bc5535e",
+        "b481ef1ce1f85e9c",
+        "ca45171464d5dc38",
+        "db9699a598107f82",
+        "ef1b959f66fd5cdb",
+        "fda64fef4d8d194a",
+        "ff0cf18c4f5279e8"
+      ],
+      "strength": "E-T/R0",
+      "supports_comparison": false,
+      "value": 0.0
+    },
+    {
+      "claim_id": "C012",
+      "definition": "count(trials with no plan-ledger match)",
+      "evidence_grade": "E-T",
+      "metric": "orphan_trial_count",
+      "repetition_class": "R0",
+      "run_ids": [],
+      "strength": "E-T/R0",
+      "supports_comparison": false,
+      "value": 1.0
+    },
+    {
+      "claim_id": "C013",
+      "definition": "share of trials with load_source = 'none'; with no sampler there are no soft infrastructure signals and infra_suspect is always false",
+      "evidence_grade": "E-T",
+      "metric": "no_load_sampling_share",
+      "repetition_class": "R0",
+      "run_ids": [],
+      "strength": "E-T/R0",
+      "supports_comparison": false,
+      "value": 1.0
+    }
+  ],
+  "evidence_index_schema_version": "1.0",
+  "source": "oragentbench-controls.json"
+}

@@ -1,0 +1,135 @@
+name: report
+
+# Rebuilds a report from a small normalized slice. GitHub-hosted, no secrets,
+# no model calls, no benchmark execution — rendering a report is pure
+# computation over data that was already produced elsewhere.
+#
+# The input is a normalized slice: run ids, attributions, numeric reward keys.
+# Raw Harbor job bundles, agent trajectories, verifier stdout and hidden
+# reference data never enter this workflow. A guard step below enforces that on
+# the actual bytes rather than trusting the uploader.
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_run_id:
+        description: >-
+          Run id of the workflow run holding a "normalized-slice" artifact.
+          Leave empty to rebuild from the repository fixtures.
+        required: false
+        default: ""
+      require_label:
+        description: Fail if the effective evidence label is weaker than this
+        required: false
+        default: exploratory
+        type: choice
+        options: [exploratory, partial, validated]
+  workflow_run:
+    workflows: [benchmark-smoke]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: report-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Download the normalized slice
+        if: inputs.artifact_run_id != ''
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: normalized-slice
+          path: incoming
+          run-id: ${{ inputs.artifact_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Select the input
+        id: select
+        run: |
+          set -euo pipefail
+          mkdir -p incoming
+          if [ -n "$(find incoming -name '*.json' -print -quit)" ]; then
+            echo "source=downloaded" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::no uploaded slice; rebuilding from repository fixtures"
+            cp fixtures/normalized/*.json incoming/
+            echo "source=fixtures" >> "$GITHUB_OUTPUT"
+          fi
+          ls -la incoming
+
+      - name: Guard — reject raw bundle content in the input
+        run: |
+          set -euo pipefail
+          # A normalized slice is small and structured. If any of these appear,
+          # something uploaded raw evidence into a public artifact path.
+          forbidden='trajectory.json|test-stdout|test-stderr|reference_metrics|reference_objective|reference_runtime|BEGIN [A-Z ]*PRIVATE KEY'
+          failed=0
+          for file in incoming/*.json; do
+            size=$(wc -c < "$file")
+            if [ "$size" -gt 5242880 ]; then
+              echo "::error::$file is ${size} bytes; a normalized slice is kilobytes, not megabytes"
+              failed=1
+            fi
+            if grep -REl "$forbidden" "$file" >/dev/null 2>&1; then
+              echo "::error::$file contains raw bundle or hidden verifier content"
+              failed=1
+            fi
+          done
+          [ "$failed" -eq 0 ] || exit 1
+
+      - name: Validate each slice against the published schema
+        run: |
+          set -euo pipefail
+          for file in incoming/*.json; do
+            orbench schema validate "$file" --schema normalized_rollout.schema.json
+          done
+
+      - name: Build the reports
+        run: |
+          set -euo pipefail
+          mkdir -p out/reports
+          for file in incoming/*.json; do
+            name=$(basename "$file" .json)
+            orbench report build \
+              --input "$file" \
+              --out "out/reports/$name" \
+              --require-label "${{ inputs.require_label || 'exploratory' }}"
+          done
+
+      - name: Show the labels the evidence actually supports
+        run: |
+          set -euo pipefail
+          for summary in out/reports/*/summary.json; do
+            python -c "
+          import json, sys
+          data = json.load(open('$summary'))
+          evidence = data['evidence']
+          print(f\"{data['campaign_id']}: {evidence['effective_label']} (intended {evidence['intended_label']})\")
+          for reason in evidence['downgrade_reasons']:
+              print(f'  downgraded: {reason}')
+          "
+          done
+
+      - name: Upload the rendered reports
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: reports
+          path: out/reports
+          retention-days: 90
+          if-no-files-found: error

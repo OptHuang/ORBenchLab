@@ -1,0 +1,151 @@
+{
+  "_note": "Synthetic scores over real planner output. One rollout per configuration: asks for 'partial' but every measurement is R0, so the report renders as 'exploratory' and comparative wording is rejected.",
+  "campaign_id": "oragentbench-smoke-20260822-9f68d0e2",
+  "durability": {
+    "min_replica_count": 2,
+    "verified": true
+  },
+  "evidence_intent": "partial",
+  "integration": "oragentbench",
+  "normalized_schema_version": "1.0",
+  "orphan_trials": [
+    {
+      "reason": "no plan-ledger match_key; recorded, excluded from the capability denominator",
+      "trial_name": "airport_gate_assignment__k7Qm2Xz"
+    }
+  ],
+  "scoring": {
+    "reward_keys": [
+      "feasibility",
+      "quality"
+    ],
+    "strict_pass_rule": {
+      "description": "strict pass = feasibility >= 1 and quality >= 1.0, where quality is the upstream ORAgentBench reward key (0-2, 1.0 means the reference objective was matched)",
+      "feasibility_key": "feasibility",
+      "quality_key": "quality",
+      "quality_threshold": 1.0
+    }
+  },
+  "site": {
+    "cpus": 4,
+    "load_source": "none",
+    "name": "local-docker",
+    "perf_isolated": false
+  },
+  "trials": [
+    {
+      "agent_id": "nop",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 2,
+      "run_id": "4e2ee2ee250bc2c5",
+      "scaffold": "nop",
+      "scores": {
+        "feasibility": 0.0,
+        "quality": 0.0
+      },
+      "seed": 1,
+      "task_name": "additive_microfactory_order_planning",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "nop",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 2,
+      "run_id": "ec18641720640136",
+      "scaffold": "nop",
+      "scores": {
+        "feasibility": 0.0,
+        "quality": 0.0
+      },
+      "seed": 1,
+      "task_name": "airport_gate_assignment",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "nop",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 2,
+      "run_id": "ebe09e9c83e8191c",
+      "scaffold": "nop",
+      "scores": {
+        "feasibility": 0.0,
+        "quality": 0.0
+      },
+      "seed": 1,
+      "task_name": "bike_share_rebalancing",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "oracle",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 2,
+      "run_id": "75b6ef8772c3489e",
+      "scaffold": "oracle",
+      "scores": {
+        "feasibility": 1.0,
+        "quality": 1.0
+      },
+      "seed": 1,
+      "task_name": "additive_microfactory_order_planning",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "oracle",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 2,
+      "run_id": "cbd5979b1b45c3c2",
+      "scaffold": "oracle",
+      "scores": {
+        "feasibility": 1.0,
+        "quality": 1.42
+      },
+      "seed": 1,
+      "task_name": "airport_gate_assignment",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "oracle",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 2,
+      "run_id": "076ab0beb040ce16",
+      "scaffold": "oracle",
+      "scores": {
+        "feasibility": 1.0,
+        "quality": 1.0
+      },
+      "seed": 1,
+      "task_name": "bike_share_rebalancing",
+      "trace_status": "complete"
+    }
+  ]
+}

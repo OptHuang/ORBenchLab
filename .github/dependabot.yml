@@ -1,0 +1,23 @@
+# Actions are pinned to commit shas, which is what keeps CI from having a
+# remotely-rewritable entry point. Dependabot is how those pins get updated:
+# each bump arrives as a reviewable pull request rather than as a tag that
+# silently moved underneath us.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+      - github-actions
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies

@@ -1,0 +1,20 @@
+# Template for a performance-isolated site. Copy to sites/<your-site>.yaml and
+# fill in real values before pointing a performance-scored campaign at it.
+#
+# perf_isolated: true is an assertion about the machine, and campaign validation
+# takes it at face value. Only set it when all of the following hold:
+#   * cores are pinned for the run and nothing else is scheduled on them
+#   * no other benchmark, build or container shares those cores
+#   * concurrency is at most the number of physical cores
+#   * the declared solver licence slots really are available
+name: perf-isolated-example
+perf_isolated: true
+cpus: 1
+memory_mb: 65536
+solver_license_slots: 1
+runner_labels: [self-hosted, orbench-exec, perf-isolated]
+notes: >-
+  FrontierOR scores a speed term against a reference runtime measured on a
+  single pinned core. Any site claiming perf_isolated must reproduce those
+  conditions; if it cannot, run the campaign as exploratory instead of
+  pretending the timing is official.

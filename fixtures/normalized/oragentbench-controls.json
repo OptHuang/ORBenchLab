@@ -1,0 +1,376 @@
+{
+  "_note": "Synthetic scores over real planner output. Exercises the durability gate: the campaign asks for 'validated' but only one replica exists, so the report renders as 'partial'.",
+  "campaign_id": "oragentbench-controls-20260822-7a6d8ee1",
+  "durability": {
+    "min_replica_count": 1,
+    "verified": false
+  },
+  "evidence_intent": "validated",
+  "integration": "oragentbench",
+  "normalized_schema_version": "1.0",
+  "orphan_trials": [
+    {
+      "reason": "no plan-ledger match_key; recorded, excluded from the capability denominator",
+      "trial_name": "airport_gate_assignment__k7Qm2Xz"
+    }
+  ],
+  "scoring": {
+    "reward_keys": [
+      "feasibility",
+      "quality"
+    ],
+    "strict_pass_rule": {
+      "description": "strict pass = feasibility >= 1 and quality >= 1.0, where quality is the upstream ORAgentBench reward key (0-2, 1.0 means the reference objective was matched)",
+      "feasibility_key": "feasibility",
+      "quality_key": "quality",
+      "quality_threshold": 1.0
+    }
+  },
+  "site": {
+    "cpus": 4,
+    "load_source": "none",
+    "name": "local-docker",
+    "perf_isolated": false
+  },
+  "trials": [
+    {
+      "agent_id": "nop",
+      "attempt": 1,
+      "attribution": "infra",
+      "cost_usd": 0.0,
+      "counts_toward_capability": false,
+      "exclusion_basis": "hard_infra_evidence",
+      "infra_suspect": false,
+      "replica_count": 1,
+      "run_id": "a75cedf3d7a14cb4",
+      "scaffold": "nop",
+      "scores": {},
+      "seed": 1,
+      "task_name": "additive_microfactory_order_planning",
+      "trace_status": "missing"
+    },
+    {
+      "agent_id": "nop",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 1,
+      "run_id": "fda64fef4d8d194a",
+      "scaffold": "nop",
+      "scores": {
+        "feasibility": 0.0,
+        "quality": 0.0
+      },
+      "seed": 1,
+      "task_name": "airport_gate_assignment",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "nop",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 1,
+      "run_id": "b481ef1ce1f85e9c",
+      "scaffold": "nop",
+      "scores": {
+        "feasibility": 0.0,
+        "quality": 0.0
+      },
+      "seed": 1,
+      "task_name": "bike_share_rebalancing",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "nop",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 1,
+      "run_id": "752887f0f699ed6e",
+      "scaffold": "nop",
+      "scores": {
+        "feasibility": 0.0,
+        "quality": 0.0
+      },
+      "seed": 2,
+      "task_name": "additive_microfactory_order_planning",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "nop",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 1,
+      "run_id": "6c57962b2ac50194",
+      "scaffold": "nop",
+      "scores": {
+        "feasibility": 0.0,
+        "quality": 0.0
+      },
+      "seed": 2,
+      "task_name": "airport_gate_assignment",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "nop",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 1,
+      "run_id": "142a991ec1d791d9",
+      "scaffold": "nop",
+      "scores": {
+        "feasibility": 0.0,
+        "quality": 0.0
+      },
+      "seed": 2,
+      "task_name": "bike_share_rebalancing",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "nop",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 1,
+      "run_id": "1ba0b62afd776251",
+      "scaffold": "nop",
+      "scores": {
+        "feasibility": 0.0,
+        "quality": 0.0
+      },
+      "seed": 3,
+      "task_name": "additive_microfactory_order_planning",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "nop",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 1,
+      "run_id": "4612e9d18d66e9c2",
+      "scaffold": "nop",
+      "scores": {
+        "feasibility": 0.0,
+        "quality": 0.0
+      },
+      "seed": 3,
+      "task_name": "airport_gate_assignment",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "nop",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 1,
+      "run_id": "0c7fc04b30865917",
+      "scaffold": "nop",
+      "scores": {
+        "feasibility": 0.0,
+        "quality": 0.0
+      },
+      "seed": 3,
+      "task_name": "bike_share_rebalancing",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "oracle",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 1,
+      "run_id": "14606cb212837f2e",
+      "scaffold": "oracle",
+      "scores": {
+        "feasibility": 1.0,
+        "quality": 1.0
+      },
+      "seed": 1,
+      "task_name": "additive_microfactory_order_planning",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "oracle",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 1,
+      "run_id": "ff0cf18c4f5279e8",
+      "scaffold": "oracle",
+      "scores": {
+        "feasibility": 1.0,
+        "quality": 1.42
+      },
+      "seed": 1,
+      "task_name": "airport_gate_assignment",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "oracle",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 1,
+      "run_id": "ef1b959f66fd5cdb",
+      "scaffold": "oracle",
+      "scores": {
+        "feasibility": 1.0,
+        "quality": 1.0
+      },
+      "seed": 1,
+      "task_name": "bike_share_rebalancing",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "oracle",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 1,
+      "run_id": "62f75181b1ecaf18",
+      "scaffold": "oracle",
+      "scores": {
+        "feasibility": 1.0,
+        "quality": 1.0
+      },
+      "seed": 2,
+      "task_name": "additive_microfactory_order_planning",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "oracle",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 1,
+      "run_id": "245ebfcd8856bfa0",
+      "scaffold": "oracle",
+      "scores": {
+        "feasibility": 1.0,
+        "quality": 1.42
+      },
+      "seed": 2,
+      "task_name": "airport_gate_assignment",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "oracle",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 1,
+      "run_id": "70fc971b131f4760",
+      "scaffold": "oracle",
+      "scores": {
+        "feasibility": 1.0,
+        "quality": 1.0
+      },
+      "seed": 2,
+      "task_name": "bike_share_rebalancing",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "oracle",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 1,
+      "run_id": "db9699a598107f82",
+      "scaffold": "oracle",
+      "scores": {
+        "feasibility": 1.0,
+        "quality": 1.0
+      },
+      "seed": 3,
+      "task_name": "additive_microfactory_order_planning",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "oracle",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 1,
+      "run_id": "ca45171464d5dc38",
+      "scaffold": "oracle",
+      "scores": {
+        "feasibility": 1.0,
+        "quality": 1.41
+      },
+      "seed": 3,
+      "task_name": "airport_gate_assignment",
+      "trace_status": "complete"
+    },
+    {
+      "agent_id": "oracle",
+      "attempt": 1,
+      "attribution": "agent",
+      "cost_usd": 0.0,
+      "counts_toward_capability": true,
+      "exclusion_basis": null,
+      "infra_suspect": false,
+      "replica_count": 1,
+      "run_id": "a76861434bc5535e",
+      "scaffold": "oracle",
+      "scores": {
+        "feasibility": 1.0,
+        "quality": 1.0
+      },
+      "seed": 3,
+      "task_name": "bike_share_rebalancing",
+      "trace_status": "complete"
+    }
+  ]
+}

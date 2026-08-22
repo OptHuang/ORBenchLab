@@ -1,0 +1,70 @@
+# FrontierOR contract check.
+#
+# This spec exists to be *rejected* against a shared site, and that rejection is
+# the point. FrontierOR's score contains a speed term measured as trusted-host
+# wall clock, so campaign validation refuses to plan it anywhere that has not
+# declared perf_isolated: true.
+#
+#   # fails, with the reason stated:
+#   orbench campaign validate campaigns/frontieror-contract-check.yaml
+#
+#   # succeeds only against a site you have actually isolated:
+#   cp sites/perf-isolated.example.yaml sites/my-perf-site.yaml   # then edit it
+#   # ...and set `site: my-perf-site` below
+#
+# The zero-cost path that needs no site at all is the contract inspection:
+#   orbench integration inspect frontieror --source <FrontierOR checkout>
+schema_version: "1.0"
+slug: frontieror-contract-check
+date: "2026-08-22"
+integration: frontieror
+# Deliberately a shared site. Change this only for a machine whose cores you
+# have actually pinned.
+site: local-docker
+evidence_intent: exploratory
+
+dataset:
+  # PLACEHOLDER — all-zero digest. Replace with the real digest of your local
+  # FrontierOR dataset before running anything; validation only checks the
+  # shape, so an unreplaced placeholder produces run ids pinned to nothing.
+  #
+  # The official final instances are unpublished server-only data. What is
+  # downloadable from HuggingFace is suitable for local integration tests, not
+  # for leaderboard scoring, so this can only ever pin a local dataset.
+  path: frontier-or
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+tasks:
+  - bierwirth2017
+
+agents:
+  - id: oneshot-pinned
+    scaffold: codex
+    scaffold_version: "0.1"
+    model: openai/gpt-5.3-codex
+    # PLACEHOLDER — replace with the digest of the prompt you actually used.
+    prompt_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    tool_policy:
+      disallowed_tools: [WebSearch, WebFetch]
+    # Names only. Values never appear in a spec, a plan, a ledger or a job
+    # config; the compiler emits ${NAME} placeholders.
+    env_keys: [OPENROUTER_API_KEY, GRB_LICENSE_FILE]
+
+budget:
+  wall_clock_sec: 3600
+  max_cost_usd: 25
+
+seeds: [1]
+attempts: 1
+shards: 1
+
+harbor:
+  jobs_dir: jobs
+  n_concurrent_trials: 1
+  environment_type: docker
+
+retry:
+  max_retries: 0
+  include_exceptions: []
+
+metrics: []

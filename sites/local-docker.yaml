@@ -1,0 +1,12 @@
+# A developer machine or a plain self-hosted runner. Fine for correctness work,
+# unusable for anything whose score contains a runtime term.
+name: local-docker
+perf_isolated: false
+cpus: 4
+memory_mb: 8192
+solver_license_slots: 0
+runner_labels: [self-hosted, orbench-exec]
+notes: >-
+  Shared, co-tenanted host. Campaign validation rejects performance-scored
+  integrations here, because a wall-clock number measured on a shared machine is
+  not comparable to one measured anywhere else.

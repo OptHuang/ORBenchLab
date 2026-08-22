@@ -1,0 +1,142 @@
+name: integration-contract
+
+# Clones the pinned upstream commits and inspects both integrations. Static
+# reads only: no secrets, no model calls, no benchmark execution, no containers.
+#
+# This is the workflow that catches upstream drift. When an upstream change
+# breaks an assumption an integration depends on, it surfaces here as a failed
+# check rather than as a wrong number in a report months later.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "src/orbenchlab/integrations/**"
+      - "campaigns/**"
+      - "sites/**"
+      - ".github/workflows/integration-contract.yml"
+  schedule:
+    # Weekly, so drift is found on a schedule rather than by accident.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: >-
+          Override the pinned commit for the selected integration (drift check).
+          Leave empty to use the pin recorded in the integration module.
+        required: false
+        default: ""
+      integration:
+        description: Integration to override the ref for
+        required: false
+        default: oragentbench
+        type: choice
+        options: [oragentbench, frontieror]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-contract-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Directory names are load-bearing: ORAgentBench resolves its
+          # dataset path against the checkout's parent.
+          - integration: oragentbench
+            checkout_dir: ORAgentBench
+          - integration: frontieror
+            checkout_dir: FrontierOR
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Clone upstream at the pinned commit
+        run: |
+          set -euo pipefail
+          bash .github/scripts/clone-upstream.sh \
+            "${{ matrix.integration }}" upstream "${{ inputs.integration == matrix.integration && inputs.upstream_ref || '' }}"
+
+      - name: Inspect
+        id: inspect
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          orbench integration inspect ${{ matrix.integration }} \
+            --source upstream/${{ matrix.checkout_dir }} \
+            --json out/${{ matrix.integration }}-inspection.json > /dev/null
+          python - <<'PY'
+          import json, os, sys
+          path = f"out/{os.environ['INTEGRATION']}-inspection.json"
+          report = json.load(open(path))
+          print(f"status: {report['status']}  counts: {report['counts']}")
+          for check in report["checks"]:
+              print(f"  [{check['status']:>4}] {check['id']}: {check['detail']}")
+          # Inspection must remain a static read. If this ever changes, the
+          # workflow's whole "no secrets, no cost" premise is void.
+          assert report["execution"] == {
+              "model_calls": 0,
+              "benchmark_executed": False,
+              "network_access": False,
+              "reads_credentials": False,
+          }, report["execution"]
+          if report["status"] == "failed":
+              failed = [c["id"] for c in report["checks"] if c["status"] == "fail"]
+              print(f"::error::{os.environ['INTEGRATION']} inspection failed: {failed}")
+              sys.exit(1)
+          for check in report["checks"]:
+              if check["status"] == "warn":
+                  print(f"::warning::{check['id']}: {check['detail']}")
+          PY
+        env:
+          INTEGRATION: ${{ matrix.integration }}
+
+      - name: Assert the integration decision has not silently changed
+        env:
+          INTEGRATION: ${{ matrix.integration }}
+        run: |
+          python - <<'PY'
+          import json, os, sys
+          integration = os.environ["INTEGRATION"]
+          report = json.load(open(f"out/{integration}-inspection.json"))
+          decisions = report["decisions"]
+          expected = {
+              # ORAgentBench is Harbor-native: no adapter, no second task copy.
+              "oragentbench": {"adapter_required": False},
+              # FrontierOR wraps the official harness until conversion is
+              # demonstrably parity-safe.
+              "frontieror": {
+                  "adapter_required": False,
+                  "harbor_tasks_materialized": False,
+                  "integration_form": "official-external-harness",
+              },
+          }[integration]
+          for key, value in expected.items():
+              if decisions.get(key) != value:
+                  print(f"::error::{integration}: decision {key} is {decisions.get(key)!r}, expected {value!r}")
+                  sys.exit(1)
+          print(f"{integration}: integration decisions unchanged")
+          PY
+
+      - name: Upload inspection report
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        if: always()
+        with:
+          name: inspection-${{ matrix.integration }}
+          path: out/${{ matrix.integration }}-inspection.json
+          retention-days: 14
+          if-no-files-found: error

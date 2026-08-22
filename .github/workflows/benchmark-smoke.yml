@@ -1,0 +1,457 @@
+name: benchmark-smoke
+
+# Manual only. There is no scheduled or push trigger here on purpose: a
+# workflow that can spend money or occupy a licensed machine should start with
+# a person deciding to start it.
+#
+# Four paths, in increasing order of what they need:
+#
+#   validate-only      zero cost, GitHub-hosted. Clones the pinned upstream,
+#                      validates the inputs, compiles the plan and builds the
+#                      exact upstream command — without running it.
+#   oracle-controls    zero *model* cost, self-hosted. `harbor run -c` with
+#                      Harbor's built-in oracle/nop agents. Needs a runner and
+#                      Docker; no model key.
+#   agent (oragentbench)  real cost. Runs upstream's own Harbor wrapper.
+#   agent (frontieror)    real cost. Runs upstream's official trusted-agent
+#                      entry point, and only on a performance-isolated runner.
+#
+# Every precondition fails closed. A missing secret, licence, image, runner or
+# isolation guarantee stops the job; nothing degrades into a run that looks
+# successful. Command construction lives in `orbenchlab.execution` and is unit
+# tested, so what runs here is what the tests asserted.
+on:
+  workflow_dispatch:
+    inputs:
+      integration:
+        description: Integration to smoke
+        required: true
+        default: oragentbench
+        type: choice
+        options: [oragentbench, frontieror]
+      mode:
+        description: What to actually do
+        required: true
+        default: validate-only
+        type: choice
+        options: [validate-only, oracle-controls, agent]
+      campaign:
+        description: Campaign spec for oracle-controls
+        required: false
+        default: campaigns/oragentbench-controls.yaml
+      task:
+        description: >-
+          ORAgentBench: task directory name under harbor_tasks/, validated
+          against the pinned checkout.
+        required: false
+        default: additive_microfactory_order_planning
+      scaffold:
+        description: "ORAgentBench: agent scaffold"
+        required: false
+        default: claude-code
+        type: choice
+        options: [claude-code, codex, mini-swe-agent]
+      model:
+        description: "ORAgentBench: exact pinned model id (no floating aliases)"
+        required: false
+        default: ""
+      campaign_date:
+        description: Campaign date, YYYY-MM-DD. Campaign ids derive from it.
+        required: true
+        default: "2026-08-22"
+      paper_id:
+        description: "FrontierOR: paper id, validated against paper_meta_info.json"
+        required: false
+        default: bierwirth2017
+      primary_model:
+        description: "FrontierOR: full provider/model route, e.g. openai/gpt-5.4"
+        required: false
+        default: ""
+      stage1_instances:
+        description: "FrontierOR: stage-1 instances (space separated)"
+        required: false
+        default: tiny
+      dev_set:
+        description: "FrontierOR: dev instances (space separated)"
+        required: false
+        default: large_1
+      test_set:
+        description: "FrontierOR: held-out test instances; must not overlap the above"
+        required: false
+        default: large_2
+      run_id:
+        description: "FrontierOR: upstream run id"
+        required: false
+        default: orbench-agent-smoke
+      acknowledge_cost:
+        description: >-
+          Type "i-accept-model-costs" to run mode=agent. Ignored otherwise.
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never cancel in progress: a cancelled benchmark leaves half-written state on
+  # the execution host.
+  group: benchmark-smoke-${{ inputs.integration }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    # Zero cost, GitHub-hosted, no secrets. Clones the pinned upstream, proves
+    # the inputs are valid against it, and prints the exact command the paid
+    # jobs will run. If this fails, nothing downstream starts.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      run_controls: ${{ steps.gate.outputs.run_controls }}
+      run_agent_oab: ${{ steps.gate.outputs.run_agent_oab }}
+      run_agent_fo: ${{ steps.gate.outputs.run_agent_fo }}
+      evidence_label: ${{ steps.gate.outputs.evidence_label }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Refuse to run from a fork
+        if: github.event.repository.fork
+        run: |
+          echo "::error::forks do not receive secrets and must not schedule work on this repository's runners"
+          exit 1
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Clone the pinned upstream commit
+        env:
+          INTEGRATION: ${{ inputs.integration }}
+        run: |
+          set -euo pipefail
+          bash .github/scripts/clone-upstream.sh "$INTEGRATION" upstream
+
+      - name: Validate inputs and build the upstream command (nothing executed)
+        env:
+          INTEGRATION: ${{ inputs.integration }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          if [ "$INTEGRATION" = "oragentbench" ]; then
+            python tools/run_benchmark_smoke.py oragentbench \
+              --source upstream/ORAgentBench \
+              --task '${{ inputs.task }}' \
+              --scaffold '${{ inputs.scaffold }}' \
+              --model '${{ inputs.model }}' \
+              --date '${{ inputs.campaign_date }}' \
+              --campaign-slug "oab-${{ inputs.scaffold }}-smoke" \
+              --output-root out/benchmark-smoke \
+              --receipt out/preflight-receipt.json \
+              --allow-missing-tooling
+          else
+            python tools/run_benchmark_smoke.py frontieror \
+              --source upstream/FrontierOR \
+              --paper-id '${{ inputs.paper_id }}' \
+              --primary-model '${{ inputs.primary_model }}' \
+              --stage1-instances ${{ inputs.stage1_instances }} \
+              --dev-set ${{ inputs.dev_set }} \
+              --test-set ${{ inputs.test_set }} \
+              --run-id '${{ inputs.run_id }}' \
+              --receipt out/preflight-receipt.json \
+              --allow-missing-tooling
+          fi
+
+      - name: Let upstream's own wrapper prove the compiled config is consumable
+        # ORAgentBench only, and still zero cost: `--dry-run` makes upstream's
+        # wrapper transform the config, apply dynamic skills and print the
+        # `harbor run` command it would execute, then stop. It needs neither
+        # Harbor, Docker nor a credential — so a real upstream check runs on
+        # every dispatch instead of only on the paid path.
+        if: inputs.integration == 'oragentbench'
+        run: |
+          set -euo pipefail
+          python tools/run_benchmark_smoke.py oragentbench \
+            --source upstream/ORAgentBench \
+            --task '${{ inputs.task }}' \
+            --scaffold '${{ inputs.scaffold }}' \
+            --model '${{ inputs.model }}' \
+            --date '${{ inputs.campaign_date }}' \
+            --campaign-slug "oab-${{ inputs.scaffold }}-smoke" \
+            --output-root out/benchmark-smoke \
+            --upstream-dry-run --execute \
+            --receipt out/upstream-dry-run-receipt.json
+
+      - name: Gate
+        id: gate
+        env:
+          MODE: ${{ inputs.mode }}
+          INTEGRATION: ${{ inputs.integration }}
+          ACK: ${{ inputs.acknowledge_cost }}
+        run: |
+          set -euo pipefail
+          run_controls=false
+          run_agent_oab=false
+          run_agent_fo=false
+          # FrontierOR scores a speed term against a reference runtime measured
+          # on a pinned core. Nothing produced on a GitHub-hosted runner is
+          # comparable to that, so such a run is exploratory by construction.
+          evidence_label=exploratory
+
+          case "$MODE" in
+            validate-only)
+              echo "validate-only: the command above was built and validated, not executed"
+              ;;
+            oracle-controls)
+              if [ "$INTEGRATION" != "oragentbench" ]; then
+                echo "::error::oracle/nop controls are Harbor built-ins and apply to Harbor-native integrations; $INTEGRATION is not one"
+                exit 1
+              fi
+              run_controls=true
+              ;;
+            agent)
+              if [ "$ACK" != "i-accept-model-costs" ]; then
+                echo "::error::mode=agent spends money; re-dispatch with acknowledge_cost set to i-accept-model-costs"
+                exit 1
+              fi
+              if [ "$INTEGRATION" = "oragentbench" ]; then
+                run_agent_oab=true
+              else
+                run_agent_fo=true
+              fi
+              ;;
+          esac
+
+          echo "run_controls=$run_controls" >> "$GITHUB_OUTPUT"
+          echo "run_agent_oab=$run_agent_oab" >> "$GITHUB_OUTPUT"
+          echo "run_agent_fo=$run_agent_fo" >> "$GITHUB_OUTPUT"
+          echo "evidence_label=$evidence_label" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the plan and the preflight receipts
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        if: always()
+        with:
+          name: preflight-${{ inputs.integration }}
+          # Plan, ledger and receipts only. Raw Harbor job bundles never leave
+          # the execution host.
+          path: |
+            out/benchmark-smoke/**/plan/**
+            out/*receipt.json
+          retention-days: 7
+          if-no-files-found: warn
+
+  oracle-controls:
+    # Zero model cost: oracle and nop are Harbor built-ins. Still needs a real
+    # machine, because it builds and runs containers.
+    needs: preflight
+    if: needs.preflight.outputs.run_controls == 'true'
+    runs-on: [self-hosted, orbench-exec]
+    timeout-minutes: 90
+    environment: controls
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Fail closed on missing execution prerequisites
+        run: |
+          set -euo pipefail
+          missing=0
+          command -v docker >/dev/null 2>&1 || { echo "::error::docker is not available on this runner"; missing=1; }
+          command -v harbor >/dev/null 2>&1 || { echo "::error::the harbor CLI is not installed on this runner"; missing=1; }
+          command -v python3 >/dev/null 2>&1 || { echo "::error::python3 is not available on this runner"; missing=1; }
+          [ "$missing" -eq 0 ] || exit 1
+
+      - name: Install package and clone the pinned upstream commit
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -e .
+          bash .github/scripts/clone-upstream.sh oragentbench upstream
+
+      - name: Verify the upstream checkout still satisfies the contract
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          orbench integration inspect oragentbench --source upstream/ORAgentBench \
+            --json out/oragentbench-inspection.json > /dev/null
+
+      - name: Run the zero-cost controls through Harbor
+        run: |
+          set -euo pipefail
+          orbench campaign plan '${{ inputs.campaign }}' --out out/plan
+          # `harbor run -c <config>` from the checkout's parent: exactly what
+          # upstream's experiments/scripts/run_oracle_all.sh does.
+          for config in out/plan/jobs/*.yaml; do
+            echo "+ harbor run -c $(realpath "$config")"
+            ( cd upstream && harbor run -c "$(realpath "../$config")" )
+          done
+
+      - name: Upload the control summary only
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        if: always()
+        with:
+          name: controls-summary
+          path: |
+            out/plan/plan.json
+            out/plan/plan_ledger.json
+            out/oragentbench-inspection.json
+          retention-days: 14
+          if-no-files-found: warn
+
+  agent-oragentbench:
+    # Real cost. Runs upstream's own Harbor wrapper — the same path
+    # experiments/scripts/run_claude_code.sh takes — against a job config
+    # compiled from validated inputs.
+    needs: preflight
+    if: needs.preflight.outputs.run_agent_oab == 'true'
+    # Required reviewers on this environment are what actually stop an
+    # unattended spend; the workflow only refuses to proceed without the
+    # preconditions.
+    environment: benchmark-agent
+    runs-on: [self-hosted, orbench-exec]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Fail closed on missing secrets or tooling
+        env:
+          # Referenced only to test for emptiness; never echoed.
+          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+          MODEL_BASE_URL: ${{ vars.MODEL_BASE_URL }}
+        run: |
+          set -euo pipefail
+          missing=0
+          [ -n "${MODEL_API_KEY:-}" ] || { echo "::error::repository secret MODEL_API_KEY is not configured"; missing=1; }
+          [ -n "${MODEL_BASE_URL:-}" ] || { echo "::error::repository variable MODEL_BASE_URL is not configured"; missing=1; }
+          command -v docker >/dev/null 2>&1 || { echo "::error::docker is not available on this runner"; missing=1; }
+          command -v harbor >/dev/null 2>&1 || { echo "::error::the harbor CLI is not installed on this runner"; missing=1; }
+          [ "$missing" -eq 0 ] || exit 1
+
+      - name: Install package and clone the pinned upstream commit
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -e .
+          bash .github/scripts/clone-upstream.sh oragentbench upstream
+
+      - name: Run the agent through upstream's Harbor wrapper
+        env:
+          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+          MODEL_BASE_URL: ${{ vars.MODEL_BASE_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # The script validates the task against the checkout, compiles the
+          # job config, checks preconditions and then hands the argv to
+          # upstream's own wrapper, which execs `harbor run -c`.
+          python3 tools/run_benchmark_smoke.py oragentbench \
+            --source upstream/ORAgentBench \
+            --task '${{ inputs.task }}' \
+            --scaffold '${{ inputs.scaffold }}' \
+            --model '${{ inputs.model }}' \
+            --date '${{ inputs.campaign_date }}' \
+            --campaign-slug "oab-${{ inputs.scaffold }}-smoke" \
+            --output-root "$RUNNER_TEMP/orbench/benchmark-smoke" \
+            --receipt out/agent-receipt.json \
+            --execute --acknowledge-cost '${{ inputs.acknowledge_cost }}'
+
+      - name: Record the evidence label this run may claim
+        if: always()
+        run: |
+          echo "::notice::evidence label: ${{ needs.preflight.outputs.evidence_label }}"
+          echo "::notice::a single smoke rollout supports case diagnosis only; the report renderer rejects comparative claims at R0"
+
+      - name: Upload the sanitized receipt only
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        if: always()
+        with:
+          name: agent-receipt-oragentbench
+          # The receipt alone. Job directories, trajectories and verifier
+          # output stay on the execution host.
+          path: out/agent-receipt.json
+          retention-days: 14
+          if-no-files-found: warn
+
+  agent-frontieror:
+    # Real cost, and only on a performance-isolated runner. FrontierOR's score
+    # contains a speed term measured as trusted-host wall clock: a run on a
+    # co-tenanted machine does not produce a weaker number, it produces a
+    # differently-defined one.
+    needs: preflight
+    if: needs.preflight.outputs.run_agent_fo == 'true'
+    environment: benchmark-agent
+    runs-on: [self-hosted, orbench-exec, perf-isolated]
+    timeout-minutes: 480
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Fail closed on missing secrets, licence, images or isolation
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -euo pipefail
+          missing=0
+          [ -n "${OPENROUTER_API_KEY:-}" ] || { echo "::error::repository secret OPENROUTER_API_KEY is not configured"; missing=1; }
+          if [ -z "${GRB_LICENSE_FILE:-}" ] || [ ! -f "${GRB_LICENSE_FILE:-/nonexistent}" ]; then
+            echo "::error::GRB_LICENSE_FILE must point at a readable Gurobi licence on this runner"
+            missing=1
+          fi
+          # Performance isolation is a property of the machine, not of a label.
+          if [ "${ORBENCH_PERF_ISOLATED:-false}" != "true" ]; then
+            echo "::error::FrontierOR scores runtime; this runner does not declare ORBENCH_PERF_ISOLATED=true"
+            echo "::error::a number produced here would not be an official score"
+            missing=1
+          fi
+          command -v docker >/dev/null 2>&1 || { echo "::error::docker is not available on this runner"; missing=1; }
+          for image in frontieror-candidate:1 frontieror-coral-agent:0.1 frontieror-coral-model-proxy:0.1; do
+            if ! docker image inspect "$image" >/dev/null 2>&1; then
+              echo "::error::container image $image has not been built; see docs/integrations.md"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+      - name: Install package and clone the pinned upstream commit
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -e .
+          bash .github/scripts/clone-upstream.sh frontieror upstream
+
+      - name: Run the official trusted-agent evaluation
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # The script validates the paper id and instance split against the
+          # checkout, refuses any flag from upstream's fixed trusted profile,
+          # and then invokes `python -m frontieror.infra agent`. Upstream
+          # appends coral / docker isolation / staged_qte / proxied model
+          # access / anti-hack itself.
+          python3 tools/run_benchmark_smoke.py frontieror \
+            --source upstream/FrontierOR \
+            --paper-id '${{ inputs.paper_id }}' \
+            --primary-model '${{ inputs.primary_model }}' \
+            --stage1-instances ${{ inputs.stage1_instances }} \
+            --dev-set ${{ inputs.dev_set }} \
+            --test-set ${{ inputs.test_set }} \
+            --run-id '${{ inputs.run_id }}' \
+            --receipt out/agent-receipt.json \
+            --execute --acknowledge-cost '${{ inputs.acknowledge_cost }}'
+
+      - name: Record what this run may and may not claim
+        if: always()
+        run: |
+          echo "::notice::official FrontierOR scoring requires unpublished server-only final instances"
+          echo "::notice::a run against the public dataset is an integration test, not a leaderboard score"
+
+      - name: Upload the sanitized receipt only
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        if: always()
+        with:
+          name: agent-receipt-frontieror
+          path: out/agent-receipt.json
+          retention-days: 14
+          if-no-files-found: warn

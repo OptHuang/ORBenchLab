@@ -1,0 +1,66 @@
+# ORAgentBench task-health controls.
+#
+# Zero model cost: `oracle` and `nop` are Harbor built-in agents. This is the
+# first campaign worth running against any task set, because it answers "is this
+# task set well-formed?" before anyone spends money asking "how good is this
+# agent?".
+#
+# Expected outcome: oracle passes everything, nop passes nothing. A task that
+# fails either direction is broken and should be quarantined, not measured.
+#
+#   orbench campaign validate campaigns/oragentbench-controls.yaml
+#   orbench campaign plan     campaigns/oragentbench-controls.yaml --out out/controls
+schema_version: "1.0"
+slug: oragentbench-controls
+# Explicit, not "today": campaign ids are derived from this, and an id that
+# changes with the wall clock is not an id.
+date: "2026-08-22"
+integration: oragentbench
+site: local-docker
+evidence_intent: exploratory
+
+dataset:
+  # Consumed in place from an ORAgentBench checkout. Nothing is copied here.
+  path: ORAgentBench/harbor_tasks
+  # From: orbench integration inspect oragentbench --source <checkout>
+  # (facts.dataset_digest, upstream commit c9eb952435a4352f33daa2a35efe0f8c76d31b28)
+  digest: sha256:ff55ae31f9a742ca7cc2b6fc48eb29c98d09c0992dfa8a40d1194b85dde5fe63
+
+tasks:
+  - additive_microfactory_order_planning
+  - airport_gate_assignment
+  - bike_share_rebalancing
+
+agents:
+  - id: oracle
+    scaffold: oracle
+  - id: nop
+    scaffold: nop
+
+budget:
+  wall_clock_sec: 2700
+  # Controls call no model. A non-zero ceiling here would be rejected: it would
+  # suggest a spend that cannot occur.
+  max_cost_usd: 0
+
+# Three seeds per configuration is the minimum that supports a rate rather than
+# an anecdote (R1).
+seeds: [1, 2, 3]
+attempts: 1
+shards: 1
+
+harbor:
+  jobs_dir: jobs
+  n_concurrent_trials: 4
+  environment_type: docker
+
+retry:
+  max_retries: 0
+  # Only infrastructure and provider failures may ever be listed here. Retrying
+  # a capability failure inflates the pass rate.
+  include_exceptions: []
+
+metrics:
+  # Upstream's own aggregation script, consumed as a Harbor uv-script metric.
+  - type: uv-script
+    script_path: ORAgentBench/metrics/per_dimension_reward.py
