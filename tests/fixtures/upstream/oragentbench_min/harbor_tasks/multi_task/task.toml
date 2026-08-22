@@ -1,0 +1,17 @@
+schema_version = "1.1"
+multi_step_reward_strategy = "mean"
+
+[task]
+name = "oragentbench/multi_task"
+description = "Multi-step fixture task"
+
+[metadata]
+benchmark = "ORAgentBench"
+base_image = "oragentbench-base:py311-scip"
+requires_gurobi = true
+
+[environment]
+allow_internet = true
+
+[[steps]]
+name = "step1"

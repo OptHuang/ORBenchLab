@@ -1,0 +1,5 @@
+job_name: fixture-oracle
+agents:
+  - name: oracle
+datasets:
+  - path: harbor_tasks

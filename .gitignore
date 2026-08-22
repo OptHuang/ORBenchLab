@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local working output. Raw Harbor job bundles (L0) must never be committed.
+out/
+jobs/
+warehouse/
+# Only the repository-root checkout cache is disposable.  Test fixtures live
+# under tests/fixtures/upstream/ and must be committed for offline CI.
+/upstream/
+*.local.yaml
