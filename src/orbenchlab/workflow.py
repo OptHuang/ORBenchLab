@@ -262,10 +262,36 @@ def _verify_integrity(run_root: Path) -> None:
 
     job_name = manifest_data.get("job_name") if isinstance(manifest_data, dict) else None
     job_prefix = f"jobs/{job_name}/" if isinstance(job_name, str) and job_name else ""
+    upstream_attempt = manifest_data.get("upstream_attempt")
+    mutable_log_files: set[str] | None = None
+    if upstream_attempt is not None:
+        if not isinstance(upstream_attempt, dict):
+            raise EvidenceError("existing run manifest has invalid upstream attempt evidence")
+        attempt_id = upstream_attempt.get("id")
+        stdout_log = upstream_attempt.get("stdout_log")
+        stderr_log = upstream_attempt.get("stderr_log")
+        receipt_path = upstream_attempt.get("receipt")
+        if (
+            not isinstance(attempt_id, str)
+            or re.fullmatch(r"attempt-[0-9]{4,}", attempt_id) is None
+            or stdout_log != f"logs/{attempt_id}/upstream.stdout.log"
+            or stderr_log != f"logs/{attempt_id}/upstream.stderr.log"
+            or receipt_path != f"logs/{attempt_id}/receipt.json"
+        ):
+            raise EvidenceError("existing run manifest has invalid upstream attempt evidence")
+        mutable_log_files = {stdout_log, stderr_log, receipt_path}
 
     def running_mutable(relative: str) -> bool:
-        if relative.startswith("logs/"):
+        if relative == "receipt.json":
+            # This is only the canonical alias for the latest attempt-local
+            # receipt.  It is refreshed atomically while the attempt is still
+            # running; historical receipts remain immutable under logs/.
             return True
+        if relative.startswith("logs/"):
+            # Legacy workspaces used two mutable top-level files.  New runs
+            # identify the current attempt explicitly, keeping every prior
+            # attempt hash-bound even while a resumed process is running.
+            return mutable_log_files is None or relative in mutable_log_files
         if not job_prefix or not relative.startswith(job_prefix):
             return False
         # The top-level Harbor config decides what --resume will execute. Once
@@ -972,6 +998,115 @@ def _bind_resume_config(**kwargs: Any) -> dict[str, Any]:
     return binding
 
 
+def _allocate_upstream_attempt_logs(
+    run_root: Path, *, starting_number: int = 1
+) -> tuple[dict[str, str], Path, Path]:
+    """Reserve a new append-only log namespace under the campaign lock."""
+    logs = run_root / "logs"
+    logs.mkdir(mode=0o700, exist_ok=True)
+    number = starting_number
+    while True:
+        attempt_id = f"attempt-{number:04d}"
+        attempt_dir = logs / attempt_id
+        try:
+            attempt_dir.mkdir(mode=0o700)
+        except FileExistsError:
+            number += 1
+            continue
+        stdout_path = attempt_dir / "upstream.stdout.log"
+        stderr_path = attempt_dir / "upstream.stderr.log"
+        record = {
+            "id": attempt_id,
+            "stdout_log": stdout_path.relative_to(run_root).as_posix(),
+            "stderr_log": stderr_path.relative_to(run_root).as_posix(),
+            "receipt": (attempt_dir / "receipt.json").relative_to(run_root).as_posix(),
+        }
+        return record, stdout_path, stderr_path
+
+
+def _atomic_copy_file(source: Path, target: Path) -> None:
+    """Publish an exact byte copy without exposing a partial evidence file."""
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if target.exists():
+        if not target.is_file() or _sha256(target) != _sha256(source):
+            raise EvidenceError("existing legacy attempt receipt conflicts with canonical receipt")
+        return
+    temporary = target.with_name(f".{target.name}.tmp-{os.getpid()}")
+    try:
+        with source.open("rb") as input_stream, temporary.open("xb") as output_stream:
+            shutil.copyfileobj(input_stream, output_stream)
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _legacy_upstream_attempt(
+    run_root: Path, *, archive_canonical: bool
+) -> dict[str, str | None] | None:
+    """Describe pre-attempt-layout logs without moving or rewriting them."""
+    logs = run_root / "logs"
+    stdout_path = logs / "upstream.stdout.log"
+    stderr_path = logs / "upstream.stderr.log"
+    if not stdout_path.is_file() and not stderr_path.is_file():
+        return None
+    canonical_receipt = run_root / "receipt.json"
+    archived_receipt = logs / "legacy-attempt-0001" / "receipt.json"
+    if archive_canonical and canonical_receipt.is_file():
+        _atomic_copy_file(canonical_receipt, archived_receipt)
+    receipt = (
+        archived_receipt.relative_to(run_root).as_posix()
+        if archived_receipt.is_file()
+        else None
+    )
+    return {
+        "id": "legacy-attempt-0001",
+        "stdout_log": "logs/upstream.stdout.log" if stdout_path.is_file() else None,
+        "stderr_log": "logs/upstream.stderr.log" if stderr_path.is_file() else None,
+        "receipt": receipt,
+    }
+
+
+def _write_upstream_attempt_receipt(
+    *,
+    prepared: PreparedRun,
+    preconditions: execution.PreconditionReport,
+    upstream_attempt: Mapping[str, str],
+    paid: bool,
+    exit_code: int | None,
+    runtime_image: Mapping[str, Any] | None = None,
+    runtime_image_evidence: str | None = None,
+    alias_verification: Mapping[str, Any] | None = None,
+    notes: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Atomically persist the attempt receipt, then refresh its canonical alias."""
+    receipt = execution.build_receipt(
+        integration="oragentbench",
+        mode="agent" if paid else "controls",
+        command=prepared.command,
+        campaign_id=prepared.campaign_id,
+        preconditions=preconditions,
+        exit_code=exit_code,
+        evidence_label="exploratory",
+        output_root=str(prepared.run_root),
+        notes=notes,
+    )
+    receipt["scaffold_version"] = prepared.scaffold_version
+    receipt["agent_id"] = prepared.agent_id
+    receipt["source_snapshot_digest"] = prepared.source_snapshot_digest
+    receipt["runtime_image"] = runtime_image
+    receipt["runtime_image_evidence"] = runtime_image_evidence
+    receipt["runtime_image_alias_verification"] = alias_verification
+    receipt["upstream_attempt"] = dict(upstream_attempt)
+    receipt = execution.sanitize_receipt(receipt)
+    attempt_receipt = prepared.run_root / upstream_attempt["receipt"]
+    _atomic_json(attempt_receipt, receipt)
+    _atomic_json(prepared.run_root / "receipt.json", receipt)
+    return receipt
+
+
 def _run_process_group(
     argv: list[str],
     *,
@@ -1023,6 +1158,61 @@ def _command_environment(
         else:
             merged[name] = value
     return merged
+
+
+def _is_oragentbench_resume_command(command: execution.UpstreamCommand) -> bool:
+    """Recognize both upstream agent and control recovery entry points."""
+    argv = command.argv
+    if "--resume" in argv:
+        return True
+    return (
+        len(argv) >= 4
+        and argv[0:2] == ("bash", "-c")
+        and argv[3] == "orbench-control-resume"
+        and "exec harbor job resume --job-path" in argv[2]
+    )
+
+
+def _resume_runtime_image_id(run_root: Path, job_dir: Path) -> str | None:
+    """Return the image behind existing trials, or None before any trial began."""
+    try:
+        manifest = json.loads(
+            (run_root / "manifest.json").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise EvidenceError("interrupted job manifest is not readable JSON") from None
+    runtime_image = manifest.get("runtime_image") if isinstance(manifest, dict) else None
+    image_id = runtime_image.get("image_id") if isinstance(runtime_image, dict) else None
+    if image_id is None:
+        try:
+            has_trial_directory = any(child.is_dir() for child in job_dir.iterdir())
+        except OSError:
+            raise EvidenceError(
+                "interrupted Harbor job directory cannot be inspected safely"
+            ) from None
+        if not has_trial_directory:
+            return None
+        raise EvidenceError(
+            "interrupted Harbor job has trial directories but no valid immutable "
+            "Docker image ID; refusing to mix trials with an unknown runtime"
+        )
+    if not isinstance(image_id, str) or re.fullmatch(
+        r"sha256:[0-9a-f]{64}", image_id
+    ) is None:
+        raise EvidenceError("interrupted Harbor runtime image evidence is inconsistent")
+    alias = manifest.get("runtime_image_alias_verification")
+    evidence_is_consistent = (
+        isinstance(runtime_image, dict)
+        and runtime_image.get("requested_tag")
+        == execution.ORAGENTBENCH_FIXED_BASE_IMAGE
+        and isinstance(alias, dict)
+        and alias.get("fixed_alias") == execution.ORAGENTBENCH_FIXED_BASE_IMAGE
+        and alias.get("fixed_alias_image_id") == image_id
+        and alias.get("matches_runtime_image") is True
+    )
+    if not evidence_is_consistent:
+        raise EvidenceError("interrupted Harbor runtime image evidence is inconsistent")
+    return image_id
 
 
 def prepare_oragentbench_run(
@@ -1239,12 +1429,28 @@ def prepare_oragentbench_run(
                 resumed = True
 
     final_job = run_root / "plan" / "jobs" / f"{compiled.jobs[0].job_name}.yaml"
+    upstream_job_dir = run_root / "jobs" / compiled.jobs[0].job_name
+    resume_upstream = (upstream_job_dir / "config.json").is_file()
     if agent in execution.CONTROL_SCAFFOLDS:
-        command = execution.oragentbench_controls_command(source=source, job_config=final_job)
+        expected_image_id: str | None = None
+        if resume_upstream:
+            with _campaign_lock(workspace, campaign_id):
+                _verify_integrity(run_root)
+                expected_image_id = _resume_runtime_image_id(
+                    run_root, upstream_job_dir
+                )
+        command = (
+            execution.oragentbench_controls_resume_command(
+                source=source,
+                job_dir=upstream_job_dir,
+                expected_image_id=expected_image_id,
+            )
+            if resume_upstream
+            else execution.oragentbench_controls_command(
+                source=source, job_config=final_job
+            )
+        )
     else:
-        resume_upstream = (
-            run_root / "jobs" / compiled.jobs[0].job_name / "config.json"
-        ).is_file()
         command = execution.oragentbench_agent_command(
             source=source,
             job_config=final_job,
@@ -1344,7 +1550,7 @@ def execute_prepared_run(
             )
             _write_integrity(prepared.run_root)
             return ingested
-        if "--resume" in prepared.command.argv:
+        if _is_oragentbench_resume_command(prepared.command):
             _bind_resume_config(
                 run_root=prepared.run_root,
                 source=prepared.source,
@@ -1382,6 +1588,22 @@ def execute_prepared_run(
         # have captured the post-run immutable image identity.  Campaign locks
         # alone are insufficient because campaigns may use different roots.
         with _oragentbench_docker_alias_lock(environ=environ):
+            prior_attempts = manifest.get("upstream_attempts", [])
+            if not isinstance(prior_attempts, list) or not all(
+                isinstance(item, dict) for item in prior_attempts
+            ):
+                raise EvidenceError("run manifest has invalid upstream attempt history")
+            legacy_attempt = _legacy_upstream_attempt(
+                prepared.run_root, archive_canonical=not prior_attempts
+            )
+            if legacy_attempt is not None and not prior_attempts:
+                prior_attempts = [legacy_attempt]
+            upstream_attempt, stdout_path, stderr_path = _allocate_upstream_attempt_logs(
+                prepared.run_root,
+                starting_number=2 if legacy_attempt is not None else 1,
+            )
+            manifest["upstream_attempts"] = [*prior_attempts, upstream_attempt]
+            manifest["upstream_attempt"] = upstream_attempt
             manifest["state"] = "running"
             manifest["runner_pid"] = os.getpid()
             _atomic_json(manifest_path, manifest)
@@ -1389,12 +1611,8 @@ def execute_prepared_run(
             # starts so a power loss/SIGKILL leaves a resumable, integrity-valid
             # workspace instead of permanently bricking the campaign.
             _write_integrity(prepared.run_root)
-            logs = prepared.run_root / "logs"
-            logs.mkdir(exist_ok=True)
             try:
-                with (logs / "upstream.stdout.log").open("wb") as stdout, (
-                    logs / "upstream.stderr.log"
-                ).open("wb") as stderr:
+                with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
                     exit_code = _run_process_group(
                         list(prepared.command.argv),
                         cwd=prepared.command.cwd,
@@ -1404,26 +1622,25 @@ def execute_prepared_run(
                         timeout_sec=prepared.wall_clock_sec,
                     )
             except OSError as exc:
+                _write_upstream_attempt_receipt(
+                    prepared=prepared,
+                    preconditions=preconditions,
+                    upstream_attempt=upstream_attempt,
+                    paid=paid,
+                    exit_code=None,
+                    notes=("upstream command could not be started",),
+                )
                 manifest["state"] = "failed"
                 manifest["failure"] = f"{type(exc).__name__}: {exc}"
+                manifest.pop("runner_pid", None)
                 _atomic_json(manifest_path, execution.sanitize_receipt(manifest))
                 _write_integrity(prepared.run_root)
                 raise PreconditionError(f"could not start upstream command: {exc}") from None
 
-            if _source_snapshot_digest(prepared.source) != manifest.get(
-                "source_snapshot_digest"
-            ):
-                manifest["state"] = "failed"
-                manifest["failure"] = (
-                    "content-addressed source snapshot changed during execution"
-                )
-                manifest.pop("runner_pid", None)
-                _atomic_json(manifest_path, manifest)
-                _write_integrity(prepared.run_root)
-                raise EvidenceError(
-                    "ORAgentBench execution snapshot changed during execution"
-                )
-            if "--resume" in prepared.command.argv:
+            # A resume config has a stricter domain contract than the general
+            # workspace ledger. Validate it first so a changed Harbor field is
+            # diagnosed precisely rather than flattened into a hash mismatch.
+            if _is_oragentbench_resume_command(prepared.command):
                 try:
                     _bind_resume_config(
                         run_root=prepared.run_root,
@@ -1435,6 +1652,14 @@ def execute_prepared_run(
                         task=prepared.task,
                     )
                 except EvidenceError:
+                    _write_upstream_attempt_receipt(
+                        prepared=prepared,
+                        preconditions=preconditions,
+                        upstream_attempt=upstream_attempt,
+                        paid=paid,
+                        exit_code=exit_code,
+                        notes=("interrupted Harbor resume identity changed",),
+                    )
                     manifest["state"] = "failed"
                     manifest["failure"] = (
                         "interrupted Harbor resume identity changed during execution"
@@ -1444,6 +1669,52 @@ def execute_prepared_run(
                     _write_integrity(prepared.run_root)
                     raise
 
+            # The ledger was refreshed after selecting the current attempt but
+            # before its files were opened.  In the running phase only that
+            # attempt's stdout, stderr and receipt are mutable; this check
+            # prevents a wrapper from rewriting older evidence and having that
+            # rewrite blessed below.
+            try:
+                _verify_integrity(prepared.run_root)
+            except EvidenceError:
+                _write_upstream_attempt_receipt(
+                    prepared=prepared,
+                    preconditions=preconditions,
+                    upstream_attempt=upstream_attempt,
+                    paid=paid,
+                    exit_code=exit_code,
+                    notes=("upstream changed integrity-bound run inputs",),
+                )
+                manifest["state"] = "failed"
+                manifest["failure"] = (
+                    "upstream changed integrity-bound run inputs during execution"
+                )
+                manifest.pop("runner_pid", None)
+                _atomic_json(manifest_path, manifest)
+                _write_integrity(prepared.run_root)
+                raise
+
+            if _source_snapshot_digest(prepared.source) != manifest.get(
+                "source_snapshot_digest"
+            ):
+                _write_upstream_attempt_receipt(
+                    prepared=prepared,
+                    preconditions=preconditions,
+                    upstream_attempt=upstream_attempt,
+                    paid=paid,
+                    exit_code=exit_code,
+                    notes=("content-addressed source snapshot changed",),
+                )
+                manifest["state"] = "failed"
+                manifest["failure"] = (
+                    "content-addressed source snapshot changed during execution"
+                )
+                manifest.pop("runner_pid", None)
+                _atomic_json(manifest_path, manifest)
+                _write_integrity(prepared.run_root)
+                raise EvidenceError(
+                    "ORAgentBench execution snapshot changed during execution"
+                )
             runtime_image = execution.docker_image_fingerprint(
                 prepared.runtime_image_tag
             )
@@ -1482,24 +1753,19 @@ def execute_prepared_run(
             )
             manifest["runtime_image_alias_verification"] = alias_verification
 
-        receipt = execution.build_receipt(
-            integration="oragentbench",
-            mode="controls" if not paid else "agent",
-            command=prepared.command,
-            campaign_id=prepared.campaign_id,
+        _write_upstream_attempt_receipt(
+            prepared=prepared,
             preconditions=preconditions,
+            upstream_attempt=upstream_attempt,
+            paid=paid,
             exit_code=exit_code,
-            evidence_label="exploratory",
-            output_root=str(prepared.run_root),
-            notes=["raw Harbor bundle remains local; normalized report is derived after ingest"],
+            runtime_image=runtime_image,
+            runtime_image_evidence=manifest["runtime_image_evidence"],
+            alias_verification=alias_verification,
+            notes=(
+                "raw Harbor bundle remains local; normalized report is derived after ingest",
+            ),
         )
-        receipt["scaffold_version"] = prepared.scaffold_version
-        receipt["agent_id"] = prepared.agent_id
-        receipt["source_snapshot_digest"] = prepared.source_snapshot_digest
-        receipt["runtime_image"] = runtime_image
-        receipt["runtime_image_evidence"] = manifest["runtime_image_evidence"]
-        receipt["runtime_image_alias_verification"] = alias_verification
-        _atomic_json(prepared.run_root / "receipt.json", receipt)
         if exit_code != 0:
             manifest["state"] = "failed"
             manifest["exit_code"] = exit_code

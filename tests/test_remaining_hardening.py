@@ -175,6 +175,16 @@ def test_running_crash_recovery_allows_only_upstream_output_roots(
     manifest_path = first.run_root / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["state"] = "running"
+    manifest["runtime_image"] = {
+        "requested_tag": "oragentbench-base:py311-scip",
+        "image_id": "sha256:" + "1" * 64,
+        "repo_digests": [],
+    }
+    manifest["runtime_image_alias_verification"] = {
+        "fixed_alias": "oragentbench-base:py311-scip",
+        "fixed_alias_image_id": "sha256:" + "1" * 64,
+        "matches_runtime_image": True,
+    }
     workflow._atomic_json(manifest_path, manifest)
     import yaml
 

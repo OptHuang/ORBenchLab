@@ -64,6 +64,11 @@ ORAGENTBENCH_PREBUILD_WRAPPER = "source/scripts/run_harbor_prebuild.py"
 #: a fresh host and then delegates to Harbor with the supplied config.
 ORAGENTBENCH_ORACLE_RUNNER = "experiments/scripts/run_oracle_all.sh"
 
+#: The same upstream build step used by the oracle runner.  Recovery uses it
+#: only when the immutable image recorded for an interrupted job is no longer
+#: available under its ID in the local Docker daemon.
+ORAGENTBENCH_BASE_IMAGE_BUILDER = "scripts/build_base_image.sh"
+
 #: Both upstream control and prebuilt-agent paths build through this fixed
 #: alias before Harbor starts.  ORBenchLab serializes all use of it per host.
 ORAGENTBENCH_FIXED_BASE_IMAGE = "oragentbench-base:py311-scip"
@@ -580,6 +585,82 @@ def oragentbench_controls_command(
             "checkout parent"
         ),
         description="Harbor job over ORAgentBench tasks using built-in control agents",
+        makes_model_calls=False,
+    )
+
+
+def oragentbench_controls_resume_command(
+    *, source: Path, job_dir: Path, expected_image_id: str | None
+) -> UpstreamCommand:
+    """Restore the exact control base image, then resume one persisted Harbor job.
+
+    Harbor owns the job lock and recovery semantics.  Once ``config.json``
+    exists, starting the oracle runner again would invoke a new ``harbor run``
+    against the same directory and conflict with that lock.  The only safe
+    recovery path is Harbor's documented ``job resume --job-path`` command.
+    If trials already exist, the recorded immutable image ID is retagged to the
+    fixed alias when local, or the pinned builder must recreate that exact ID.
+    If an early interruption created no trial, there is no prior image to bind
+    and the pinned builder establishes it. Harbor is not started on a recorded
+    image path unless the alias resolves to that ID exactly.
+    """
+    source = validate_oragentbench_source(source)
+    builder = source / ORAGENTBENCH_BASE_IMAGE_BUILDER
+    if not builder.is_file():
+        raise PreconditionError(
+            "the pinned ORAgentBench checkout does not ship its base image builder"
+        )
+    job_dir = Path(job_dir).resolve()
+    config = job_dir / "config.json"
+    if config.is_symlink() or not config.is_file():
+        raise PreconditionError("the interrupted Harbor job has no safe config.json")
+    if expected_image_id is not None and re.fullmatch(
+        r"sha256:[0-9a-f]{64}", expected_image_id
+    ) is None:
+        raise PreconditionError(
+            "the interrupted Harbor job has no valid immutable Docker image ID"
+        )
+    shell = (
+        'set -euo pipefail\n'
+        'if [ -z "$3" ]; then\n'
+        '  bash "$1" "$2"\n'
+        'elif docker image inspect "$3" >/dev/null 2>&1; then\n'
+        '  docker image tag "$3" "$2"\n'
+        'else\n'
+        '  bash "$1" "$2"\n'
+        'fi\n'
+        'actual_id="$(docker image inspect --format \'{{.Id}}\' "$2")"\n'
+        'if ! printf \'%s\\n\' "$actual_id" | grep -Eq \'^sha256:[0-9a-f]{64}$\'; then\n'
+        '  echo "fixed base image has no valid immutable ID" >&2\n'
+        '  exit 1\n'
+        'fi\n'
+        'if [ -n "$3" ] && [ "$actual_id" != "$3" ]; then\n'
+        '  echo "fixed base image identity mismatch" >&2\n'
+        '  exit 1\n'
+        'fi\n'
+        'exec harbor job resume --job-path "$4"'
+    )
+    return UpstreamCommand(
+        argv=(
+            "bash",
+            "-c",
+            shell,
+            "orbench-control-resume",
+            str(builder),
+            ORAGENTBENCH_FIXED_BASE_IMAGE,
+            expected_image_id or "",
+            str(job_dir),
+        ),
+        cwd=str(source.parent),
+        required_env=(),
+        provenance=(
+            "Restore the exact recorded ORAgentBench runtime base image "
+            "(immutable-ID retag, "
+            "or scripts/build_base_image.sh fallback), or build when no trial "
+            "existed; verify the fixed alias before official "
+            "`harbor job resume --job-path <jobdir>` recovery"
+        ),
+        description="Resume an interrupted ORAgentBench control job through Harbor",
         makes_model_calls=False,
     )
 

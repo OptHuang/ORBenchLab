@@ -656,6 +656,284 @@ def test_running_state_is_integrity_checked_before_upstream_starts(
         workflow.execute_prepared_run(prepared)
 
 
+def test_retry_preserves_prior_upstream_logs_and_receipts_point_to_current_attempt(
+    monkeypatch, upstream_fixtures: Path, tmp_path: Path
+):
+    """A failed public execute retry must never truncate its prior evidence."""
+    from orbenchlab import execution, workflow
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    prepared = workflow.prepare_oragentbench_run(
+        source=source,
+        task="single_task",
+        agent="oracle",
+        model="",
+        date="2026-08-24",
+        workspace=tmp_path / "runs",
+        wall_clock_sec=20,
+    )
+    _install_passing_runner_probes(monkeypatch, execution)
+    calls = 0
+
+    def fail_with_distinct_logs(*args, stdout, stderr, **kwargs):
+        nonlocal calls
+        calls += 1
+        stdout.write(f"stdout attempt {calls}\n".encode())
+        stderr.write(f"stderr attempt {calls}\n".encode())
+        return 9
+
+    monkeypatch.setattr(workflow, "_run_process_group", fail_with_distinct_logs)
+    monkeypatch.setattr(
+        execution,
+        "docker_image_fingerprint",
+        lambda image: {
+            "requested_tag": image,
+            "image_id": "sha256:" + "1" * 64,
+            "repo_digests": [],
+        },
+    )
+
+    with pytest.raises(PreconditionError, match="exited with code 9"):
+        workflow.execute_prepared_run(prepared)
+    first_stdout = prepared.run_root / "logs" / "attempt-0001" / "upstream.stdout.log"
+    first_stderr = prepared.run_root / "logs" / "attempt-0001" / "upstream.stderr.log"
+    first_stdout_bytes = first_stdout.read_bytes()
+    first_stderr_bytes = first_stderr.read_bytes()
+
+    with pytest.raises(PreconditionError, match="exited with code 9"):
+        workflow.execute_prepared_run(prepared)
+
+    second_stdout = prepared.run_root / "logs" / "attempt-0002" / "upstream.stdout.log"
+    second_stderr = prepared.run_root / "logs" / "attempt-0002" / "upstream.stderr.log"
+    assert first_stdout.read_bytes() == first_stdout_bytes == b"stdout attempt 1\n"
+    assert first_stderr.read_bytes() == first_stderr_bytes == b"stderr attempt 1\n"
+    assert second_stdout.read_bytes() == b"stdout attempt 2\n"
+    assert second_stderr.read_bytes() == b"stderr attempt 2\n"
+
+    current_attempt = {
+        "id": "attempt-0002",
+        "stdout_log": "logs/attempt-0002/upstream.stdout.log",
+        "stderr_log": "logs/attempt-0002/upstream.stderr.log",
+        "receipt": "logs/attempt-0002/receipt.json",
+    }
+    manifest = json.loads((prepared.run_root / "manifest.json").read_text())
+    receipt = json.loads((prepared.run_root / "receipt.json").read_text())
+    assert manifest["upstream_attempt"] == current_attempt
+    assert manifest["upstream_attempts"] == [
+        {
+            "id": "attempt-0001",
+            "stdout_log": "logs/attempt-0001/upstream.stdout.log",
+            "stderr_log": "logs/attempt-0001/upstream.stderr.log",
+            "receipt": "logs/attempt-0001/receipt.json",
+        },
+        current_attempt,
+    ]
+    assert receipt["upstream_attempt"] == current_attempt
+    assert json.loads(
+        (prepared.run_root / current_attempt["receipt"]).read_text()
+    ) == receipt
+    workflow._verify_integrity(prepared.run_root)
+
+
+def test_legacy_flat_logs_are_retained_as_attempt_one_before_a_retry(
+    monkeypatch, upstream_fixtures: Path, tmp_path: Path
+):
+    from orbenchlab import execution, workflow
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    prepared = workflow.prepare_oragentbench_run(
+        source=source,
+        task="single_task",
+        agent="oracle",
+        model="",
+        date="2026-08-24",
+        workspace=tmp_path / "runs",
+        wall_clock_sec=20,
+    )
+    logs = prepared.run_root / "logs"
+    logs.mkdir()
+    legacy_stdout = logs / "upstream.stdout.log"
+    legacy_stderr = logs / "upstream.stderr.log"
+    legacy_stdout.write_bytes(b"legacy stdout\n")
+    legacy_stderr.write_bytes(b"legacy stderr\n")
+    legacy_receipt_bytes = (
+        b'{\n  "exit_code": 9,\n  "executed": true,\n'
+        b'  "notes": ["legacy failure evidence"]\n}\n'
+    )
+    canonical_receipt = prepared.run_root / "receipt.json"
+    canonical_receipt.write_bytes(legacy_receipt_bytes)
+    manifest_path = prepared.run_root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["state"] = "failed"
+    workflow._atomic_json(manifest_path, manifest)
+    workflow._write_integrity(prepared.run_root)
+    _install_passing_runner_probes(monkeypatch, execution)
+
+    def fail(*args, stdout, stderr, **kwargs):
+        stdout.write(b"new stdout\n")
+        stderr.write(b"new stderr\n")
+        return 9
+
+    monkeypatch.setattr(workflow, "_run_process_group", fail)
+    monkeypatch.setattr(
+        execution,
+        "docker_image_fingerprint",
+        lambda image: {
+            "requested_tag": image,
+            "image_id": "sha256:" + "1" * 64,
+            "repo_digests": [],
+        },
+    )
+
+    with pytest.raises(PreconditionError, match="exited with code 9"):
+        workflow.execute_prepared_run(prepared)
+
+    manifest = json.loads(manifest_path.read_text())
+    assert legacy_stdout.read_bytes() == b"legacy stdout\n"
+    assert legacy_stderr.read_bytes() == b"legacy stderr\n"
+    assert manifest["upstream_attempts"][0] == {
+        "id": "legacy-attempt-0001",
+        "stdout_log": "logs/upstream.stdout.log",
+        "stderr_log": "logs/upstream.stderr.log",
+        "receipt": "logs/legacy-attempt-0001/receipt.json",
+    }
+    assert manifest["upstream_attempt"]["id"] == "attempt-0002"
+    assert (logs / "attempt-0002" / "receipt.json").is_file()
+    archived_receipt = logs / "legacy-attempt-0001" / "receipt.json"
+    assert archived_receipt.read_bytes() == legacy_receipt_bytes
+    assert json.loads(archived_receipt.read_text()) == {
+        "exit_code": 9,
+        "executed": True,
+        "notes": ["legacy failure evidence"],
+    }
+    assert json.loads(canonical_receipt.read_text())["upstream_attempt"]["id"] == (
+        "attempt-0002"
+    )
+    assert canonical_receipt.read_bytes() != legacy_receipt_bytes
+    workflow._verify_integrity(prepared.run_root)
+
+
+def test_integrity_failure_after_upstream_marks_attempt_failed_and_clears_pid(
+    monkeypatch, upstream_fixtures: Path, tmp_path: Path
+):
+    from orbenchlab import execution, workflow
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    prepared = workflow.prepare_oragentbench_run(
+        source=source,
+        task="single_task",
+        agent="oracle",
+        model="",
+        date="2026-08-24",
+        workspace=tmp_path / "runs",
+        wall_clock_sec=20,
+    )
+    _install_passing_runner_probes(monkeypatch, execution)
+    protected = prepared.run_root / "plan" / "plan.json"
+
+    def alter_protected_input(*args, stdout, stderr, **kwargs):
+        stdout.write(b"stdout\n")
+        stderr.write(b"stderr\n")
+        protected.write_text("{}\n")
+        return 9
+
+    monkeypatch.setattr(workflow, "_run_process_group", alter_protected_input)
+
+    with pytest.raises(EvidenceError, match="failed integrity check"):
+        workflow.execute_prepared_run(prepared)
+
+    manifest = json.loads((prepared.run_root / "manifest.json").read_text())
+    assert manifest["state"] == "failed"
+    assert manifest["failure"] == (
+        "upstream changed integrity-bound run inputs during execution"
+    )
+    assert "runner_pid" not in manifest
+    workflow._verify_integrity(prepared.run_root)
+
+
+def test_source_snapshot_failure_after_upstream_keeps_the_attempt_receipt(
+    monkeypatch, upstream_fixtures: Path, tmp_path: Path
+):
+    from orbenchlab import execution, workflow
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    prepared = workflow.prepare_oragentbench_run(
+        source=source,
+        task="single_task",
+        agent="oracle",
+        model="",
+        date="2026-08-24",
+        workspace=tmp_path / "runs",
+        wall_clock_sec=20,
+    )
+    _install_passing_runner_probes(monkeypatch, execution)
+
+    def finish(*args, stdout, stderr, **kwargs):
+        stdout.write(b"stdout\n")
+        stderr.write(b"stderr\n")
+        return 0
+
+    digest_calls = 0
+
+    def changed_after_launch(path):
+        nonlocal digest_calls
+        digest_calls += 1
+        if digest_calls == 1:
+            return prepared.source_snapshot_digest
+        return "sha256:" + "f" * 64
+
+    monkeypatch.setattr(workflow, "_run_process_group", finish)
+    monkeypatch.setattr(workflow, "_source_snapshot_digest", changed_after_launch)
+
+    with pytest.raises(EvidenceError, match="snapshot changed during execution"):
+        workflow.execute_prepared_run(prepared)
+
+    manifest = json.loads((prepared.run_root / "manifest.json").read_text())
+    attempt_receipt = prepared.run_root / manifest["upstream_attempt"]["receipt"]
+    assert manifest["state"] == "failed"
+    assert "runner_pid" not in manifest
+    assert attempt_receipt.is_file()
+    assert json.loads(attempt_receipt.read_text()) == json.loads(
+        (prepared.run_root / "receipt.json").read_text()
+    )
+    workflow._verify_integrity(prepared.run_root)
+
+
+def test_process_start_failure_keeps_attempt_receipt_and_clears_runner_pid(
+    monkeypatch, upstream_fixtures: Path, tmp_path: Path
+):
+    from orbenchlab import execution, workflow
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    prepared = workflow.prepare_oragentbench_run(
+        source=source,
+        task="single_task",
+        agent="oracle",
+        model="",
+        date="2026-08-24",
+        workspace=tmp_path / "runs",
+        wall_clock_sec=20,
+    )
+    _install_passing_runner_probes(monkeypatch, execution)
+    monkeypatch.setattr(
+        workflow,
+        "_run_process_group",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("start failed")),
+    )
+
+    with pytest.raises(PreconditionError, match="could not start upstream command"):
+        workflow.execute_prepared_run(prepared)
+
+    manifest = json.loads((prepared.run_root / "manifest.json").read_text())
+    attempt_receipt = prepared.run_root / manifest["upstream_attempt"]["receipt"]
+    receipt = json.loads(attempt_receipt.read_text())
+    assert manifest["state"] == "failed"
+    assert "runner_pid" not in manifest
+    assert receipt["executed"] is False
+    assert receipt == json.loads((prepared.run_root / "receipt.json").read_text())
+    workflow._verify_integrity(prepared.run_root)
+
+
 def test_unexpected_ingest_failure_marks_campaign_failed_and_refreshes_integrity(
     monkeypatch, upstream_fixtures: Path, tmp_path: Path
 ):
@@ -812,3 +1090,135 @@ def test_failed_agent_workspace_uses_upstream_resume_when_job_config_exists(
     binding = json.loads((resumed.run_root / "resume-binding.json").read_text())
     assert binding["job_name"] == job_name
     assert binding["scaffold_version"] == "fixture-cli-1.2.3"
+
+
+def test_failed_control_workspace_uses_harbor_job_resume_when_config_exists(
+    monkeypatch, upstream_fixtures: Path, tmp_path: Path
+):
+    from orbenchlab import execution, workflow
+    import yaml
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    kwargs = dict(
+        source=source,
+        task="single_task",
+        agent="oracle",
+        model="",
+        date="2026-08-24",
+        workspace=tmp_path / "runs",
+        wall_clock_sec=20,
+    )
+    first = workflow.prepare_oragentbench_run(**kwargs)
+    plan = json.loads((first.run_root / "plan" / "plan.json").read_text())
+    job_name = plan["jobs"][0]["job_name"]
+    job_dir = first.run_root / "jobs" / job_name
+    job_dir.mkdir(parents=True)
+    config = yaml.safe_load(
+        (first.run_root / "plan" / "jobs" / f"{job_name}.yaml").read_text()
+    )
+    config.pop("pre_build", None)
+    (job_dir / "config.json").write_text(json.dumps(config) + "\n")
+    manifest_path = first.run_root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["state"] = "failed"
+    manifest_path.write_text(json.dumps(manifest) + "\n")
+    workflow._write_integrity(first.run_root)
+
+    early_resume = workflow.prepare_oragentbench_run(**kwargs)
+    assert early_resume.command.argv[-2] == ""
+
+    trial_dir = job_dir / "single_task__oracle__1"
+    trial_dir.mkdir()
+    with pytest.raises(EvidenceError, match="immutable Docker image ID"):
+        workflow.prepare_oragentbench_run(**kwargs)
+    trial_dir.rmdir()
+
+    expected_image_id = "sha256:" + "1" * 64
+    manifest = json.loads(manifest_path.read_text())
+    manifest["runtime_image"] = {
+        "requested_tag": "oragentbench-base:py311-scip",
+        "image_id": expected_image_id,
+        "repo_digests": [],
+    }
+    manifest["runtime_image_alias_verification"] = {
+        "fixed_alias": "oragentbench-base:py311-scip",
+        "fixed_alias_image_id": expected_image_id,
+        "matches_runtime_image": True,
+    }
+    consistent_manifest = json.loads(json.dumps(manifest))
+    inconsistent_manifests = []
+    changed = json.loads(json.dumps(consistent_manifest))
+    changed["runtime_image"]["requested_tag"] = "wrong:tag"
+    inconsistent_manifests.append(changed)
+    changed = json.loads(json.dumps(consistent_manifest))
+    changed["runtime_image_alias_verification"]["fixed_alias"] = "wrong:tag"
+    inconsistent_manifests.append(changed)
+    changed = json.loads(json.dumps(consistent_manifest))
+    changed["runtime_image_alias_verification"]["fixed_alias_image_id"] = (
+        "sha256:" + "2" * 64
+    )
+    inconsistent_manifests.append(changed)
+    changed = json.loads(json.dumps(consistent_manifest))
+    changed["runtime_image_alias_verification"]["matches_runtime_image"] = False
+    inconsistent_manifests.append(changed)
+    for inconsistent in inconsistent_manifests:
+        manifest_path.write_text(json.dumps(inconsistent) + "\n")
+        workflow._write_integrity(first.run_root)
+        with pytest.raises(EvidenceError, match="runtime image evidence"):
+            workflow.prepare_oragentbench_run(**kwargs)
+
+    manifest_path.write_text(json.dumps(consistent_manifest) + "\n")
+    workflow._write_integrity(first.run_root)
+
+    resumed = workflow.prepare_oragentbench_run(**kwargs)
+
+    assert resumed.resumed is True
+    assert "harbor job resume --job-path" in resumed.command.argv[2]
+    assert resumed.command.argv[-2] == expected_image_id
+    assert resumed.command.argv[-1] == str(job_dir.resolve())
+    binding = json.loads((resumed.run_root / "resume-binding.json").read_text())
+    assert binding["job_name"] == job_name
+    assert binding["agent"] == "oracle"
+
+    _install_passing_runner_probes(monkeypatch, execution)
+
+    process_calls = 0
+
+    def mutate_bound_config(*args, **kwargs):
+        nonlocal process_calls
+        process_calls += 1
+        changed = json.loads((job_dir / "config.json").read_text())
+        changed["n_attempts"] = 2
+        (job_dir / "config.json").write_text(json.dumps(changed) + "\n")
+        return 0
+
+    monkeypatch.setattr(workflow, "_run_process_group", mutate_bound_config)
+    monkeypatch.setattr(
+        execution,
+        "docker_image_fingerprint",
+        lambda image: {
+            "requested_tag": image,
+            "image_id": "sha256:" + "1" * 64,
+            "repo_digests": [],
+        },
+    )
+    monkeypatch.setattr(
+        workflow, "ingest_harbor_bundle", lambda **kwargs: SimpleNamespace()
+    )
+
+    with pytest.raises(EvidenceError) as excinfo:
+        workflow.execute_prepared_run(
+            resumed,
+            environ={"ORBENCH_HOST_LOCK_DIR": str(tmp_path / "host-locks")},
+        )
+    assert process_calls == 1
+    assert "attempt count" in str(excinfo.value)
+    failed_manifest = json.loads((resumed.run_root / "manifest.json").read_text())
+    assert failed_manifest["failure"] == (
+        "interrupted Harbor resume identity changed during execution"
+    )
+    attempt_receipt = resumed.run_root / failed_manifest["upstream_attempt"]["receipt"]
+    assert attempt_receipt.is_file()
+    assert json.loads(attempt_receipt.read_text())["upstream_attempt"] == (
+        failed_manifest["upstream_attempt"]
+    )

@@ -9,6 +9,7 @@ for free.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -71,6 +72,120 @@ def test_controls_command_delegates_to_upstream_runner_and_builds_on_fresh_host(
     assert command.cwd == str(oab_source.parent)
     assert command.makes_model_calls is False
     assert "run_oracle_all.sh" in command.provenance
+
+
+def test_controls_resume_restores_expected_base_then_delegates_to_harbor_job_resume(
+    oab_source, tmp_path
+):
+    job_dir = tmp_path / "jobs" / "oracle-single-task"
+    job_dir.mkdir(parents=True)
+    (job_dir / "config.json").write_text("{}\n", encoding="utf-8")
+    expected_image_id = "sha256:" + "1" * 64
+
+    command = execution.oragentbench_controls_resume_command(
+        source=oab_source,
+        job_dir=job_dir,
+        expected_image_id=expected_image_id,
+    )
+
+    assert command.argv == (
+        "bash",
+        "-c",
+        (
+            'set -euo pipefail\n'
+            'if [ -z "$3" ]; then\n'
+            '  bash "$1" "$2"\n'
+            'elif docker image inspect "$3" >/dev/null 2>&1; then\n'
+            '  docker image tag "$3" "$2"\n'
+            'else\n'
+            '  bash "$1" "$2"\n'
+            'fi\n'
+            'actual_id="$(docker image inspect --format \'{{.Id}}\' "$2")"\n'
+            'if ! printf \'%s\\n\' "$actual_id" | grep -Eq \'^sha256:[0-9a-f]{64}$\'; then\n'
+            '  echo "fixed base image has no valid immutable ID" >&2\n'
+            '  exit 1\n'
+            'fi\n'
+            'if [ -n "$3" ] && [ "$actual_id" != "$3" ]; then\n'
+            '  echo "fixed base image identity mismatch" >&2\n'
+            '  exit 1\n'
+            'fi\n'
+            'exec harbor job resume --job-path "$4"'
+        ),
+        "orbench-control-resume",
+        str(oab_source / "scripts" / "build_base_image.sh"),
+        "oragentbench-base:py311-scip",
+        expected_image_id,
+        str(job_dir.resolve()),
+    )
+    assert command.cwd == str(oab_source.parent)
+    assert command.makes_model_calls is False
+    assert "harbor job resume --job-path" in command.provenance
+
+
+def test_controls_resume_without_prior_trials_builds_before_harbor(
+    oab_source, tmp_path
+):
+    job_dir = tmp_path / "jobs" / "oracle-single-task"
+    job_dir.mkdir(parents=True)
+    (job_dir / "config.json").write_text("{}\n", encoding="utf-8")
+
+    command = execution.oragentbench_controls_resume_command(
+        source=oab_source,
+        job_dir=job_dir,
+        expected_image_id=None,
+    )
+
+    assert command.argv[-2] == ""
+    assert 'if [ -z "$3" ]; then\n  bash "$1" "$2"' in command.argv[2]
+    assert "harbor job resume --job-path" in command.argv[2]
+
+
+def test_controls_resume_image_mismatch_never_starts_harbor(
+    oab_source, tmp_path
+):
+    job_dir = tmp_path / "jobs" / "oracle-single-task"
+    job_dir.mkdir(parents=True)
+    (job_dir / "config.json").write_text("{}\n", encoding="utf-8")
+    expected_image_id = "sha256:" + "1" * 64
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    harbor_marker = tmp_path / "harbor-started"
+    docker = fake_bin / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1 $2\" = \"image inspect\" ] && [ \"$3\" = \"--format\" ]; then\n"
+        "  echo 'sha256:" + "2" * 64 + "'\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+    harbor = fake_bin / "harbor"
+    harbor.write_text(
+        f"#!/bin/sh\nprintf started > {harbor_marker}\nexit 0\n",
+        encoding="utf-8",
+    )
+    harbor.chmod(0o755)
+    command = execution.oragentbench_controls_resume_command(
+        source=oab_source,
+        job_dir=job_dir,
+        expected_image_id=expected_image_id,
+    )
+    environ = dict(os.environ)
+    environ["PATH"] = str(fake_bin) + os.pathsep + environ["PATH"]
+
+    result = subprocess.run(
+        command.argv,
+        cwd=command.cwd,
+        env=environ,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "fixed base image identity mismatch" in result.stderr
+    assert not harbor_marker.exists()
 
 
 def test_agent_command_is_the_upstream_prebuild_wrapper(oab_source, tmp_path):
