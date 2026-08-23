@@ -204,6 +204,18 @@ def _run_process_group(
         return 124
 
 
+def _command_environment(
+    command: execution.UpstreamCommand, environ: Mapping[str, str]
+) -> dict[str, str]:
+    merged = dict(environ)
+    for name, value in command.env_overrides.items():
+        if name == "PYTHONPATH" and merged.get(name):
+            merged[name] = value + os.pathsep + merged[name]
+        else:
+            merged[name] = value
+    return merged
+
+
 def prepare_oragentbench_run(
     *,
     source: str | Path,
@@ -356,10 +368,14 @@ def prepare_oragentbench_run(
     if agent in execution.CONTROL_SCAFFOLDS:
         command = execution.oragentbench_controls_command(source=source, job_config=final_job)
     else:
+        resume_upstream = (
+            run_root / "jobs" / compiled.jobs[0].job_name / "config.json"
+        ).is_file()
         command = execution.oragentbench_agent_command(
             source=source,
             job_config=final_job,
             required_env=validated.agents[0].secret_names,
+            resume=resume_upstream,
         )
     preconditions = execution.oragentbench_preconditions(
         source=source,
@@ -435,7 +451,7 @@ def execute_prepared_run(
                 exit_code = _run_process_group(
                     list(prepared.command.argv),
                     cwd=prepared.command.cwd,
-                    environ=environ,
+                    environ=_command_environment(prepared.command, environ),
                     stdout=stdout,
                     stderr=stderr,
                     timeout_sec=prepared.wall_clock_sec,
@@ -462,6 +478,7 @@ def execute_prepared_run(
         if exit_code != 0:
             manifest["state"] = "failed"
             manifest["exit_code"] = exit_code
+            manifest.pop("runner_pid", None)
             _atomic_json(manifest_path, manifest)
             _write_integrity(prepared.run_root)
             raise PreconditionError(f"upstream benchmark exited with code {exit_code}")

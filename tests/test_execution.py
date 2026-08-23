@@ -80,6 +80,7 @@ def test_agent_command_is_the_upstream_prebuild_wrapper(oab_source, tmp_path):
         "--skip-build",
     )
     assert command.cwd == str(oab_source.parent)
+    assert command.env_overrides == {"PYTHONPATH": str(oab_source.parent)}
     assert command.makes_model_calls is True
     assert "run_claude_code.sh" in command.provenance
 

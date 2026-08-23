@@ -254,6 +254,9 @@ class UpstreamCommand:
     #: Environment variable names the command needs. Names only — a value in
     #: this structure would be a leaked credential.
     required_env: tuple[str, ...] = ()
+    #: Non-secret process-environment overrides required by upstream.  Values
+    #: are recorded in receipts, so credentials must never be placed here.
+    env_overrides: dict[str, str] = field(default_factory=dict)
     #: Where this command was read from, so a reviewer can check it.
     provenance: str = ""
     description: str = ""
@@ -265,6 +268,7 @@ class UpstreamCommand:
             "argv": list(self.argv),
             "cwd": self.cwd,
             "required_env": list(self.required_env),
+            "env_overrides": dict(self.env_overrides),
             "provenance": self.provenance,
             "description": self.description,
             "makes_model_calls": self.makes_model_calls,
@@ -541,6 +545,11 @@ def oragentbench_agent_command(
         # The credentials live in the job config as ${NAME} placeholders, so the
         # names travel with the command even though none is on its argv.
         required_env=tuple(sorted(set(required_env))),
+        # The prebuild wrapper rewrites the agent to an import path under the
+        # repository namespace. Harbor is a console script and does not put its
+        # current working directory on sys.path, so the checkout parent must be
+        # explicit for ``ORAgentBench.harbor_agents`` to resolve.
+        env_overrides={"PYTHONPATH": str(source.parent)},
         provenance=(
             "ORAgentBench experiments/scripts/run_claude_code.sh -> "
             "scripts/run_harbor_prebuild.sh -> source/scripts/run_harbor_prebuild.py, "

@@ -379,3 +379,41 @@ def test_completed_resume_refreshes_integrity_after_reingest(
 
     integrity = (run_root / "integrity.sha256").read_text()
     assert "normalized/rollout.json" in integrity
+
+
+def test_failed_agent_workspace_uses_upstream_resume_when_job_config_exists(
+    upstream_fixtures: Path, tmp_path: Path
+):
+    from orbenchlab import workflow
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    wrapper = source / "source" / "scripts" / "run_harbor_prebuild.py"
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text("# fixture wrapper\n")
+    kwargs = dict(
+        source=source,
+        task="single_task",
+        agent="codex",
+        model="gpt-5.5",
+        auth_mode="codex-auth-json",
+        model_base_url="https://router.example.test/v1",
+        date="2026-08-24",
+        workspace=tmp_path / "runs",
+        wall_clock_sec=20,
+    )
+    first = workflow.prepare_oragentbench_run(**kwargs)
+    plan = json.loads((first.run_root / "plan" / "plan.json").read_text())
+    job_name = plan["jobs"][0]["job_name"]
+    job_dir = first.run_root / "jobs" / job_name
+    job_dir.mkdir(parents=True)
+    (job_dir / "config.json").write_text("{}\n")
+    manifest_path = first.run_root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["state"] = "failed"
+    manifest_path.write_text(json.dumps(manifest) + "\n")
+    workflow._write_integrity(first.run_root)
+
+    resumed = workflow.prepare_oragentbench_run(**kwargs)
+
+    assert resumed.resumed is True
+    assert "--resume" in resumed.command.argv

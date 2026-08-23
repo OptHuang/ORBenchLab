@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -374,7 +375,15 @@ def _finish(
                 f"--acknowledge-cost {COST_ACKNOWLEDGEMENT}"
             )
         print("# executing", file=sys.stderr)
-        exit_code = subprocess.run(list(command.argv), cwd=command.cwd).returncode
+        process_env = dict(os.environ)
+        for name, value in command.env_overrides.items():
+            if name == "PYTHONPATH" and process_env.get(name):
+                process_env[name] = value + os.pathsep + process_env[name]
+            else:
+                process_env[name] = value
+        exit_code = subprocess.run(
+            list(command.argv), cwd=command.cwd, env=process_env
+        ).returncode
         print(f"# upstream exited {exit_code}", file=sys.stderr)
     else:
         notes = [*notes, "dry run: the command above was built and validated, not executed"]
