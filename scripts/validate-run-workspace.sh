@@ -55,7 +55,13 @@ if [[ ! "$available_kb" =~ ^[0-9]+$ ]] || (( available_kb < minimum_free_kb )); 
 fi
 
 workspace="$root/$lane"
-mkdir -p "$workspace"
+if [[ ! -e "$workspace" && ! -L "$workspace" ]]; then
+  # Shared research hosts commonly use umask 0002.  The lane is a private
+  # evidence workspace, so create the final directory with an explicit mode
+  # instead of creating 0775 and then rejecting our own output.  If another
+  # process wins this creation race, mkdir fails and the caller retries.
+  mkdir -m 700 "$workspace"
+fi
 if [[ -L "$workspace" || "$(stat_uid "$workspace")" != "$(id -u)" ]]; then
   echo "error: workspace lane is unsafe or not runner-owned" >&2
   exit 2
