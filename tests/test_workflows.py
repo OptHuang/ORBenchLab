@@ -364,6 +364,12 @@ def test_self_hosted_oragentbench_jobs_use_the_runner_bootstrap(workflows):
         assert "python3 -m pip install -e ." not in scripts, job_name
 
 
+def test_runner_bootstrap_persists_venv_bin_for_later_github_steps():
+    script = Path("scripts/bootstrap-runner.sh").read_text(encoding="utf-8")
+    assert "GITHUB_PATH" in script
+    assert 'printf \'%s\\n\' "$repo_root/$venv_dir/bin"' in script
+
+
 def test_oragentbench_jobs_upload_only_the_fixed_shareable_allowlist(workflows):
     smoke = workflows["benchmark-smoke.yml"]
     shareable = {

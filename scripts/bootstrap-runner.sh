@@ -44,6 +44,14 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 "$python_bin" -m venv "$repo_root/$venv_dir"
 "$repo_root/$venv_dir/bin/python" -m pip install -e "$repo_root"
 
+# GitHub Actions starts every run step in a fresh shell.  Exporting PATH in the
+# bootstrap step is therefore insufficient: use the runner's documented path
+# channel so doctor/run steps resolve the exact venv installed above.  Ordinary
+# local shells still activate the venv explicitly.
+if [[ -n "${GITHUB_PATH:-}" ]]; then
+  printf '%s\n' "$repo_root/$venv_dir/bin" >> "$GITHUB_PATH"
+fi
+
 # `uv tool install harbor` keeps the executable outside the ordinary PATH on
 # some non-interactive runners (notably under
 # $HOME/.local/share/uv/tools/harbor/bin). Resolve it without assuming a user
