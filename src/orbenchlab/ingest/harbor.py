@@ -53,6 +53,16 @@ def _task_name(result: Mapping[str, Any]) -> str:
     return raw.rsplit("/", 1)[-1]
 
 
+def _is_job_aggregate(result: Mapping[str, Any]) -> bool:
+    """Harbor writes ``<job>/result.json`` in addition to trial results."""
+    return (
+        "n_total_trials" in result
+        and "stats" in result
+        and not result.get("task_name")
+        and not result.get("trial_name")
+    )
+
+
 def _known_job_name(
     result_path: Path,
     jobs_root: Path,
@@ -221,6 +231,8 @@ def ingest_harbor_bundle(*, run_root: str | Path, jobs_root: str | Path) -> Harb
     consumed: set[str] = set()
     for result_path in sorted(jobs_root.rglob("result.json")):
         result = _load_json(result_path, what="Harbor result")
+        if _is_job_aggregate(result):
+            continue
         task_name = _task_name(result)
         job_name = _known_job_name(result_path, jobs_root, result, known_jobs)
         entry = by_key.get((job_name or "", task_name), [])

@@ -170,6 +170,11 @@ def test_harbor_bundle_ingest_builds_normalized_data_and_report(tmp_path: Path):
         )
         + "\n"
     )
+    # Harbor also writes a job-level aggregate named result.json beside the
+    # trial directories. It is metadata, not an orphan trial.
+    (jobs / "result.json").write_text(
+        json.dumps({"n_total_trials": 1, "stats": {"n_completed": 1}}) + "\n"
+    )
 
     result = ingest_harbor_bundle(run_root=run_root, jobs_root=run_root / "jobs")
 
