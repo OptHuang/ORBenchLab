@@ -73,6 +73,7 @@ def agent_uid(
     env_keys: Iterable[str] | None,
     env_from_secret: Mapping[str, str] | None = None,
     env_literals: Mapping[str, str] | None = None,
+    auth_mode: str | None = None,
     import_path: str | None = None,
     setup_timeout_sec: int | None = None,
 ) -> str:
@@ -103,6 +104,10 @@ def agent_uid(
         payload["env_from_secret"] = {str(k): str(v) for k, v in sorted(env_from_secret.items())}
     if env_literals:
         payload["env_literals"] = {str(k): str(v) for k, v in sorted(env_literals.items())}
+    if auth_mode is not None and auth_mode != "api-key":
+        # API-key is the historical default; only a non-default transport
+        # changes identity so existing campaigns keep stable ids.
+        payload["auth_mode"] = auth_mode
     if import_path:
         payload["import_path"] = import_path
     if setup_timeout_sec is not None:

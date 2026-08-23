@@ -218,6 +218,27 @@ def test_codex_profile_uses_the_openai_variables(oab_source, sites_dir):
     assert agent["kwargs"]["web_search"] == "disabled"
 
 
+def test_codex_auth_json_profile_contains_no_api_key_placeholder(oab_source, sites_dir):
+    compiled = compile_mod.compile_campaign(
+        _agent_spec(
+            oab_source,
+            sites_dir,
+            scaffold="codex",
+            model="gpt-5.5",
+            auth_mode="codex-auth-json",
+            model_base_url="https://router.example.test/v1",
+        )
+    )
+    agent = next(iter(compiled.job_configs.values()))["agents"][0]
+
+    assert agent["env"] == {
+        "CODEX_FORCE_AUTH_JSON": "true",
+        "OPENAI_BASE_URL": "https://router.example.test/v1",
+    }
+    assert "MODEL_API_KEY" not in json.dumps(agent)
+    assert "OPENAI_API_KEY" not in agent["env"]
+
+
 def test_control_campaign_config_gains_no_pre_build_block(campaigns_dir, sites_dir):
     """Controls need no agent CLI, so their config stays as it was."""
     raw = spec_mod.load_spec(campaigns_dir / "oragentbench-controls.yaml")
@@ -340,6 +361,55 @@ def test_preconditions_report_a_missing_task(oab_source):
         require_harbor=False,
     )
     assert not report.ok
+
+
+def test_codex_auth_json_preconditions_require_a_private_auth_file(oab_source, tmp_path):
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"auth_mode":"chatgpt"}\n')
+    auth.chmod(0o600)
+    environ = {"CODEX_AUTH_JSON_PATH": str(auth)}
+
+    report = execution.oragentbench_preconditions(
+        source=oab_source,
+        task_name="single_task",
+        scaffold="codex",
+        model="gpt-5.5",
+        auth_mode="codex-auth-json",
+        model_base_url="https://router.example.test/v1",
+        environ=environ,
+        require_docker=False,
+        require_harbor=False,
+    )
+    assert report.ok, report.missing
+
+    auth.chmod(0o644)
+    exposed = execution.oragentbench_preconditions(
+        source=oab_source,
+        task_name="single_task",
+        scaffold="codex",
+        model="gpt-5.5",
+        auth_mode="codex-auth-json",
+        model_base_url="https://router.example.test/v1",
+        environ=environ,
+        require_docker=False,
+        require_harbor=False,
+    )
+    assert not exposed.ok
+    assert any("private" in item for item in exposed.missing)
+
+
+def test_codex_base_url_can_be_discovered_without_reading_a_secret(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text(
+        'model_provider = "gateway"\n'
+        '[model_providers.gateway]\n'
+        'base_url = "https://router.example.test/v1"\n',
+        encoding="utf-8",
+    )
+
+    assert execution.discover_codex_base_url(
+        {"CODEX_CONFIG_PATH": str(config)}
+    ) == "https://router.example.test/v1"
 
 
 # --------------------------------------------------------------------------- #
@@ -602,6 +672,22 @@ def test_receipt_is_shareable_and_claims_no_bundle(oab_source, tmp_path):
     execution.assert_receipt_is_shareable(receipt)
     assert receipt["raw_bundle_uploaded"] is False
     assert receipt["evidence_label"] == "exploratory"
+
+
+@pytest.mark.parametrize(
+    ("raw", "secret"),
+    [
+        ("Authorization: Bearer sk-live-secret", "sk-live-secret"),
+        ("https://provider.test/v1?api_key=sk-query-secret", "sk-query-secret"),
+        ("token=plain-token-value", "plain-token-value"),
+    ],
+)
+def test_receipt_sanitizer_redacts_common_provider_secret_shapes(raw, secret):
+    """Provider/CLI errors often contain headers or URL query parameters."""
+    cleaned = execution.sanitize_receipt({"provider_error": raw})
+    blob = json.dumps(cleaned)
+    assert secret not in blob
+    assert "<redacted>" in blob
 
 
 @pytest.mark.parametrize("marker", ["trajectory.json", "test-stdout", "reference_objective"])

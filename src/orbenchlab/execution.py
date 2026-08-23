@@ -31,6 +31,8 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -116,6 +118,41 @@ AGENT_PROFILES: dict[str, dict[str, Any]] = {
 
 #: Zero-model-cost controls. Harbor built-ins; they take no credentials at all.
 CONTROL_SCAFFOLDS = ("oracle", "nop")
+
+
+def discover_codex_base_url(environ: Mapping[str, str] | None = None) -> str:
+    """Return Codex's configured provider URL without inspecting auth data.
+
+    Environment overrides are useful on CI/self-hosted runners.  Otherwise we
+    read only ``config.toml`` (never ``auth.json``) and resolve the selected
+    provider table used by Codex itself.
+    """
+    environ = os.environ if environ is None else environ
+    direct = environ.get("ORBENCH_MODEL_BASE_URL") or environ.get("OPENAI_BASE_URL")
+    if direct:
+        return direct.strip()
+    explicit = environ.get("CODEX_CONFIG_PATH")
+    if explicit:
+        path = Path(explicit).expanduser()
+    else:
+        codex_home = Path(environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+        path = codex_home / "config.toml"
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return ""
+    top_level = data.get("openai_base_url")
+    if isinstance(top_level, str) and top_level.strip():
+        return top_level.strip()
+    provider = data.get("model_provider")
+    providers = data.get("model_providers")
+    if isinstance(provider, str) and isinstance(providers, Mapping):
+        selected = providers.get(provider)
+        if isinstance(selected, Mapping):
+            value = selected.get("base_url")
+            if isinstance(value, str):
+                return value.strip()
+    return ""
 
 # --------------------------------------------------------------------------- #
 # FrontierOR — upstream execution surface
@@ -652,6 +689,8 @@ def oragentbench_agent_campaign_spec(
     site: str = "local-docker",
     jobs_dir: str = "jobs",
     n_concurrent_trials: int = 1,
+    auth_mode: str = "api-key",
+    model_base_url: str = "",
 ) -> dict[str, Any]:
     """Build a campaign spec for one validated ORAgentBench agent run.
 
@@ -668,20 +707,39 @@ def oragentbench_agent_campaign_spec(
     profile = AGENT_PROFILES[scaffold]
     validate_pinned_model(model)
 
+    if auth_mode not in {"api-key", "codex-auth-json"}:
+        raise SpecError(
+            f"auth_mode {auth_mode!r} must be 'api-key' or 'codex-auth-json'"
+        )
+    if auth_mode == "codex-auth-json" and scaffold != "codex":
+        raise SpecError("codex-auth-json is only valid for the codex scaffold")
+
     env_literals: dict[str, str] = {}
-    literal_var = profile.get("env_literal_from_model")
-    if literal_var:
-        env_literals[literal_var] = model
+    env_from_secret = dict(profile["env_from_secret"])
+    if auth_mode == "codex-auth-json":
+        if not model_base_url.strip():
+            raise SpecError("codex-auth-json requires a pinned model_base_url")
+        env_from_secret = {}
+        env_literals = {
+            "CODEX_FORCE_AUTH_JSON": "true",
+            "OPENAI_BASE_URL": model_base_url.strip(),
+        }
+    else:
+        literal_var = profile.get("env_literal_from_model")
+        if literal_var:
+            env_literals[literal_var] = model
 
     agent: dict[str, Any] = {
         "id": f"{scaffold}-{model}".lower().replace("/", "-").replace(".", "-"),
         "scaffold": scaffold,
         "model": model,
-        "env_from_secret": dict(profile["env_from_secret"]),
+        "env_from_secret": env_from_secret,
         "env_literals": env_literals,
         "agent_kwargs": dict(profile["kwargs"]),
         "setup_timeout_sec": profile.get("setup_timeout_sec"),
     }
+    if auth_mode != "api-key":
+        agent["auth_mode"] = auth_mode
 
     return {
         "schema_version": "1.0",
@@ -727,6 +785,8 @@ def oragentbench_preconditions(
     require_docker: bool = True,
     require_harbor: bool = True,
     require_secrets: bool = True,
+    auth_mode: str = "api-key",
+    model_base_url: str = "",
 ) -> PreconditionReport:
     """Everything that must hold before an ORAgentBench agent run may start."""
     environ = os.environ if environ is None else environ
@@ -754,9 +814,42 @@ def oragentbench_preconditions(
             report.require(True, f"model {model!r} is pinned")
         except SpecError as exc:
             report.require(False, str(exc))
-        non_secret = set(AGENT_PROFILES[scaffold].get("non_secret_env") or ())
-        names = sorted(set(AGENT_PROFILES[scaffold]["env_from_secret"].values()))
-        if not require_secrets:
+        if auth_mode == "codex-auth-json":
+            report.require(
+                scaffold == "codex",
+                "codex-auth-json is only valid for the codex scaffold",
+            )
+            report.require(
+                bool(model_base_url.strip()),
+                "codex-auth-json has a pinned OPENAI_BASE_URL",
+            )
+            if require_secrets:
+                explicit = environ.get("CODEX_AUTH_JSON_PATH")
+                auth_path = (
+                    Path(explicit).expanduser()
+                    if explicit
+                    else Path.home() / ".codex" / "auth.json"
+                )
+                report.require(
+                    auth_path.is_file(),
+                    f"Codex auth file exists at {auth_path} (contents never read or logged)",
+                )
+                if auth_path.is_file():
+                    mode = stat.S_IMODE(auth_path.stat().st_mode)
+                    report.require(
+                        mode & 0o077 == 0,
+                        f"Codex auth file is private (mode {mode:04o}; require no group/world access)",
+                    )
+            else:
+                report.require(
+                    True,
+                    "Codex auth file not required for a prepare-only run",
+                )
+            names: list[str] = []
+        else:
+            non_secret = set(AGENT_PROFILES[scaffold].get("non_secret_env") or ())
+            names = sorted(set(AGENT_PROFILES[scaffold]["env_from_secret"].values()))
+        if not require_secrets and auth_mode != "codex-auth-json":
             report.require(
                 True,
                 "credentials not required: upstream's wrapper dry run transforms the "
@@ -908,7 +1001,7 @@ def _sanitize(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_sanitize(item) for item in value]
     if isinstance(value, str):
-        return _redact_env_assignments(value)
+        return _redact_sensitive_text(value)
     return value
 
 
@@ -924,6 +1017,24 @@ _ENV_ASSIGNMENT_RE = re.compile(
 
 def _redact_env_assignments(text: str) -> str:
     return _ENV_ASSIGNMENT_RE.sub(r"\1=<redacted>", text)
+
+
+# Provider clients frequently include an Authorization header or a request URL
+# in exception strings.  Mapping-key redaction cannot see those values, so a
+# receipt that simply sanitizes dictionaries is not safe enough to publish.
+_AUTH_HEADER_RE = re.compile(
+    r"(?i)(\bauthorization\s*:\s*(?:bearer|basic)\s+)([^\s,;]+)"
+)
+_SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?i)(\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|password|credential)\s*=\s*)([^&\s,;]+)"
+)
+
+
+def _redact_sensitive_text(text: str) -> str:
+    """Redact common credential shapes embedded inside log/error strings."""
+    text = _redact_env_assignments(text)
+    text = _AUTH_HEADER_RE.sub(r"\1<redacted>", text)
+    return _SENSITIVE_ASSIGNMENT_RE.sub(r"\1<redacted>", text)
 
 
 def env_presence(names: Iterable[str], environ: Mapping[str, str] | None = None) -> dict[str, str]:

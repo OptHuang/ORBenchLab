@@ -4,14 +4,19 @@
 [![Integration contract](https://github.com/OptHuang/ORBenchLab/actions/workflows/integration-contract.yml/badge.svg)](https://github.com/OptHuang/ORBenchLab/actions/workflows/integration-contract.yml)
 
 A control plane for running operations-research agent benchmarks and reporting
-what they actually showed.
+what they actually showed. ORAgentBench now has one lifecycle command:
+**inspect → plan → preflight → execute → ingest → report** in one immutable
+workspace.
 
-ORBenchLab does not execute benchmarks and does not reimplement them. It sits
-either side of an upstream benchmark's own machinery:
+ORBenchLab does not reimplement benchmark logic. It sits either side of an
+upstream benchmark's own machinery:
 
 * **before** — a campaign spec compiles into a plan, stable external run ids and
   the upstream runner's own job configs;
-* **after** — normalized results render into a report whose claims are bounded
+* **during** — an explicit `--execute` hands the compiled config to the
+  upstream runner and records a sanitized receipt;
+* **after** — raw Harbor results are reconciled exactly against the plan ledger,
+  then normalized results render into a report whose claims are bounded
   by the evidence behind them.
 
 The benchmark itself stays where it belongs. ORAgentBench's task packages,
@@ -55,12 +60,54 @@ orbench campaign plan     campaigns/oragentbench-controls.yaml --out out/plan
 # Render a report from a normalized slice.
 orbench report build --input fixtures/normalized/oragentbench-controls.json --out out/report
 
-# Build the exact upstream command for an agent run — without running it.
-python tools/run_benchmark_smoke.py oragentbench \
-    --source /tmp/ORAgentBench --task additive_microfactory_order_planning \
-    --scaffold claude-code --model <pinned-model> --date 2026-08-22 \
-    --allow-missing-tooling
+# One command prepares an auditable workspace. This is the safe default: it
+# does not start Docker or contact a model provider.
+orbench run oragentbench \
+  --source /tmp/ORAgentBench \
+  --task additive_microfactory_order_planning \
+  --agent oracle --date 2026-08-24 \
+  --workspace ./orbench-runs
+
+# Check the actual execution host, then run the zero-model-cost oracle control.
+orbench doctor oragentbench \
+  --source /tmp/ORAgentBench \
+  --task additive_microfactory_order_planning --agent oracle
+orbench run oragentbench \
+  --source /tmp/ORAgentBench \
+  --task additive_microfactory_order_planning \
+  --agent oracle --date 2026-08-24 \
+  --workspace ./orbench-runs --execute
 ```
+
+The checkout directory must be named exactly `ORAgentBench`, matching
+upstream's dataset-path contract. Repeating the same command verifies and
+resumes the same content-addressed workspace instead of scheduling a duplicate.
+
+### Reuse a local Codex coding-plan login
+
+Harbor 0.16+'s Codex adapter can inject the host's private
+`~/.codex/auth.json`. This keeps credentials out of campaign specs, job YAML,
+receipts and reports:
+
+```bash
+orbench doctor oragentbench \
+  --source /tmp/ORAgentBench \
+  --task additive_microfactory_order_planning \
+  --agent codex --model gpt-5.5 --auth-mode codex-auth-json
+
+orbench run oragentbench \
+  --source /tmp/ORAgentBench \
+  --task additive_microfactory_order_planning \
+  --agent codex --model gpt-5.5 --auth-mode codex-auth-json \
+  --date 2026-08-24 --wall-clock-sec 1200 --max-cost-usd 5 \
+  --workspace ./orbench-runs --execute \
+  --acknowledge-cost i-accept-model-costs
+```
+
+The provider base URL is discovered from `~/.codex/config.toml`; alternatively
+set the non-secret `ORBENCH_MODEL_BASE_URL` or pass `--model-base-url`. The auth
+file must exist with no group/world permissions. `doctor` reports only whether
+the URL is configured and never prints it or reads auth-file contents.
 
 `orbench integration inspect` emits JSON with a `checks` array, a `facts` object
 and a `decisions` object — CI asserts on all three.
@@ -124,17 +171,17 @@ A downgrade is always printed at the top of the report with its reason.
 Stated plainly, because a missing feature that reads as present is worse than an
 absent one:
 
-* No execution *from `orbench`*. The CLI never invokes a benchmark. Running one
-  is `tools/run_benchmark_smoke.py`'s job: it validates inputs against the
-  upstream checkout, builds the command upstream documents for itself, and hands
-  it over. See `docs/integrations.md`.
-* No ingest of raw job bundles into a warehouse. Reports are built from a small
-  normalized slice; producing that slice from raw bundles is not yet implemented.
+* The one-command lifecycle currently executes and ingests **ORAgentBench**.
+  FrontierOR remains on its official external harness path and still requires a
+  licensed, performance-isolated runner before its runtime-bearing score is
+  meaningful.
+* Harbor ingestion is a local run-bundle transform, not a remote warehouse.
+  Raw trajectories and verifier material stay on the execution host; only the
+  normalized slice, report and sanitized receipt are intended for sharing.
 * No durability verification, so no `validated` reports.
-* No paid agent run has been performed from this repository. Hosted CI,
-  integration inspection, zero-cost smoke preflight and report rendering have
-  been observed; the self-hosted model-calling jobs remain deliberately
-  unexecuted until credentials, runner capabilities and cost approval exist.
+* A model run still requires an explicit cost acknowledgement. A successful
+  prepare/doctor/control run is not evidence that a paid model rollout was
+  performed.
 
 ## Repository layout
 
@@ -144,9 +191,12 @@ src/orbenchlab/
   integrations/   the registry and the two first-class integrations
   campaign/       spec validation and the compiler
   report/         metrics and the renderer
+  ingest/         Harbor plan-ledger reconciliation and normalized slices
   execution.py    upstream command construction, validation, receipts
+  workflow.py     one-command ORAgentBench lifecycle and immutable workspace
   schemas/        published JSON schemas
-tools/            run_benchmark_smoke.py — the one thing that starts an upstream run
+tools/            legacy checked command builder used by compatibility CI
+scripts/          runner bootstrap
 campaigns/        example campaign specs
 sites/            execution site declarations
 fixtures/         normalized rollout slices used by the report tests

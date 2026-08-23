@@ -130,6 +130,57 @@ def test_model_calling_agent_must_declare_env_keys(controls_raw, sites_dir):
     _expect_rejection(raw, sites_dir, "must declare env_keys")
 
 
+def test_codex_auth_json_is_a_narrow_secretless_exception(controls_raw, sites_dir):
+    raw = copy.deepcopy(controls_raw)
+    raw["agents"] = [
+        {
+            "id": "codex-plan",
+            "scaffold": "codex",
+            "model": "gpt-5.5",
+            "auth_mode": "codex-auth-json",
+            "env_literals": {
+                "CODEX_FORCE_AUTH_JSON": "true",
+                "OPENAI_BASE_URL": "https://router.example.test/v1",
+            },
+        }
+    ]
+    raw["budget"]["max_cost_usd"] = 1
+
+    spec = _validate(raw, sites_dir)
+
+    assert spec.agents[0].auth_mode == "codex-auth-json"
+    assert spec.agents[0].secret_names == ()
+
+
+@pytest.mark.parametrize(
+    ("scaffold", "literals", "needle"),
+    [
+        (
+            "claude-code",
+            {"CODEX_FORCE_AUTH_JSON": "true", "OPENAI_BASE_URL": "https://x.test/v1"},
+            "only valid for the codex scaffold",
+        ),
+        ("codex", {"OPENAI_BASE_URL": "https://x.test/v1"}, "CODEX_FORCE_AUTH_JSON"),
+        ("codex", {"CODEX_FORCE_AUTH_JSON": "true"}, "OPENAI_BASE_URL"),
+    ],
+)
+def test_codex_auth_json_fails_closed_when_misconfigured(
+    controls_raw, sites_dir, scaffold, literals, needle
+):
+    raw = copy.deepcopy(controls_raw)
+    raw["agents"] = [
+        {
+            "id": "plan",
+            "scaffold": scaffold,
+            "model": "pinned-1",
+            "auth_mode": "codex-auth-json",
+            "env_literals": literals,
+        }
+    ]
+    raw["budget"]["max_cost_usd"] = 1
+    _expect_rejection(raw, sites_dir, needle)
+
+
 def test_env_keys_may_not_carry_values(controls_raw, sites_dir):
     raw = copy.deepcopy(controls_raw)
     raw["agents"] = [

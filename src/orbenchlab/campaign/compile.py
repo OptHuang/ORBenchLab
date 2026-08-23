@@ -238,6 +238,7 @@ def _agent_uid(agent: AgentSpec) -> str:
         env_keys=agent.env_keys,
         env_from_secret=agent.env_from_secret,
         env_literals=agent.env_literals,
+        auth_mode=agent.auth_mode,
         import_path=agent.import_path,
         setup_timeout_sec=agent.setup_timeout_sec,
     )

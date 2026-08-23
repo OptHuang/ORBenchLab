@@ -87,6 +87,9 @@ class AgentSpec:
     env_keys: tuple[str, ...] = ()
     env_from_secret: dict[str, str] = field(default_factory=dict)
     env_literals: dict[str, str] = field(default_factory=dict)
+    #: Explicit non-default credential transport.  ``None`` preserves the
+    #: original API-key behavior and its stable identifiers.
+    auth_mode: str | None = None
     #: Harbor ``AgentConfig.import_path`` — used by upstream's prebuilt agent
     #: classes, which turn CLI installation into a no-op.
     import_path: str | None = None
@@ -359,6 +362,13 @@ def _parse_agents(raw_agents: Any, problems: list[str]) -> tuple[AgentSpec, ...]
             problems.append(f"agents[{index}].scaffold is required")
 
         model = raw_agent.get("model")
+        raw_auth_mode = raw_agent.get("auth_mode")
+        auth_mode = str(raw_auth_mode) if raw_auth_mode is not None else None
+        if auth_mode not in (None, "api-key", "codex-auth-json"):
+            problems.append(
+                f"agents[{index}].auth_mode {auth_mode!r} must be 'api-key' or "
+                "'codex-auth-json'"
+            )
         if scaffold not in ZERO_COST_SCAFFOLDS:
             if not model:
                 problems.append(
@@ -370,7 +380,11 @@ def _parse_agents(raw_agents: Any, problems: list[str]) -> tuple[AgentSpec, ...]
                     f"agents[{index}].model {model!r} is a floating alias; pin an exact "
                     "model identifier so run ids keep meaning the same thing"
                 )
-            if not (raw_agent.get("env_keys") or raw_agent.get("env_from_secret")):
+            if not (
+                raw_agent.get("env_keys")
+                or raw_agent.get("env_from_secret")
+                or auth_mode == "codex-auth-json"
+            ):
                 problems.append(
                     f"agents[{index}] ({agent_id!r}) must declare env_keys or env_from_secret "
                     "(names only) so the required secrets are auditable before the campaign runs"
@@ -403,6 +417,32 @@ def _parse_agents(raw_agents: Any, problems: list[str]) -> tuple[AgentSpec, ...]
                     "through env_keys or env_from_secret instead."
                 )
 
+        if auth_mode == "codex-auth-json":
+            if scaffold != "codex":
+                problems.append(
+                    f"agents[{index}].auth_mode 'codex-auth-json' is only valid for the "
+                    "codex scaffold"
+                )
+            if env_keys or env_from_secret:
+                problems.append(
+                    f"agents[{index}] uses codex-auth-json and must not also declare "
+                    "API-key secrets"
+                )
+            if env_literals.get("CODEX_FORCE_AUTH_JSON") != "true":
+                problems.append(
+                    f"agents[{index}] uses codex-auth-json, so env_literals must set "
+                    "CODEX_FORCE_AUTH_JSON to the literal 'true'"
+                )
+            if not env_literals.get("OPENAI_BASE_URL"):
+                problems.append(
+                    f"agents[{index}] uses codex-auth-json, so env_literals must pin "
+                    "OPENAI_BASE_URL"
+                )
+        elif scaffold in ZERO_COST_SCAFFOLDS and auth_mode is not None:
+            problems.append(
+                f"agents[{index}] is a zero-cost control and may not declare auth_mode"
+            )
+
         agents.append(
             AgentSpec(
                 id=agent_id,
@@ -421,6 +461,7 @@ def _parse_agents(raw_agents: Any, problems: list[str]) -> tuple[AgentSpec, ...]
                 env_keys=env_keys,
                 env_from_secret=env_from_secret,
                 env_literals=env_literals,
+                auth_mode=auth_mode,
                 import_path=(
                     str(raw_agent["import_path"]) if raw_agent.get("import_path") else None
                 ),

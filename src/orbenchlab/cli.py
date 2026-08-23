@@ -22,6 +22,8 @@ from .core.errors import ORBenchError
 from .integrations import registry
 from .report import render as render_mod
 from .report.model import NormalizedRollout
+from . import workflow as workflow_mod
+from . import execution as execution_mod
 
 PROG = "orbench"
 
@@ -58,7 +60,154 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_campaign(sub)
     _add_report(sub)
     _add_schema(sub)
+    _add_doctor(sub)
+    _add_run(sub)
     return parser
+
+
+# --------------------------------------------------------------------------- #
+# run -- the practical one-command path
+# --------------------------------------------------------------------------- #
+
+
+def _add_doctor(sub: argparse._SubParsersAction) -> None:
+    parser = sub.add_parser(
+        "doctor",
+        help="check the real runner, benchmark checkout and credential transport",
+    )
+    parser.add_argument("integration", choices=["oragentbench"])
+    parser.add_argument("--source", required=True)
+    parser.add_argument("--task", required=True)
+    parser.add_argument("--agent", default="oracle")
+    parser.add_argument("--model", default="")
+    parser.add_argument(
+        "--auth-mode",
+        choices=["api-key", "codex-auth-json"],
+        default="api-key",
+    )
+    parser.add_argument("--model-base-url", default="")
+    parser.set_defaults(handler=_cmd_doctor)
+
+
+def _resolved_model_base_url(args: argparse.Namespace) -> str:
+    if args.model_base_url:
+        return str(args.model_base_url).strip()
+    if args.auth_mode == "codex-auth-json":
+        return execution_mod.discover_codex_base_url()
+    return ""
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    base_url = _resolved_model_base_url(args)
+    report = execution_mod.oragentbench_preconditions(
+        source=Path(args.source),
+        task_name=args.task,
+        scaffold=args.agent,
+        model=args.model,
+        auth_mode=args.auth_mode,
+        model_base_url=base_url,
+        require_docker=True,
+        require_harbor=True,
+        require_secrets=args.agent not in execution_mod.CONTROL_SCAFFOLDS,
+    )
+    _print_json(
+        {
+            "ok": report.ok,
+            "integration": "oragentbench",
+            "agent": args.agent,
+            "auth_mode": args.auth_mode,
+            "model_base_url_configured": bool(base_url),
+            "checks": report.to_dict(),
+        }
+    )
+    return 0 if report.ok else 5
+
+
+def _add_run(sub: argparse._SubParsersAction) -> None:
+    parser = sub.add_parser(
+        "run",
+        help="prepare or execute one benchmark evaluation in an auditable workspace",
+        description=(
+            "One-command lifecycle for a supported benchmark. Safe by default: without "
+            "--execute it only inspects, plans and writes a preflight bundle."
+        ),
+    )
+    parser.add_argument("integration", choices=["oragentbench"])
+    parser.add_argument("--source", required=True, help="validated upstream checkout")
+    parser.add_argument("--task", required=True)
+    parser.add_argument(
+        "--agent",
+        default="oracle",
+        help="oracle/nop control, or a recorded scaffold such as codex or claude-code",
+    )
+    parser.add_argument("--model", default="", help="pinned model id for a model agent")
+    parser.add_argument(
+        "--auth-mode",
+        choices=["api-key", "codex-auth-json"],
+        default="api-key",
+        help="credential transport; codex-auth-json reuses a private local Codex login",
+    )
+    parser.add_argument(
+        "--model-base-url",
+        default="",
+        help="non-secret pinned provider URL required by codex-auth-json",
+    )
+    parser.add_argument("--date", required=True, help="explicit YYYY-MM-DD identity input")
+    parser.add_argument("--workspace", default="orbench-runs")
+    parser.add_argument("--wall-clock-sec", type=int, default=2700)
+    parser.add_argument("--max-cost-usd", type=float, default=25.0)
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="inspect, plan and preflight only (the default)",
+    )
+    action.add_argument("--execute", action="store_true", help="start the upstream runner")
+    parser.add_argument(
+        "--acknowledge-cost",
+        default="",
+        help="model runs require the literal i-accept-model-costs",
+    )
+    parser.set_defaults(handler=_cmd_run)
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    base_url = _resolved_model_base_url(args)
+    prepared = workflow_mod.prepare_oragentbench_run(
+        source=args.source,
+        task=args.task,
+        agent=args.agent,
+        model=args.model,
+        date=args.date,
+        workspace=args.workspace,
+        wall_clock_sec=args.wall_clock_sec,
+        max_cost_usd=args.max_cost_usd,
+        auth_mode=args.auth_mode,
+        model_base_url=base_url,
+    )
+    payload: dict[str, Any] = {
+        "campaign_id": prepared.campaign_id,
+        "integration": "oragentbench",
+        "run_root": str(prepared.run_root),
+        "resumed": prepared.resumed,
+        "state": "prepared",
+        "preconditions": prepared.preconditions.to_dict(),
+    }
+    if args.execute:
+        ingested = workflow_mod.execute_prepared_run(
+            prepared, acknowledge_cost=args.acknowledge_cost
+        )
+        payload.update(
+            {
+                "state": "completed",
+                "trials": ingested.trials,
+                "orphans": ingested.orphans,
+                "normalized": str(ingested.normalized_path),
+                "report": str(ingested.report_dir / "summary.md"),
+            }
+        )
+    _print_json(payload)
+    return 0
 
 
 # --------------------------------------------------------------------------- #
