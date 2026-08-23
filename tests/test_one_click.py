@@ -11,6 +11,7 @@ import json
 import signal
 import shutil
 import subprocess
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -337,3 +338,44 @@ def test_wall_clock_timeout_terminates_the_upstream_process_group(monkeypatch, t
 
     assert code == 124
     assert killed == [(4321, signal.SIGTERM)]
+
+
+def test_completed_resume_refreshes_integrity_after_reingest(
+    monkeypatch, upstream_fixtures: Path, tmp_path: Path
+):
+    from orbenchlab import execution, workflow
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    run_root = tmp_path / "runs" / "campaign"
+    run_root.mkdir(parents=True)
+    (run_root / "manifest.json").write_text('{"state":"completed"}\n')
+    workflow._write_integrity(run_root)
+    prepared = workflow.PreparedRun(
+        run_root=run_root,
+        campaign_id="campaign",
+        command=execution.UpstreamCommand(
+            argv=("unused",), cwd=str(source.parent), required_env=(), provenance="test", description="test"
+        ),
+        preconditions=execution.PreconditionReport(),
+        resumed=True,
+        agent="oracle",
+        model="",
+        task="single_task",
+        source=source,
+        wall_clock_sec=20,
+        auth_mode="api-key",
+        model_base_url="",
+    )
+    monkeypatch.setattr(execution.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def fake_ingest(**kwargs):
+        (run_root / "normalized").mkdir()
+        (run_root / "normalized" / "rollout.json").write_text("{}\n")
+        return SimpleNamespace()
+
+    monkeypatch.setattr(workflow, "ingest_harbor_bundle", fake_ingest)
+
+    workflow.execute_prepared_run(prepared)
+
+    integrity = (run_root / "integrity.sha256").read_text()
+    assert "normalized/rollout.json" in integrity

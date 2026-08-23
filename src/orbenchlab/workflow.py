@@ -418,9 +418,11 @@ def execute_prepared_run(
         manifest_path = prepared.run_root / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if manifest.get("state") == "completed":
-            return ingest_harbor_bundle(
+            ingested = ingest_harbor_bundle(
                 run_root=prepared.run_root, jobs_root=prepared.run_root / "jobs"
             )
+            _write_integrity(prepared.run_root)
+            return ingested
         manifest["state"] = "running"
         manifest["runner_pid"] = os.getpid()
         _atomic_json(manifest_path, manifest)
