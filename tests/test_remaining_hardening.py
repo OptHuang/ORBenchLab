@@ -521,6 +521,11 @@ def test_execute_rechecks_integrity_after_prepare_before_launch(
     )
     monkeypatch.setattr(
         execution,
+        "_probe_uv_cli",
+        lambda *args, **kwargs: (True, "fixture uv is compatible"),
+    )
+    monkeypatch.setattr(
+        execution,
         "_probe_docker_daemon",
         lambda *args, **kwargs: (True, "fixture Docker is reachable"),
     )
@@ -570,6 +575,11 @@ def test_execute_uses_the_frozen_snapshot_when_the_operator_checkout_drifts(
         execution,
         "_probe_harbor_version",
         lambda *args, **kwargs: (True, "fixture Harbor is compatible"),
+    )
+    monkeypatch.setattr(
+        execution,
+        "_probe_uv_cli",
+        lambda *args, **kwargs: (True, "fixture uv is compatible"),
     )
     monkeypatch.setattr(
         execution,

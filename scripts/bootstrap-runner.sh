@@ -75,6 +75,27 @@ if [[ -n "$harbor_bin" && ! -e "$venv_harbor" && ! -L "$venv_harbor" ]]; then
   ln -s "$harbor_bin" "$venv_harbor"
 fi
 
+# Harbor's uv-script metric shells out to `uv` after the trial finishes.  A
+# uv-tool Harbor installation can work while `uv` itself is absent from a
+# non-login PATH, which would otherwise fail only after a full container run.
+uv_bin=""
+if command -v uv >/dev/null 2>&1; then
+  uv_bin="$(command -v uv)"
+else
+  uv_dir="${ORBENCH_UV_BIN_DIR:-${HOME:?HOME must be set}/.local/bin}"
+  if [[ -x "$uv_dir/uv" ]]; then
+    uv_bin="$uv_dir/uv"
+  fi
+fi
+
+venv_uv="$repo_root/$venv_dir/bin/uv"
+if [[ -n "$uv_bin" && ! -e "$venv_uv" && ! -L "$venv_uv" ]]; then
+  if [[ "$uv_bin" != /* ]]; then
+    uv_bin="$(cd "$(dirname "$uv_bin")" && pwd -P)/$(basename "$uv_bin")"
+  fi
+  ln -s "$uv_bin" "$venv_uv"
+fi
+
 "$repo_root/$venv_dir/bin/orbench" --version
 
 echo "runner ready: $repo_root/$venv_dir/bin/orbench"
@@ -84,4 +105,11 @@ if [[ -x "$venv_harbor" ]]; then
 else
   echo "warning: Harbor was not found; prepare/report commands work, but ORAgentBench execution will fail doctor" >&2
   echo 'hint: install Harbor or set ORBENCH_HARBOR_BIN_DIR (for uv, usually $HOME/.local/share/uv/tools/harbor/bin), then rerun bootstrap' >&2
+fi
+if [[ -x "$venv_uv" ]]; then
+  "$venv_uv" --version
+  echo "uv ready via project venv: $venv_uv"
+else
+  echo "warning: uv was not found; Harbor uv-script metrics will fail doctor" >&2
+  echo 'hint: install uv or set ORBENCH_UV_BIN_DIR (usually $HOME/.local/bin), then rerun bootstrap' >&2
 fi

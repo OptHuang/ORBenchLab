@@ -368,6 +368,8 @@ def test_runner_bootstrap_persists_venv_bin_for_later_github_steps():
     script = Path("scripts/bootstrap-runner.sh").read_text(encoding="utf-8")
     assert "GITHUB_PATH" in script
     assert 'printf \'%s\\n\' "$repo_root/$venv_dir/bin"' in script
+    assert "ORBENCH_UV_BIN_DIR" in script
+    assert '"$venv_uv" --version' in script
 
 
 def test_oragentbench_jobs_upload_only_the_fixed_shareable_allowlist(workflows):

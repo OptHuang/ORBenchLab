@@ -982,6 +982,34 @@ def _probe_harbor_version(
     return True, f"Harbor CLI {rendered} is compatible (minimum Harbor {minimum})"
 
 
+def _probe_uv_cli(
+    executable: str,
+    *,
+    command_runner: CommandRunner | None = None,
+) -> tuple[bool, str]:
+    """Check the executable required by Harbor's compiled uv-script metric."""
+    runner = subprocess.run if command_runner is None else command_runner
+    argv = [executable, "--version"]
+    try:
+        result = runner(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=RUNNER_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, (
+            f"uv --version timed out after {RUNNER_PROBE_TIMEOUT_SECONDS:g}s; "
+            "the uv-script metric cannot run"
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False, "uv --version could not run; the uv-script metric cannot run"
+    if result.returncode != 0:
+        return False, "uv --version failed; the uv-script metric cannot run"
+    return True, "uv CLI is runnable for Harbor's uv-script metric"
+
+
 def _codex_auth_json_has_basic_structure(path: Path) -> bool:
     """Validate only the non-secret container shape; never return its contents."""
     try:
@@ -1144,6 +1172,12 @@ def oragentbench_preconditions(
             ok, description = _probe_harbor_version(
                 harbor, command_runner=command_runner
             )
+            report.require(ok, description)
+        uv = shutil.which("uv")
+        if uv is None:
+            report.require(False, "the uv CLI is on PATH for the uv-script metric")
+        else:
+            ok, description = _probe_uv_cli(uv, command_runner=command_runner)
             report.require(ok, description)
     if require_docker:
         docker = shutil.which("docker")

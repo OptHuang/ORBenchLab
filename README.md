@@ -44,10 +44,10 @@ pip install -e ".[dev]"
 Python 3.11+. One runtime dependency (PyYAML).
 
 For an execution host, the bootstrap script creates the local environment and
-also discovers Harbor installed by `uv tool`. If a non-interactive shell cannot
-see Harbor at its usual `$HOME/.local/share/uv/tools/harbor/bin`, the script
-links the discovered executable into `.venv/bin` without overwriting an
-existing command:
+also discovers Harbor installed by `uv tool` plus the `uv` executable required
+by Harbor's `uv-script` metric. If a non-interactive shell cannot see them at
+their usual user-local locations, the script links the discovered executables
+into `.venv/bin` without overwriting existing commands:
 
 ```bash
 ORBENCH_PYTHON="$HOME/.local/bin/python3.12" ./scripts/bootstrap-runner.sh
@@ -56,8 +56,9 @@ orbench --version
 harbor --version
 ```
 
-For a non-standard uv location, set `ORBENCH_HARBOR_BIN_DIR` to the directory
-containing `harbor`. The script never assumes a user name.
+For non-standard locations, set `ORBENCH_HARBOR_BIN_DIR` to the directory
+containing `harbor` and `ORBENCH_UV_BIN_DIR` to the directory containing `uv`.
+The script never assumes a user name.
 
 ## Use
 

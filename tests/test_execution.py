@@ -387,7 +387,11 @@ def test_preconditions_probe_the_docker_daemon_not_just_the_executable(
     )
 
     assert not report.ok
-    assert calls == [["/usr/bin/harbor", "--version"], ["/usr/bin/docker", "info"]]
+    assert calls == [
+        ["/usr/bin/harbor", "--version"],
+        ["/usr/bin/uv", "--version"],
+        ["/usr/bin/docker", "info"],
+    ]
     assert any("daemon" in item and "docker info" in item for item in report.missing)
     assert "daemon unavailable" not in json.dumps(report.to_dict())
 
@@ -425,6 +429,31 @@ def test_preconditions_require_a_parseable_supported_harbor_version(
     assert report.ok is expected_ok
     relevant = report.satisfied if expected_ok else report.missing
     assert any("Harbor" in item and "0.16" in item for item in relevant)
+
+
+def test_preconditions_require_uv_for_the_compiled_uv_script_metric(
+    oab_source, monkeypatch
+):
+    monkeypatch.setattr(
+        execution.shutil,
+        "which",
+        lambda name: None if name == "uv" else f"/usr/bin/{name}",
+    )
+
+    report = execution.oragentbench_preconditions(
+        source=oab_source,
+        task_name="single_task",
+        scaffold="oracle",
+        model="",
+        environ={},
+        require_docker=False,
+        command_runner=lambda argv, **kwargs: _probe_result(
+            list(argv), stdout="harbor, version 0.16.1\n"
+        ),
+    )
+
+    assert not report.ok
+    assert any("uv" in item and "metric" in item for item in report.missing)
 
 
 def test_preconditions_fail_closed_when_a_runner_probe_times_out(oab_source, monkeypatch):
