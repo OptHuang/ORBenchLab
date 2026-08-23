@@ -8,7 +8,9 @@ into a normalized slice plus a report without hand-written glue.
 from __future__ import annotations
 
 import json
+import signal
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -300,3 +302,33 @@ def test_ingest_refuses_a_partial_job_that_silently_drops_a_planned_run(tmp_path
 
     with pytest.raises(EvidenceError, match="missing planned run"):
         ingest_harbor_bundle(run_root=run_root, jobs_root=run_root / "jobs")
+
+
+def test_wall_clock_timeout_terminates_the_upstream_process_group(monkeypatch, tmp_path: Path):
+    from orbenchlab import workflow
+
+    killed: list[tuple[int, int]] = []
+
+    class FakeProcess:
+        pid = 4321
+
+        def __init__(self, *args, **kwargs):
+            assert kwargs["start_new_session"] is True
+            self.waits = 0
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired("fixture", timeout)
+            return -signal.SIGTERM
+
+    monkeypatch.setattr(workflow.subprocess, "Popen", FakeProcess)
+    monkeypatch.setattr(workflow.os, "killpg", lambda pid, sig: killed.append((pid, sig)))
+
+    with (tmp_path / "stdout").open("wb") as stdout, (tmp_path / "stderr").open("wb") as stderr:
+        code = workflow._run_process_group(
+            ["fixture"], cwd=tmp_path, environ={}, stdout=stdout, stderr=stderr, timeout_sec=20
+        )
+
+    assert code == 124
+    assert killed == [(4321, signal.SIGTERM)]

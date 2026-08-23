@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 from contextlib import contextmanager
@@ -160,6 +161,47 @@ def _git_head(source: Path) -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _run_process_group(
+    argv: list[str],
+    *,
+    cwd: str | Path,
+    environ: Mapping[str, str],
+    stdout: Any,
+    stderr: Any,
+    timeout_sec: int,
+) -> int:
+    """Run upstream under one killable process group and enforce the budget.
+
+    Harbor and Docker both create children.  Killing only the wrapper on a
+    timeout leaves those children consuming a shared runner and can corrupt the
+    next resume attempt, so the timeout owns a fresh process group.
+    """
+    process = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        env=dict(environ),
+        stdout=stdout,
+        stderr=stderr,
+        start_new_session=True,
+    )
+    try:
+        return int(process.wait(timeout=timeout_sec))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+        return 124
 
 
 def prepare_oragentbench_run(
@@ -388,18 +430,14 @@ def execute_prepared_run(
             with (logs / "upstream.stdout.log").open("wb") as stdout, (
                 logs / "upstream.stderr.log"
             ).open("wb") as stderr:
-                completed = subprocess.run(
+                exit_code = _run_process_group(
                     list(prepared.command.argv),
                     cwd=prepared.command.cwd,
-                    env=environ,
+                    environ=environ,
                     stdout=stdout,
                     stderr=stderr,
-                    timeout=prepared.wall_clock_sec + 1200,
-                    check=False,
+                    timeout_sec=prepared.wall_clock_sec,
                 )
-            exit_code = completed.returncode
-        except subprocess.TimeoutExpired:
-            exit_code = 124
         except OSError as exc:
             manifest["state"] = "failed"
             manifest["failure"] = f"{type(exc).__name__}: {exc}"
