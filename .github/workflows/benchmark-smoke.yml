@@ -35,10 +35,6 @@ on:
         default: validate-only
         type: choice
         options: [validate-only, oracle-controls, agent]
-      campaign:
-        description: Campaign spec for oracle-controls
-        required: false
-        default: campaigns/oragentbench-controls.yaml
       task:
         description: >-
           ORAgentBench: task directory name under harbor_tasks/, validated
@@ -51,6 +47,10 @@ on:
         default: claude-code
         type: choice
         options: [claude-code, codex, mini-swe-agent]
+      scaffold_version:
+        description: "ORAgentBench: exact released scaffold CLI version"
+        required: false
+        default: ""
       model:
         description: "ORAgentBench: exact pinned model id (no floating aliases)"
         required: false
@@ -110,6 +110,11 @@ jobs:
       run_agent_oab: ${{ steps.gate.outputs.run_agent_oab }}
       run_agent_fo: ${{ steps.gate.outputs.run_agent_fo }}
       evidence_label: ${{ steps.gate.outputs.evidence_label }}
+      # Only these normalized values may cross into either FrontierOR CLI.
+      # Raw workflow_dispatch strings never become argv.
+      stage1_instances: ${{ steps.frontieror-instances.outputs.stage1_instances }}
+      dev_set: ${{ steps.frontieror-instances.outputs.dev_set }}
+      test_set: ${{ steps.frontieror-instances.outputs.test_set }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
@@ -127,6 +132,47 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 
+      - name: Validate and normalize FrontierOR instance lists
+        id: frontieror-instances
+        if: inputs.integration == 'frontieror'
+        env:
+          STAGE1_INSTANCES: ${{ inputs.stage1_instances }}
+          DEV_SET: ${{ inputs.dev_set }}
+          TEST_SET: ${{ inputs.test_set }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          instance_name = re.compile(r"^(?:tiny|large_[1-9][0-9]*)$")
+          fields = (
+              ("stage1_instances", "stage-1", os.environ["STAGE1_INSTANCES"]),
+              ("dev_set", "dev", os.environ["DEV_SET"]),
+              ("test_set", "test", os.environ["TEST_SET"]),
+          )
+          normalized = []
+          for output_name, label, raw in fields:
+              tokens = raw.split()
+              invalid = [token for token in tokens if not instance_name.fullmatch(token)]
+              if not tokens or invalid:
+                  print(
+                      "::error::invalid FrontierOR "
+                      f"{label} instance list: every token must be 'tiny' or "
+                      f"'large_<N>' with N >= 1; invalid tokens: {invalid!r}",
+                      file=sys.stderr,
+                  )
+                  raise SystemExit(2)
+              normalized.append((output_name, " ".join(tokens)))
+
+          # Write nothing unless every list passed. Downstream jobs receive
+          # these normalized values, never the raw dispatch strings.
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+              for output_name, value in normalized:
+                  stream.write(f"{output_name}={value}\n")
+          PY
+
       - name: Clone the pinned upstream commit
         env:
           INTEGRATION: ${{ inputs.integration }}
@@ -137,29 +183,61 @@ jobs:
       - name: Validate inputs and build the upstream command (nothing executed)
         env:
           INTEGRATION: ${{ inputs.integration }}
+          MODE: ${{ inputs.mode }}
+          TASK: ${{ inputs.task }}
+          SCAFFOLD: ${{ inputs.scaffold }}
+          SCAFFOLD_VERSION: ${{ inputs.scaffold_version }}
+          MODEL: ${{ inputs.model }}
+          MODEL_BASE_URL: ${{ vars.MODEL_BASE_URL }}
+          CAMPAIGN_DATE: ${{ inputs.campaign_date }}
+          PAPER_ID: ${{ inputs.paper_id }}
+          PRIMARY_MODEL: ${{ inputs.primary_model }}
+          STAGE1_INSTANCES: ${{ steps.frontieror-instances.outputs.stage1_instances }}
+          DEV_SET: ${{ steps.frontieror-instances.outputs.dev_set }}
+          TEST_SET: ${{ steps.frontieror-instances.outputs.test_set }}
+          RUN_ID: ${{ inputs.run_id }}
         run: |
           set -euo pipefail
           mkdir -p out
           if [ "$INTEGRATION" = "oragentbench" ]; then
-            python tools/run_benchmark_smoke.py oragentbench \
+            prepare_agent=oracle
+            prepare_model=""
+            if [ "$MODE" != "oracle-controls" ] && [ -n "$MODEL" ]; then
+              prepare_agent="$SCAFFOLD"
+              prepare_model="$MODEL"
+            elif [ "$MODE" = "agent" ]; then
+              echo "::error::mode=agent requires an exact pinned model id"
+              exit 1
+            fi
+            if [ "$prepare_agent" != "oracle" ] && [ -z "$SCAFFOLD_VERSION" ]; then
+              echo "::error::a paid ORAgentBench run requires scaffold_version"
+              exit 1
+            fi
+            scaffold_version_args=()
+            if [ -n "$SCAFFOLD_VERSION" ]; then
+              scaffold_version_args=(--scaffold-version "$SCAFFOLD_VERSION")
+            fi
+            orbench run oragentbench \
               --source upstream/ORAgentBench \
-              --task '${{ inputs.task }}' \
-              --scaffold '${{ inputs.scaffold }}' \
-              --model '${{ inputs.model }}' \
-              --date '${{ inputs.campaign_date }}' \
-              --campaign-slug "oab-${{ inputs.scaffold }}-smoke" \
-              --output-root out/benchmark-smoke \
-              --receipt out/preflight-receipt.json \
-              --allow-missing-tooling
+              --task "$TASK" \
+              --agent "$prepare_agent" \
+              --model "$prepare_model" \
+              "${scaffold_version_args[@]}" \
+              --date "$CAMPAIGN_DATE" \
+              --workspace out/benchmark-smoke \
+              --prepare-only > out/preflight-run.json
           else
+            read -r -a stage1_array <<< "$STAGE1_INSTANCES"
+            read -r -a dev_array <<< "$DEV_SET"
+            read -r -a test_array <<< "$TEST_SET"
             python tools/run_benchmark_smoke.py frontieror \
               --source upstream/FrontierOR \
-              --paper-id '${{ inputs.paper_id }}' \
-              --primary-model '${{ inputs.primary_model }}' \
-              --stage1-instances ${{ inputs.stage1_instances }} \
-              --dev-set ${{ inputs.dev_set }} \
-              --test-set ${{ inputs.test_set }} \
-              --run-id '${{ inputs.run_id }}' \
+              --paper-id "$PAPER_ID" \
+              --primary-model "$PRIMARY_MODEL" \
+              --stage1-instances "${stage1_array[@]}" \
+              --dev-set "${dev_array[@]}" \
+              --test-set "${test_array[@]}" \
+              --run-id "$RUN_ID" \
               --receipt out/preflight-receipt.json \
               --allow-missing-tooling
           fi
@@ -170,16 +248,27 @@ jobs:
         # `harbor run` command it would execute, then stop. It needs neither
         # Harbor, Docker nor a credential — so a real upstream check runs on
         # every dispatch instead of only on the paid path.
-        if: inputs.integration == 'oragentbench'
+        if: >-
+          inputs.integration == 'oragentbench' &&
+          inputs.mode != 'oracle-controls' &&
+          inputs.model != ''
+        env:
+          TASK: ${{ inputs.task }}
+          SCAFFOLD: ${{ inputs.scaffold }}
+          SCAFFOLD_VERSION: ${{ inputs.scaffold_version }}
+          MODEL: ${{ inputs.model }}
+          MODEL_BASE_URL: ${{ vars.MODEL_BASE_URL }}
+          CAMPAIGN_DATE: ${{ inputs.campaign_date }}
         run: |
           set -euo pipefail
           python tools/run_benchmark_smoke.py oragentbench \
             --source upstream/ORAgentBench \
-            --task '${{ inputs.task }}' \
-            --scaffold '${{ inputs.scaffold }}' \
-            --model '${{ inputs.model }}' \
-            --date '${{ inputs.campaign_date }}' \
-            --campaign-slug "oab-${{ inputs.scaffold }}-smoke" \
+            --task "$TASK" \
+            --scaffold "$SCAFFOLD" \
+            --model "$MODEL" \
+            --scaffold-version "$SCAFFOLD_VERSION" \
+            --date "$CAMPAIGN_DATE" \
+            --campaign-slug "oab-${SCAFFOLD}-smoke" \
             --output-root out/benchmark-smoke \
             --upstream-dry-run --execute \
             --receipt out/upstream-dry-run-receipt.json
@@ -238,6 +327,7 @@ jobs:
           # the execution host.
           path: |
             out/benchmark-smoke/**/plan/**
+            out/preflight-run.json
             out/*receipt.json
           retention-days: 7
           if-no-files-found: warn
@@ -258,51 +348,96 @@ jobs:
           set -euo pipefail
           missing=0
           command -v docker >/dev/null 2>&1 || { echo "::error::docker is not available on this runner"; missing=1; }
-          command -v harbor >/dev/null 2>&1 || { echo "::error::the harbor CLI is not installed on this runner"; missing=1; }
-          command -v python3 >/dev/null 2>&1 || { echo "::error::python3 is not available on this runner"; missing=1; }
           [ "$missing" -eq 0 ] || exit 1
 
-      - name: Install package and clone the pinned upstream commit
+      - name: Bootstrap the tested runtime and clone the pinned upstream commit
         run: |
           set -euo pipefail
-          python3 -m pip install --upgrade pip
-          python3 -m pip install -e .
+          ./scripts/bootstrap-runner.sh
+          export PATH="$PWD/.venv/bin:$PATH"
+          command -v harbor >/dev/null 2>&1 || { echo "::error::the harbor CLI is not installed on this runner"; exit 1; }
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
           bash .github/scripts/clone-upstream.sh oragentbench upstream
 
-      - name: Verify the upstream checkout still satisfies the contract
+      - name: Run oracle and nop through the one-command lifecycle
+        env:
+          TASK: ${{ inputs.task }}
+          CAMPAIGN_DATE: ${{ inputs.campaign_date }}
+          ORBENCH_RUNS_ROOT: ${{ vars.ORBENCH_RUNS_ROOT }}
         run: |
           set -euo pipefail
-          mkdir -p out
-          orbench integration inspect oragentbench --source upstream/ORAgentBench \
-            --json out/oragentbench-inspection.json > /dev/null
+          export PATH="$PWD/.venv/bin:$PATH"
+          RUN_WORKSPACE="$(./scripts/validate-run-workspace.sh "$ORBENCH_RUNS_ROOT" controls)"
+          mkdir -p out/share
 
-      - name: Run the zero-cost controls through Harbor
-        run: |
-          set -euo pipefail
-          orbench campaign plan '${{ inputs.campaign }}' --out out/plan
-          # `harbor run -c <config>` from the checkout's parent: exactly what
-          # upstream's experiments/scripts/run_oracle_all.sh does.
-          for config in out/plan/jobs/*.yaml; do
-            echo "+ harbor run -c $(realpath "$config")"
-            ( cd upstream && harbor run -c "$(realpath "../$config")" )
+          export_orbench_shareable() {
+            local result_json="$1"
+            local destination="$2"
+            local run_root
+            local workspace_real
+            local run_root_real
+            run_root=$(.venv/bin/python -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["run_root"])' "$result_json")
+            workspace_real=$(realpath "$RUN_WORKSPACE")
+            run_root_real=$(realpath "$run_root")
+            case "$run_root_real/" in
+              "$workspace_real"/*) ;;
+              *) echo "::error::refusing to export evidence outside the controlled run workspace"; return 1 ;;
+            esac
+            orbench export \
+              --run-root "$run_root_real" \
+              --destination "$destination" > "${result_json%.json}-export.json"
+          }
+
+          for agent in oracle nop; do
+            orbench doctor oragentbench \
+              --source upstream/ORAgentBench \
+              --task "$TASK" \
+              --agent "$agent" > "out/${agent}-doctor.json"
+            orbench run oragentbench \
+              --source upstream/ORAgentBench \
+              --task "$TASK" \
+              --agent "$agent" \
+              --date "$CAMPAIGN_DATE" \
+              --workspace "$RUN_WORKSPACE" \
+              --execute > "out/${agent}-run.json"
+            export_orbench_shareable \
+              "out/${agent}-run.json" "out/share/${agent}"
           done
 
-      - name: Upload the control summary only
+      - name: Confirm the share bundle contains no raw Harbor or auth material
+        run: |
+          set -euo pipefail
+          if find out/share -type f \( \
+            -name trajectory.json -o \
+            -name agent.json -o \
+            -name auth.json -o \
+            -name '*.log' -o \
+            -name config.json -o \
+            -name manifest.json -o \
+            -name receipt.json -o \
+            -name integrity.sha256 \
+          \) -print -quit | grep -q .; then
+            echo "::error::raw Harbor or auth material reached the share bundle"
+            exit 1
+          fi
+
+      - name: Upload the shareable control evidence only
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        if: always()
+        # Never publish a partial control pair: if either control or the
+        # share-bundle guard fails, the evidence remains on the runner.
+        if: success()
         with:
-          name: controls-summary
-          path: |
-            out/plan/plan.json
-            out/plan/plan_ledger.json
-            out/oragentbench-inspection.json
+          name: controls-evidence
+          # Only host-derived normalized evidence and its audit metadata.
+          # Raw jobs/, trajectories, logs and credentials stay on the runner.
+          path: out/share/**
           retention-days: 14
-          if-no-files-found: warn
+          if-no-files-found: error
 
   agent-oragentbench:
-    # Real cost. Runs upstream's own Harbor wrapper — the same path
-    # experiments/scripts/run_claude_code.sh takes — against a job config
-    # compiled from validated inputs.
+    # Real cost. The one-command lifecycle validates the checkout and runner,
+    # prepares an auditable workspace, executes upstream Harbor, ingests the
+    # result and renders the report before anything is eligible for upload.
     needs: preflight
     if: needs.preflight.outputs.run_agent_oab == 'true'
     # Required reviewers on this environment are what actually stop an
@@ -325,36 +460,82 @@ jobs:
           [ -n "${MODEL_API_KEY:-}" ] || { echo "::error::repository secret MODEL_API_KEY is not configured"; missing=1; }
           [ -n "${MODEL_BASE_URL:-}" ] || { echo "::error::repository variable MODEL_BASE_URL is not configured"; missing=1; }
           command -v docker >/dev/null 2>&1 || { echo "::error::docker is not available on this runner"; missing=1; }
-          command -v harbor >/dev/null 2>&1 || { echo "::error::the harbor CLI is not installed on this runner"; missing=1; }
           [ "$missing" -eq 0 ] || exit 1
 
-      - name: Install package and clone the pinned upstream commit
+      - name: Bootstrap the tested runtime and clone the pinned upstream commit
         run: |
           set -euo pipefail
-          python3 -m pip install --upgrade pip
-          python3 -m pip install -e .
+          ./scripts/bootstrap-runner.sh
+          export PATH="$PWD/.venv/bin:$PATH"
+          command -v harbor >/dev/null 2>&1 || { echo "::error::the harbor CLI is not installed on this runner"; exit 1; }
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
           bash .github/scripts/clone-upstream.sh oragentbench upstream
 
-      - name: Run the agent through upstream's Harbor wrapper
+      - name: Doctor, run, ingest and export the shareable evidence
         env:
           MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
           MODEL_BASE_URL: ${{ vars.MODEL_BASE_URL }}
+          TASK: ${{ inputs.task }}
+          SCAFFOLD: ${{ inputs.scaffold }}
+          SCAFFOLD_VERSION: ${{ inputs.scaffold_version }}
+          MODEL: ${{ inputs.model }}
+          CAMPAIGN_DATE: ${{ inputs.campaign_date }}
+          ACKNOWLEDGE_COST: ${{ inputs.acknowledge_cost }}
+          ORBENCH_RUNS_ROOT: ${{ vars.ORBENCH_RUNS_ROOT }}
         run: |
           set -euo pipefail
-          mkdir -p out
-          # The script validates the task against the checkout, compiles the
-          # job config, checks preconditions and then hands the argv to
-          # upstream's own wrapper, which execs `harbor run -c`.
-          python3 tools/run_benchmark_smoke.py oragentbench \
+          export PATH="$PWD/.venv/bin:$PATH"
+          RUN_WORKSPACE="$(./scripts/validate-run-workspace.sh "$ORBENCH_RUNS_ROOT" agent)"
+          # The exporter creates its destination atomically and deliberately
+          # rejects a pre-existing directory with different contents.
+          mkdir -p out/share
+          orbench doctor oragentbench \
             --source upstream/ORAgentBench \
-            --task '${{ inputs.task }}' \
-            --scaffold '${{ inputs.scaffold }}' \
-            --model '${{ inputs.model }}' \
-            --date '${{ inputs.campaign_date }}' \
-            --campaign-slug "oab-${{ inputs.scaffold }}-smoke" \
-            --output-root "$RUNNER_TEMP/orbench/benchmark-smoke" \
-            --receipt out/agent-receipt.json \
-            --execute --acknowledge-cost '${{ inputs.acknowledge_cost }}'
+            --task "$TASK" \
+            --agent "$SCAFFOLD" \
+            --model "$MODEL" \
+            --scaffold-version "$SCAFFOLD_VERSION" \
+            --auth-mode api-key \
+            --model-base-url "$MODEL_BASE_URL" > out/agent-doctor.json
+
+          orbench run oragentbench \
+            --source upstream/ORAgentBench \
+            --task "$TASK" \
+            --agent "$SCAFFOLD" \
+            --model "$MODEL" \
+            --scaffold-version "$SCAFFOLD_VERSION" \
+            --auth-mode api-key \
+            --model-base-url "$MODEL_BASE_URL" \
+            --date "$CAMPAIGN_DATE" \
+            --workspace "$RUN_WORKSPACE" \
+            --execute \
+            --acknowledge-cost "$ACKNOWLEDGE_COST" > out/agent-run.json
+
+          run_root=$(.venv/bin/python -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["run_root"])' out/agent-run.json)
+          workspace_real=$(realpath "$RUN_WORKSPACE")
+          run_root_real=$(realpath "$run_root")
+          case "$run_root_real/" in
+            "$workspace_real"/*) ;;
+            *) echo "::error::refusing to export evidence outside the controlled run workspace"; exit 1 ;;
+          esac
+
+          orbench export \
+            --run-root "$run_root_real" \
+            --destination out/share/agent > out/agent-export.json
+
+          if find out/share -type f \( \
+            -name trajectory.json -o \
+            -name agent.json -o \
+            -name auth.json -o \
+            -name '*.log' -o \
+            -name config.json -o \
+            -name manifest.json -o \
+            -name receipt.json -o \
+            -name integrity.sha256 \
+          \) -print -quit | grep -q .; then
+            echo "::error::raw Harbor or auth material reached the share bundle"
+            exit 1
+          fi
 
       - name: Record the evidence label this run may claim
         if: always()
@@ -362,16 +543,16 @@ jobs:
           echo "::notice::evidence label: ${{ needs.preflight.outputs.evidence_label }}"
           echo "::notice::a single smoke rollout supports case diagnosis only; the report renderer rejects comparative claims at R0"
 
-      - name: Upload the sanitized receipt only
+      - name: Upload the shareable normalized evidence only
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        if: always()
+        if: success()
         with:
-          name: agent-receipt-oragentbench
-          # The receipt alone. Job directories, trajectories and verifier
-          # output stay on the execution host.
-          path: out/agent-receipt.json
+          name: agent-evidence-oragentbench
+          # The exporter uses a fixed allowlist. Raw jobs/, trajectories,
+          # logs, verifier bundles and auth material stay on the runner.
+          path: out/share/**
           retention-days: 14
-          if-no-files-found: warn
+          if-no-files-found: error
 
   agent-frontieror:
     # Real cost, and only on a performance-isolated runner. FrontierOR's score
@@ -422,9 +603,19 @@ jobs:
       - name: Run the official trusted-agent evaluation
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PAPER_ID: ${{ inputs.paper_id }}
+          PRIMARY_MODEL: ${{ inputs.primary_model }}
+          STAGE1_INSTANCES: ${{ needs.preflight.outputs.stage1_instances }}
+          DEV_SET: ${{ needs.preflight.outputs.dev_set }}
+          TEST_SET: ${{ needs.preflight.outputs.test_set }}
+          RUN_ID: ${{ inputs.run_id }}
+          ACKNOWLEDGE_COST: ${{ inputs.acknowledge_cost }}
         run: |
           set -euo pipefail
           mkdir -p out
+          read -r -a stage1_array <<< "$STAGE1_INSTANCES"
+          read -r -a dev_array <<< "$DEV_SET"
+          read -r -a test_array <<< "$TEST_SET"
           # The script validates the paper id and instance split against the
           # checkout, refuses any flag from upstream's fixed trusted profile,
           # and then invokes `python -m frontieror.infra agent`. Upstream
@@ -432,14 +623,14 @@ jobs:
           # access / anti-hack itself.
           python3 tools/run_benchmark_smoke.py frontieror \
             --source upstream/FrontierOR \
-            --paper-id '${{ inputs.paper_id }}' \
-            --primary-model '${{ inputs.primary_model }}' \
-            --stage1-instances ${{ inputs.stage1_instances }} \
-            --dev-set ${{ inputs.dev_set }} \
-            --test-set ${{ inputs.test_set }} \
-            --run-id '${{ inputs.run_id }}' \
+            --paper-id "$PAPER_ID" \
+            --primary-model "$PRIMARY_MODEL" \
+            --stage1-instances "${stage1_array[@]}" \
+            --dev-set "${dev_array[@]}" \
+            --test-set "${test_array[@]}" \
+            --run-id "$RUN_ID" \
             --receipt out/agent-receipt.json \
-            --execute --acknowledge-cost '${{ inputs.acknowledge_cost }}'
+            --execute --acknowledge-cost "$ACKNOWLEDGE_COST"
 
       - name: Record what this run may and may not claim
         if: always()

@@ -110,6 +110,16 @@ def build_parser() -> argparse.ArgumentParser:
     oab.add_argument("--task", help="task directory name under harbor_tasks/")
     oab.add_argument("--scaffold", default="claude-code", help="agent scaffold or a control")
     oab.add_argument("--model", default="", help="pinned model id")
+    oab.add_argument(
+        "--scaffold-version",
+        default="",
+        help="exact released CLI version baked into the scaffold image",
+    )
+    oab.add_argument(
+        "--model-base-url",
+        default="",
+        help="pinned HTTPS provider route; defaults to MODEL_BASE_URL without printing it",
+    )
     oab.add_argument("--campaign-slug", default="oragentbench-agent-smoke")
     oab.add_argument("--date", default="", help="campaign date, YYYY-MM-DD")
     oab.add_argument(
@@ -203,17 +213,20 @@ def _oragentbench(args: argparse.Namespace) -> int:
         digest = registry.inspect("oragentbench", source).facts["dataset_digest"]
 
     date = args.date or _require_date()
+    model_base_url = args.model_base_url or os.environ.get("MODEL_BASE_URL", "")
     raw_spec = execution.oragentbench_agent_campaign_spec(
         slug=args.campaign_slug,
         date=date,
         dataset_digest=digest,
         task_name=args.task,
         scaffold=args.scaffold,
+        scaffold_version=args.scaffold_version,
         model=args.model,
         seeds=(args.seed,),
         wall_clock_sec=args.wall_clock_sec,
         max_cost_usd=args.max_cost_usd,
         site=args.site,
+        model_base_url=model_base_url,
     )
 
     # Deterministic output root. The campaign id is a pure function of the spec,
@@ -244,7 +257,6 @@ def _oragentbench(args: argparse.Namespace) -> int:
         source=source,
         job_config=job_configs[0],
         python=args.python,
-        skip_build=True,
         dry_run=args.upstream_dry_run,
         # The credentials reach Harbor through the job config, so the command
         # carries their names rather than their values.
@@ -260,6 +272,7 @@ def _oragentbench(args: argparse.Namespace) -> int:
         # dry run: it stops after printing the transformed config and command.
         require_harbor=not args.allow_missing_tooling and not args.upstream_dry_run,
         require_secrets=not args.upstream_dry_run,
+        model_base_url=model_base_url,
     )
 
     return _finish(

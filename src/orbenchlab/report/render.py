@@ -251,9 +251,10 @@ def _render_markdown(
         add("## Mandatory disclosures")
         add("")
         add(
-            "These counts are always shown. Trials flagged `infra_suspect` stay in the "
-            "capability denominator: a busy host correlating with a timeout is a reason to "
-            "trust the number less, not a licence to delete it."
+            "These counts are always shown. `infra_suspect` and capability inclusion are "
+            "separate fields: soft load evidence alone does not reassign blame, while hard "
+            "or contradictory evidence may explicitly exclude a trial with an "
+            "`exclusion_basis`."
         )
         add("")
         add(_table_header())

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,24 @@ import yaml
 from ..core.errors import EvidenceError
 from ..report import render as render_mod
 from ..report.model import NormalizedRollout, validate_normalized
+
+
+_ORAGENTBENCH_REQUIRED_REWARD_KEYS = frozenset({"feasibility", "quality"})
+_ORAGENTBENCH_MULTISTEP_REWARD_KEYS = frozenset(
+    {"feasibility", "quality", "reward"}
+)
+_ORAGENTBENCH_SINGLE_REWARD_SCHEMA = "oragentbench-rewards-v1"
+_ORAGENTBENCH_MULTISTEP_REWARD_SCHEMA = "oragentbench-multistep-rewards-v1"
+_ORAGENTBENCH_PRESERVED_TIMEOUT_REWARD_SCHEMA = (
+    "oragentbench-preserved-timeout-rewards-v1"
+)
+_ORAGENTBENCH_UPSTREAM_REWARD_PROVENANCE = "upstream-verifier"
+_ORAGENTBENCH_PRESERVED_TIMEOUT_REWARD_PROVENANCE = (
+    "oragentbench-wrapper-preserved-timeout-fallback"
+)
+_ORAGENTBENCH_PRESERVED_TIMEOUT_EXCEPTION_TYPES = frozenset(
+    {"AgentTimeoutError", "VerifierTimeoutError"}
+)
 
 
 @dataclass(frozen=True)
@@ -125,8 +144,186 @@ def _exception_types(result: Mapping[str, Any]) -> list[str]:
     return values
 
 
-def _attribution(result: Mapping[str, Any], rewards: Mapping[str, Any] | None) -> tuple[str, bool, bool, str | None]:
+def _validated_reward_mapping(
+    raw: Any,
+    *,
+    where: str,
+    multistep: bool,
+) -> dict[str, float]:
+    """Validate the pinned ORAgentBench verifier contract without coercion.
+
+    The pinned dataset emits the two official dimensions on every task.  Its
+    multi-step tasks additionally emit Harbor's derived scalar ``reward`` on
+    some (but not all fallback) verifier paths.  That extension is accepted
+    only for a real Harbor multi-step result; all other keys are drift.
+    """
+
+    allowed = (
+        _ORAGENTBENCH_MULTISTEP_REWARD_KEYS
+        if multistep
+        else _ORAGENTBENCH_REQUIRED_REWARD_KEYS
+    )
+    problems: list[str] = []
+    if not isinstance(raw, dict):
+        raise EvidenceError(
+            f"{where} reward schema violation: expected an object, got "
+            f"{type(raw).__name__}"
+        )
+
+    actual = set(raw)
+    missing = sorted(_ORAGENTBENCH_REQUIRED_REWARD_KEYS - actual)
+    unknown = sorted(actual - allowed)
+    if missing:
+        problems.append(f"missing required key(s) {missing}")
+    if unknown:
+        problems.append(f"unknown key(s) {unknown}")
+    for key in sorted(actual & allowed):
+        value = raw[key]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            problems.append(
+                f"{key!r} must be a finite non-boolean number, got "
+                f"{type(value).__name__}"
+            )
+    if problems:
+        raise EvidenceError(f"{where} reward schema violation: {'; '.join(problems)}")
+    return {key: float(raw[key]) for key in sorted(actual)}
+
+
+def _preserved_timeout_fallback_exception(
+    result: Mapping[str, Any], raw_rewards: Any
+) -> str | None:
+    """Recognize only the pinned wrapper's synthetic resume-cleanup result.
+
+    ORAgentBench commit ``c9eb952`` synthesizes a zero vector when
+    ``--cleanup-before-resume`` recovers an agent or verifier timeout from the
+    previous job summary.  The scalar ``reward`` is not part of the ordinary
+    single-step verifier contract, so the complete wrapper fingerprint is
+    required before accepting it.
+    """
+
+    info = result.get("exception_info")
+    if not isinstance(info, dict):
+        return None
+    exception_type = info.get("exception_type")
+    if exception_type not in _ORAGENTBENCH_PRESERVED_TIMEOUT_EXCEPTION_TYPES:
+        return None
+    expected_message = (
+        f"{exception_type} preserved from the previous top-level job summary "
+        "during cleanup-before-resume."
+    )
+    if info.get("exception_message") != expected_message:
+        return None
+    if result.get("step_results") != []:
+        return None
+    if not isinstance(raw_rewards, dict):
+        return None
+    if set(raw_rewards) != _ORAGENTBENCH_MULTISTEP_REWARD_KEYS:
+        return None
+    for value in raw_rewards.values():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) != 0.0
+        ):
+            return None
+    return str(exception_type)
+
+
+def _validated_rewards(
+    result: Mapping[str, Any],
+) -> tuple[dict[str, float] | None, str | None, str | None, str | None]:
+    """Validate top-level and per-step rewards, returning the report vector."""
+
+    raw_steps = result.get("step_results")
+    if raw_steps is not None and not isinstance(raw_steps, list):
+        raise EvidenceError(
+            f"trial {result.get('trial_name')!r} step_results must be a list or null"
+        )
+    multistep = bool(raw_steps)
+    trial_name = result.get("trial_name")
+
+    verifier = result.get("verifier_result")
+    if verifier is not None and not isinstance(verifier, dict):
+        raise EvidenceError(
+            f"trial {trial_name!r} verifier_result must be an object or null"
+        )
+    raw_rewards = verifier.get("rewards") if isinstance(verifier, dict) else None
+    preserved_timeout_exception = _preserved_timeout_fallback_exception(
+        result, raw_rewards
+    )
+    rewards = (
+        _validated_reward_mapping(
+            raw_rewards,
+            where=f"trial {trial_name!r} verifier_result",
+            multistep=multistep or preserved_timeout_exception is not None,
+        )
+        if raw_rewards is not None
+        else None
+    )
+
+    for index, step in enumerate(raw_steps or []):
+        if not isinstance(step, dict):
+            raise EvidenceError(
+                f"trial {trial_name!r} step_results[{index}] must be an object"
+            )
+        step_verifier = step.get("verifier_result")
+        if step_verifier is None:
+            continue
+        if not isinstance(step_verifier, dict):
+            raise EvidenceError(
+                f"trial {trial_name!r} step_results[{index}].verifier_result "
+                "must be an object or null"
+            )
+        step_raw = step_verifier.get("rewards")
+        if step_raw is not None:
+            _validated_reward_mapping(
+                step_raw,
+                where=f"trial {trial_name!r} step_results[{index}] verifier_result",
+                multistep=True,
+            )
+
+    if rewards is None:
+        return None, None, None, None
+    if preserved_timeout_exception is not None:
+        return (
+            rewards,
+            _ORAGENTBENCH_PRESERVED_TIMEOUT_REWARD_SCHEMA,
+            _ORAGENTBENCH_PRESERVED_TIMEOUT_REWARD_PROVENANCE,
+            preserved_timeout_exception,
+        )
+    version = (
+        _ORAGENTBENCH_MULTISTEP_REWARD_SCHEMA
+        if multistep
+        else _ORAGENTBENCH_SINGLE_REWARD_SCHEMA
+    )
+    return rewards, version, _ORAGENTBENCH_UPSTREAM_REWARD_PROVENANCE, None
+
+
+def _attribution(
+    result: Mapping[str, Any],
+    rewards: Mapping[str, Any] | None,
+    preserved_timeout_exception: str | None,
+) -> tuple[str, bool, bool, str | None]:
+    if preserved_timeout_exception == "AgentTimeoutError":
+        # The wrapper deliberately preserves this as a scored zero capability
+        # outcome after resume cleanup. It is not contradictory verifier data.
+        return "agent", True, False, None
+    if preserved_timeout_exception == "VerifierTimeoutError":
+        # Preserve the diagnostic zero vector, but a verifier timeout cannot
+        # measure agent capability. Existing ingest semantics classify this as
+        # a verifier exclusion rather than hard infrastructure evidence.
+        return "verifier", False, False, "provider_or_verifier_error"
     if rewards is not None:
+        if _exception_types(result):
+            # A verifier score and a recorded exception are contradictory
+            # outcome signals. Preserve the score for diagnosis, but quarantine
+            # it from capability metrics instead of silently declaring success.
+            return "unknown", False, True, "ambiguous_reward_with_exception"
         return "agent", True, False, None
     joined = " ".join(_exception_types(result)).lower()
     if not joined:
@@ -138,7 +335,17 @@ def _attribution(result: Mapping[str, Any], rewards: Mapping[str, Any] | None) -
         return "provider", False, False, "provider_or_verifier_error"
     if "verifier" in joined:
         return "verifier", False, False, "provider_or_verifier_error"
-    if any(token in joined for token in ("environment", "docker", "setup", "artifact", "rewardfilenotfound")):
+    if any(
+        token in joined
+        for token in (
+            "environment",
+            "docker",
+            "setup",
+            "artifact",
+            "rewardfilenotfound",
+            "permission",
+        )
+    ):
         return "infra", False, True, "hard_infra_evidence"
     # Agent timeouts and solver failures are capability outcomes.  They stay in
     # the denominator, but have no verifier score and therefore remain visible
@@ -254,15 +461,16 @@ def ingest_harbor_bundle(*, run_root: str | Path, jobs_root: str | Path) -> Harb
         if not isinstance(planned, dict):
             raise EvidenceError(f"ledger run {run_id} has no matching entry in plan.json")
 
-        verifier = result.get("verifier_result") or {}
-        raw_rewards = verifier.get("rewards") if isinstance(verifier, dict) else None
-        rewards = raw_rewards if isinstance(raw_rewards, dict) else None
-        attribution, counts, infra_suspect, exclusion = _attribution(result, rewards)
-        numeric_scores = {
-            str(key): float(value)
-            for key, value in (rewards or {}).items()
-            if isinstance(value, (int, float))
-        }
+        (
+            rewards,
+            reward_schema_version,
+            reward_provenance,
+            preserved_timeout_exception,
+        ) = _validated_rewards(result)
+        attribution, counts, infra_suspect, exclusion = _attribution(
+            result, rewards, preserved_timeout_exception
+        )
+        numeric_scores = dict(rewards or {})
         agent_id = str(planned.get("agent_id") or "unknown")
         trials.append(
             {
@@ -276,6 +484,8 @@ def ingest_harbor_bundle(*, run_root: str | Path, jobs_root: str | Path) -> Harb
                 "counts_toward_capability": counts,
                 "infra_suspect": infra_suspect,
                 "exclusion_basis": exclusion,
+                "reward_schema_version": reward_schema_version,
+                "reward_provenance": reward_provenance,
                 "trace_status": _trace_status(result_path, result),
                 "replica_count": 1,
                 "cost_usd": _cost(result),

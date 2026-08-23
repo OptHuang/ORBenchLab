@@ -42,6 +42,29 @@ METRIC_SCRIPT = "metrics/per_dimension_reward.py"
 ORACLE_JOB_CONFIG = "experiments/config/run_oracle_all.yaml"
 DIFFICULTY_FILE = "difficulty.json"
 
+# Inputs that define the benchmark result, rather than just its task names.
+# The task package contains instructions, environment, solution and verifier;
+# the remaining paths define agent wrapping, images and score aggregation.
+IDENTITY_INPUTS = (
+    TASKS_DIR,
+    METRIC_SCRIPT,
+    DIFFICULTY_FILE,
+    ORACLE_JOB_CONFIG,
+    "experiments/scripts/run_oracle_all.sh",
+    "scripts/build_base_image.sh",
+    "source/scripts/run_harbor_prebuild.py",
+    "harbor_agents",
+    "skills",
+    "docker",
+)
+
+# Python imports can materialize bytecode inside the checkout.  These files are
+# neither benchmark source nor stable across interpreter versions, and hashing
+# them would make an otherwise identical checkout change identity after the
+# first dry run.  Source bytes and executable mode remain identity inputs.
+_GENERATED_IDENTITY_PARTS = frozenset({"__pycache__", ".pytest_cache"})
+_GENERATED_IDENTITY_SUFFIXES = (".pyc", ".pyo")
+
 #: Reward keys ORAgentBench's own ``tests/test.sh`` writes to
 #: ``/logs/verifier/reward.json``. Discovered by inspection, not assumed.
 EXPECTED_REWARD_KEYS = ("feasibility", "quality")
@@ -125,7 +148,7 @@ def inspect(source: Path) -> InspectionReport:
 
     parsed = _parse_tasks(task_dirs)
     _check_task_names(report, parsed)
-    _check_dataset_digest(report, parsed)
+    _check_dataset_digest(report, source)
     _check_reward_channel(report, parsed)
     _check_verifier_isolation(report, parsed)
     _check_multi_step(report, parsed)
@@ -244,20 +267,87 @@ def _check_task_names(report: InspectionReport, parsed: list[dict[str, Any]]) ->
         )
 
 
-def _check_dataset_digest(report: InspectionReport, parsed: list[dict[str, Any]]) -> None:
-    """Content-address the task set so run ids are pinned to a dataset state."""
+def _check_dataset_digest(report: InspectionReport, source: Path) -> None:
+    """Content-address every upstream input that can change a scored result.
+
+    Hashing only ``task.toml`` is insufficient: changing ``instruction.md`` or
+    ``tests/test.sh`` would otherwise reuse the same campaign id.  This is a
+    compact Merkle-style manifest over the complete task packages and the
+    upstream metric/wrapper/scaffold/image inputs consumed by the run.
+    """
     digest = hashlib.sha256()
-    for entry in sorted(parsed, key=lambda e: e["dir"]):
-        digest.update(entry["dir"].encode("utf-8"))
-        digest.update(entry["toml_digest"].encode("utf-8"))
+    digest.update(b"orbenchlab.oragentbench.identity.v3\0")
+    rows: list[tuple[str, str]] = []
+    unsafe_symlinks: list[str] = []
+    missing_or_empty_roots: list[str] = []
+    for declared in IDENTITY_INPUTS:
+        root = source / declared
+        if not root.exists() and not root.is_symlink():
+            rows.append((declared, "MISSING"))
+            missing_or_empty_roots.append(declared)
+            continue
+        root_file_count = 0
+        candidates = [root]
+        if root.is_dir() and not root.is_symlink():
+            candidates.extend(sorted(root.rglob("*")))
+        for path in candidates:
+            relative = path.relative_to(source).as_posix()
+            # Only checkout-relative components are meaningful.  A checkout
+            # living below a host directory named ``__pycache__`` must not
+            # cause the entire benchmark identity to disappear.
+            if _is_generated_identity_artifact(Path(relative)):
+                continue
+            if path.is_symlink():
+                unsafe_symlinks.append(relative)
+                rows.append((relative, f"SYMLINK:{path.readlink()}"))
+            elif path.is_file():
+                root_file_count += 1
+                executable = 1 if path.stat().st_mode & 0o111 else 0
+                content = hashlib.sha256(path.read_bytes()).hexdigest()
+                rows.append((relative, f"FILE:x{executable}:{content}"))
+        if root_file_count == 0:
+            missing_or_empty_roots.append(declared)
+    for relative, content_digest in sorted(rows):
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(content_digest.encode("utf-8"))
+        digest.update(b"\0")
     dataset_digest = f"sha256:{digest.hexdigest()}"
     report.facts["dataset_digest"] = dataset_digest
+    report.facts["identity_file_count"] = sum(value != "MISSING" for _, value in rows)
+    if missing_or_empty_roots:
+        report.add(
+            "dataset_identity_inputs",
+            "fail",
+            "one or more required benchmark identity roots are missing or contain no source files",
+            paths=sorted(set(missing_or_empty_roots)),
+        )
+    if unsafe_symlinks:
+        report.add(
+            "dataset_identity_symlinks",
+            "fail",
+            "identity inputs contain symlinks; refusing an identity that could read outside the checkout",
+            paths=unsafe_symlinks[:20],
+        )
     report.add(
         "dataset_digest",
         "pass",
-        "dataset digest computed over sorted (task dir, task.toml sha256) pairs",
+        "dataset digest covers complete task packages plus upstream metric, wrapper, scaffold and image inputs",
         dataset_digest=dataset_digest,
-        method="sha256(concat(sorted(dir_name || sha256(task.toml))))",
+        file_count=report.facts["identity_file_count"],
+        identity_inputs=list(IDENTITY_INPUTS),
+        method=(
+            "sha256(sorted(relative_path, executable_bit, sha256(file_bytes)); "
+            "missing paths explicit; generated bytecode excluded)"
+        ),
+    )
+
+
+def _is_generated_identity_artifact(path: Path) -> bool:
+    return (
+        any(part in _GENERATED_IDENTITY_PARTS for part in path.parts)
+        or path.name == ".DS_Store"
+        or path.name.endswith(_GENERATED_IDENTITY_SUFFIXES)
     )
 
 

@@ -250,6 +250,18 @@ def test_controls_are_computed_and_meet_their_expectations(controls):
     by_name = {m.name: m for m in compute_metrics(controls) if m.scope.startswith("control:")}
     assert by_name["oracle_pass_rate"].value == 1.0
     assert by_name["nop_fail_rate"].value == 1.0
+    oracle_ids = {
+        trial.run_id
+        for trial in controls.trials
+        if trial.scaffold == "oracle" and trial.counts_toward_capability
+    }
+    nop_ids = {
+        trial.run_id
+        for trial in controls.trials
+        if trial.scaffold == "nop" and trial.counts_toward_capability
+    }
+    assert set(by_name["oracle_pass_rate"].run_ids) == oracle_ids
+    assert set(by_name["nop_fail_rate"].run_ids) == nop_ids
 
 
 def test_repetition_class_follows_the_weakest_configuration():
@@ -277,8 +289,18 @@ def test_excluded_trials_leave_the_capability_denominator(controls):
 
 
 def test_disclosures_are_always_present(controls):
-    names = {m.name for m in compute_metrics(controls) if m.scope == "disclosure"}
-    assert names == {"infra_suspect_share", "orphan_trial_count", "no_load_sampling_share"}
+    disclosure = [m for m in compute_metrics(controls) if m.scope == "disclosure"]
+    names = {m.name for m in disclosure}
+    assert names == {
+        "infra_suspect_share",
+        "excluded_trial_share",
+        "orphan_trial_count",
+        "no_load_sampling_share",
+    }
+    excluded_share = next(m for m in disclosure if m.name == "excluded_trial_share")
+    assert set(excluded_share.run_ids) == {trial.run_id for trial in controls.trials}
+    no_load_share = next(m for m in disclosure if m.name == "no_load_sampling_share")
+    assert set(no_load_share.run_ids) == {trial.run_id for trial in controls.trials}
 
 
 def test_only_the_verifier_grade_may_drive_a_gate():

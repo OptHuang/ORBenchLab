@@ -8,7 +8,11 @@ an immutable commit, and that the secret-handling and fail-closed rules hold.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import subprocess
+import uuid
 from pathlib import Path
 
 import pytest
@@ -25,6 +29,30 @@ EXPECTED_WORKFLOWS = {
 SHA_PINNED = re.compile(r"^[\w.-]+/[\w.-]+(?:/[\w.-]+)*@[0-9a-f]{40}$")
 _USES = re.compile(r"^\s*-?\s*uses:\s*(\S+)", re.MULTILINE)
 _SECRET_REF = re.compile(r"\$\{\{\s*secrets\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+
+
+def _validate_run_workspace(
+    repo_root: Path,
+    root: Path,
+    *,
+    runner_temp: Path | None = None,
+    github_workspace: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["ORBENCH_MIN_FREE_KB"] = "0"
+    env.pop("RUNNER_TEMP", None)
+    env.pop("GITHUB_WORKSPACE", None)
+    if runner_temp is not None:
+        env["RUNNER_TEMP"] = str(runner_temp)
+    if github_workspace is not None:
+        env["GITHUB_WORKSPACE"] = str(github_workspace)
+    return subprocess.run(
+        ["bash", str(repo_root / "scripts/validate-run-workspace.sh"), str(root), "controls"],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
 
 
 def _workflow_paths(repo_root: Path) -> list[Path]:
@@ -188,6 +216,58 @@ def test_self_hosted_jobs_are_confined_to_the_smoke_workflow(workflows):
 # --------------------------------------------------------------------------- #
 
 
+def test_workspace_validator_rejects_system_temporary_descendants(repo_root):
+    suffix = f"orbenchlab-workspace-test-{uuid.uuid4().hex}"
+    candidates = (Path("/tmp") / suffix, Path("/var/tmp") / suffix)
+    try:
+        for candidate in candidates:
+            result = _validate_run_workspace(repo_root, candidate)
+            assert result.returncode == 2, (candidate, result.stderr)
+            assert "durable and dedicated" in result.stderr
+            assert not candidate.exists(), f"validator created rejected root {candidate}"
+    finally:
+        for candidate in candidates:
+            shutil.rmtree(candidate, ignore_errors=True)
+
+
+def test_workspace_validator_rejects_runner_temp_and_descendants(repo_root, tmp_path):
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    descendant = runner_temp / "orbench-runs"
+
+    for candidate in (runner_temp, descendant):
+        result = _validate_run_workspace(repo_root, candidate, runner_temp=runner_temp)
+        assert result.returncode == 2, (candidate, result.stderr)
+        assert "durable and dedicated" in result.stderr
+    assert not descendant.exists(), "validator created a workspace inside RUNNER_TEMP"
+
+
+def test_workspace_validator_rejects_checkout_and_descendants(repo_root, tmp_path):
+    checkout = tmp_path / "github-workspace"
+    checkout.mkdir()
+    descendant = checkout / "benchmark-runs"
+
+    for candidate in (checkout, descendant):
+        result = _validate_run_workspace(
+            repo_root, candidate, github_workspace=checkout
+        )
+        assert result.returncode == 2, (candidate, result.stderr)
+        assert "durable and dedicated" in result.stderr
+    assert not descendant.exists(), "validator created a workspace inside GITHUB_WORKSPACE"
+
+
+def test_workspace_validator_allows_a_controlled_absolute_persistent_root(repo_root):
+    root = repo_root / f".orbenchlab-durable-test-{uuid.uuid4().hex}"
+    try:
+        result = _validate_run_workspace(repo_root, root)
+        assert result.returncode == 0, result.stderr
+        expected = (root / "controls").resolve()
+        assert result.stdout.strip() == str(expected)
+        assert expected.is_dir()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_the_smoke_workflow_fails_closed_on_missing_prerequisites(raw_workflows):
     text = raw_workflows["benchmark-smoke.yml"]
     for needle in (
@@ -211,14 +291,33 @@ def test_github_hosted_frontieror_runs_are_labelled_exploratory(raw_workflows):
     assert "exploratory by construction" in text
 
 
-def test_both_agent_paths_invoke_the_checked_script(raw_workflows, workflows):
-    """The agent paths are real: each hands off to a tested command builder."""
+def test_both_agent_paths_invoke_a_tested_execution_lifecycle(raw_workflows, workflows):
+    """ORAgentBench uses one-click; FrontierOR keeps its official adapter."""
     smoke = workflows["benchmark-smoke.yml"]
     text = raw_workflows["benchmark-smoke.yml"]
     for job in ("agent-oragentbench", "agent-frontieror"):
         assert job in smoke["jobs"], job
-    assert text.count("tools/run_benchmark_smoke.py") >= 3
+    oab_scripts = "\n".join(
+        step.get("run", "") for step in smoke["jobs"]["agent-oragentbench"]["steps"]
+    )
+    frontier_scripts = "\n".join(
+        step.get("run", "") for step in smoke["jobs"]["agent-frontieror"]["steps"]
+    )
+    assert "orbench doctor oragentbench" in oab_scripts
+    assert "orbench run oragentbench" in oab_scripts
+    assert "--execute" in oab_scripts
+    assert "tools/run_benchmark_smoke.py oragentbench" not in oab_scripts
+    assert "tools/run_benchmark_smoke.py frontieror" in frontier_scripts
     assert "--execute --acknowledge-cost" in text
+
+
+def test_oragentbench_preflight_receives_only_the_nonsecret_provider_route(
+    raw_workflows,
+):
+    text = raw_workflows["benchmark-smoke.yml"]
+    preflight = text.split("  preflight:", 1)[1].split("  oracle-controls:", 1)[0]
+    assert "MODEL_BASE_URL: ${{ vars.MODEL_BASE_URL }}" in preflight
+    assert "secrets.MODEL_API_KEY" not in preflight
     # And no trace of the placeholder that used to sit here.
     assert "has no execution path in this release" not in text
 
@@ -244,16 +343,199 @@ def test_the_preflight_runs_a_zero_cost_upstream_check(raw_workflows):
     assert "neither Harbor, Docker nor a credential" in prose
 
 
-def test_agent_jobs_upload_only_a_receipt(workflows):
+def test_oragentbench_preflight_starts_with_the_one_click_prepare_path(workflows):
+    scripts = "\n".join(
+        step.get("run", "")
+        for step in workflows["benchmark-smoke.yml"]["jobs"]["preflight"]["steps"]
+    )
+    assert "orbench run oragentbench" in scripts
+    assert "--prepare-only" in scripts
+    assert "mode=agent requires an exact pinned model id" in scripts
+
+
+def test_self_hosted_oragentbench_jobs_use_the_runner_bootstrap(workflows):
     smoke = workflows["benchmark-smoke.yml"]
-    for job in ("agent-oragentbench", "agent-frontieror"):
+    for job_name in ("oracle-controls", "agent-oragentbench"):
+        scripts = "\n".join(
+            step.get("run", "") for step in smoke["jobs"][job_name]["steps"]
+        )
+        assert "./scripts/bootstrap-runner.sh" in scripts, job_name
+        assert '.venv/bin' in scripts, job_name
+        assert "python3 -m pip install -e ." not in scripts, job_name
+
+
+def test_oragentbench_jobs_upload_only_the_fixed_shareable_allowlist(workflows):
+    smoke = workflows["benchmark-smoke.yml"]
+    shareable = {
+        "normalized/rollout.json",
+        "report/summary.md",
+        "report/summary.json",
+        "report/evidence_index.json",
+        "public-receipt.json",
+        "public-manifest.json",
+        "share-integrity.sha256",
+    }
+    for job in ("oracle-controls", "agent-oragentbench"):
+        scripts = "\n".join(step.get("run", "") for step in smoke["jobs"][job]["steps"])
+        assert "orbench export" in scripts, job
+        for forbidden in (
+            "trajectory.json",
+            "agent.json",
+            "auth.json",
+            "*.log",
+            "config.json",
+            "manifest.json",
+            "receipt.json",
+            "integrity.sha256",
+        ):
+            assert forbidden in scripts, f"{job} does not reject {forbidden}"
         uploads = [
             step for step in smoke["jobs"][job]["steps"]
             if str(step.get("uses", "")).startswith("actions/upload-artifact")
         ]
         assert uploads, job
         for step in uploads:
-            assert step["with"]["path"].strip() == "out/agent-receipt.json", job
+            assert step["with"]["path"].strip() == "out/share/**", job
+            assert step["with"]["if-no-files-found"] == "error", job
+            assert step.get("if") == "success()", job
+
+    # The public file names are generated by the tested exporter rather than
+    # handwritten copy loops in the workflow.
+    exporter_source = (Path("src/orbenchlab/export.py")).read_text(encoding="utf-8")
+    assert all(marker in exporter_source for marker in shareable)
+
+
+def test_frontieror_agent_still_uploads_only_its_sanitized_receipt(workflows):
+    job = workflows["benchmark-smoke.yml"]["jobs"]["agent-frontieror"]
+    uploads = [
+        step for step in job["steps"]
+        if str(step.get("uses", "")).startswith("actions/upload-artifact")
+    ]
+    assert uploads
+    assert all(step["with"]["path"].strip() == "out/agent-receipt.json" for step in uploads)
+
+
+def _frontieror_instance_validation_step(workflows):
+    return next(
+        step
+        for step in workflows["benchmark-smoke.yml"]["jobs"]["preflight"]["steps"]
+        if step.get("id") == "frontieror-instances"
+    )
+
+
+def _run_frontieror_instance_validation(
+    workflows, tmp_path, **overrides
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    step = _frontieror_instance_validation_step(workflows)
+    output = tmp_path / "github-output"
+    values = {
+        "STAGE1_INSTANCES": "tiny",
+        "DEV_SET": "large_1",
+        "TEST_SET": "large_2",
+        **overrides,
+    }
+    env = {**os.environ, **values, "GITHUB_OUTPUT": str(output)}
+    result = subprocess.run(
+        ["bash"],
+        input=step["run"],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    return result, output.read_text(encoding="utf-8") if output.exists() else ""
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("STAGE1_INSTANCES", "tiny --execute"),
+        ("DEV_SET", ""),
+        ("TEST_SET", "large_0"),
+        ("DEV_SET", "large_1 ../large_2"),
+        ("TEST_SET", "large_2;echo injected"),
+    ],
+)
+def test_frontieror_dispatch_refuses_empty_or_non_instance_tokens(
+    workflows, tmp_path, field, value
+):
+    result, output = _run_frontieror_instance_validation(
+        workflows, tmp_path, **{field: value}
+    )
+    assert result.returncode != 0
+    assert "invalid FrontierOR" in result.stderr
+    assert output == ""
+
+
+def test_frontieror_dispatch_normalizes_only_official_instance_names(
+    workflows, tmp_path
+):
+    result, output = _run_frontieror_instance_validation(
+        workflows,
+        tmp_path,
+        STAGE1_INSTANCES="  tiny   large_12 ",
+        DEV_SET="large_1",
+        TEST_SET="large_99  large_2",
+    )
+    assert result.returncode == 0, result.stderr
+    assert output.splitlines() == [
+        "stage1_instances=tiny large_12",
+        "dev_set=large_1",
+        "test_set=large_99 large_2",
+    ]
+
+
+def test_frontieror_cli_paths_consume_only_preflight_validated_instance_outputs(
+    workflows
+):
+    smoke = workflows["benchmark-smoke.yml"]
+    preflight = smoke["jobs"]["preflight"]
+    assert preflight["outputs"]["stage1_instances"] == (
+        "${{ steps.frontieror-instances.outputs.stage1_instances }}"
+    )
+    assert preflight["outputs"]["dev_set"] == (
+        "${{ steps.frontieror-instances.outputs.dev_set }}"
+    )
+    assert preflight["outputs"]["test_set"] == (
+        "${{ steps.frontieror-instances.outputs.test_set }}"
+    )
+
+    preflight_run = next(
+        step
+        for step in preflight["steps"]
+        if step.get("name")
+        == "Validate inputs and build the upstream command (nothing executed)"
+    )
+    paid_run = next(
+        step
+        for step in smoke["jobs"]["agent-frontieror"]["steps"]
+        if step.get("name") == "Run the official trusted-agent evaluation"
+    )
+    expected_preflight = {
+        "STAGE1_INSTANCES": "${{ steps.frontieror-instances.outputs.stage1_instances }}",
+        "DEV_SET": "${{ steps.frontieror-instances.outputs.dev_set }}",
+        "TEST_SET": "${{ steps.frontieror-instances.outputs.test_set }}",
+    }
+    expected_paid = {
+        "STAGE1_INSTANCES": "${{ needs.preflight.outputs.stage1_instances }}",
+        "DEV_SET": "${{ needs.preflight.outputs.dev_set }}",
+        "TEST_SET": "${{ needs.preflight.outputs.test_set }}",
+    }
+    for name, value in expected_preflight.items():
+        assert preflight_run["env"][name] == value
+    for name, value in expected_paid.items():
+        assert paid_run["env"][name] == value
+
+
+def test_control_execution_uses_doctor_and_one_click_for_both_controls(workflows):
+    job = workflows["benchmark-smoke.yml"]["jobs"]["oracle-controls"]
+    scripts = "\n".join(step.get("run", "") for step in job["steps"])
+    assert "for agent in oracle nop" in scripts
+    assert "orbench doctor oragentbench" in scripts
+    assert "orbench run oragentbench" in scripts
+    assert "--execute" in scripts
+    assert "orbench campaign plan" not in scripts
+    assert "harbor run -c" not in scripts
 
 
 def test_report_workflow_guards_against_raw_bundle_uploads(raw_workflows):
@@ -261,6 +543,26 @@ def test_report_workflow_guards_against_raw_bundle_uploads(raw_workflows):
     assert "trajectory.json" in text
     assert "reference_objective" in text
     assert "PRIVATE KEY" in text
+
+
+def test_report_workflow_consumes_benchmark_smoke_share_artifacts(raw_workflows):
+    text = raw_workflows["report.yml"]
+    assert "github.event.workflow_run.id" in text
+    assert '"controls-evidence"' in text
+    assert '"agent-evidence-oragentbench"' in text
+    assert '**/normalized/rollout.json' in text
+    assert "normalized-slice" not in text
+    assert "produced no shareable evidence" in text
+
+
+def test_agent_export_destination_is_not_precreated(workflows):
+    scripts = "\n".join(
+        step.get("run", "")
+        for step in workflows["benchmark-smoke.yml"]["jobs"]["agent-oragentbench"]["steps"]
+    )
+    assert "mkdir -p out/share\n" in scripts
+    assert "mkdir -p out/share/agent" not in scripts
+    assert "--destination out/share/agent" in scripts
 
 
 def test_integration_contract_asserts_the_static_read_property(raw_workflows):
@@ -318,6 +620,16 @@ def test_every_run_block_is_valid_bash(workflows):
         if result.returncode != 0:
             problems.append(f"{location}: {result.stderr.strip()}")
     assert not problems, "\n".join(problems)
+
+
+def test_dispatch_inputs_never_reach_shell_source_code(workflows):
+    """Manual inputs are untrusted strings; pass them via env and quote them."""
+    offenders = [
+        location
+        for location, script in _run_blocks(workflows)
+        if "${{ inputs." in script
+    ]
+    assert not offenders, "workflow inputs interpolated into shell source: " + ", ".join(offenders)
 
 
 def test_embedded_python_is_not_indented(workflows):

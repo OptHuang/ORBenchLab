@@ -9,6 +9,7 @@ for free.
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -54,11 +55,17 @@ def fo_source(tmp_path: Path, upstream_fixtures: Path) -> Path:
 # --------------------------------------------------------------------------- #
 
 
-def test_controls_command_is_harbor_run(oab_source, tmp_path):
+def test_controls_command_delegates_to_upstream_runner_and_builds_on_fresh_host(oab_source, tmp_path):
     config = tmp_path / "job.yaml"
     config.write_text("job_name: x\n", encoding="utf-8")
     command = execution.oragentbench_controls_command(source=oab_source, job_config=config)
-    assert command.argv == ("harbor", "run", "-c", str(config.resolve()))
+    assert command.argv == (
+        "bash",
+        str(oab_source / execution.ORAGENTBENCH_ORACLE_RUNNER),
+        "--config",
+        str(config.resolve()),
+    )
+    assert "--skip-build" not in command.argv
     # Upstream runs Harbor from the checkout's *parent*, because the dataset
     # path in every job config is `ORAgentBench/harbor_tasks`.
     assert command.cwd == str(oab_source.parent)
@@ -77,7 +84,6 @@ def test_agent_command_is_the_upstream_prebuild_wrapper(oab_source, tmp_path):
         str(oab_source / execution.ORAGENTBENCH_PREBUILD_WRAPPER),
         "-c",
         str(config.resolve()),
-        "--skip-build",
     )
     assert command.cwd == str(oab_source.parent)
     assert command.env_overrides == {"PYTHONPATH": str(oab_source.parent)}
@@ -171,7 +177,11 @@ def _agent_spec(oab_source, sites_dir, **overrides):
         dataset_digest="sha256:" + "a" * 64,
         task_name="single_task",
         scaffold=overrides.pop("scaffold", "claude-code"),
+        scaffold_version=overrides.pop("scaffold_version", "fixture-cli-1.2.3"),
         model=overrides.pop("model", "deepseek-v4-pro"),
+        model_base_url=overrides.pop(
+            "model_base_url", "https://router.example.test/v1"
+        ),
         **overrides,
     )
     return spec_mod.validate(raw, sites_dir=sites_dir)
@@ -201,10 +211,15 @@ def test_compiled_job_config_matches_the_upstream_agent_shape(oab_source, sites_
         "ANTHROPIC_MODEL": "deepseek-v4-pro",
     }
     assert agent["kwargs"]["disallowed_tools"] == "WebSearch,WebFetch"
+    assert "provider_route_digest" not in json.dumps(config)
     assert config["datasets"][0]["path"] == execution.ORAGENTBENCH_DATASET_PATH
     assert config["n_attempts"] == 1
     # Consumed by upstream's wrapper to swap in its prebuilt agent class.
-    assert config["pre_build"] == {"enabled": True, "agent": "claude-code", "rebuild_base": False}
+    assert config["pre_build"]["enabled"] is True
+    assert config["pre_build"]["agent"] == "claude-code"
+    assert config["pre_build"]["rebuild_base"] is True
+    assert config["pre_build"]["image_tag"].startswith("orbench-oab-claude-code:")
+    assert agent["kwargs"]["version"] == "fixture-cli-1.2.3"
 
 
 def test_codex_profile_uses_the_openai_variables(oab_source, sites_dir):
@@ -240,6 +255,46 @@ def test_codex_auth_json_profile_contains_no_api_key_placeholder(oab_source, sit
     assert "OPENAI_API_KEY" not in agent["env"]
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://router.example.test/v1",
+        "https://user:secret@router.example.test/v1",
+        "https://router.example.test/v1?token=secret",
+        "https://router.example.test/v1#fragment",
+        "not-a-url",
+    ],
+)
+def test_codex_auth_json_rejects_unsafe_provider_urls(oab_source, url):
+    with pytest.raises(SpecError):
+        execution.oragentbench_agent_campaign_spec(
+            slug="unsafe-url",
+            date="2026-08-24",
+            dataset_digest="sha256:" + "a" * 64,
+            task_name="single_task",
+            scaffold="codex",
+            scaffold_version="fixture-cli-1.2.3",
+            model="gpt-5.5",
+            auth_mode="codex-auth-json",
+            model_base_url=url,
+        )
+
+
+def test_api_key_campaign_refuses_to_persist_an_unsafe_provider_url(oab_source):
+    with pytest.raises(SpecError):
+        execution.oragentbench_agent_campaign_spec(
+            slug="unsafe-api-route",
+            date="2026-08-24",
+            dataset_digest="sha256:" + "a" * 64,
+            task_name="single_task",
+            scaffold="codex",
+            scaffold_version="fixture-cli-1.2.3",
+            model="gpt-5.5",
+            auth_mode="api-key",
+            model_base_url="https://user:credential@router.example.test/v1",
+        )
+
+
 def test_control_campaign_config_gains_no_pre_build_block(campaigns_dir, sites_dir):
     """Controls need no agent CLI, so their config stays as it was."""
     raw = spec_mod.load_spec(campaigns_dir / "oragentbench-controls.yaml")
@@ -256,6 +311,7 @@ def test_an_unknown_scaffold_has_no_profile(oab_source, sites_dir):
             dataset_digest="sha256:" + "a" * 64,
             task_name="single_task",
             scaffold="invented-agent",
+            scaffold_version="fixture-cli-1.2.3",
             model="m",
         )
     assert "no recorded upstream agent profile" in str(excinfo.value)
@@ -269,6 +325,7 @@ def test_a_floating_model_is_refused_before_a_command_exists(oab_source):
             dataset_digest="sha256:" + "a" * 64,
             task_name="single_task",
             scaffold="claude-code",
+            scaffold_version="fixture-cli-1.2.3",
             model="something-latest",
         )
 
@@ -281,7 +338,9 @@ def test_output_location_is_not_part_of_campaign_identity(oab_source, sites_dir)
         dataset_digest="sha256:" + "a" * 64,
         task_name="single_task",
         scaffold="claude-code",
+        scaffold_version="fixture-cli-1.2.3",
         model="deepseek-v4-pro",
+        model_base_url="https://router.example.test/v1",
     )
     first = compile_mod.compile_campaign(spec_mod.validate(base, sites_dir=sites_dir))
     moved = dict(base, harbor=dict(base["harbor"], jobs_dir="/some/other/place"))
@@ -295,17 +354,146 @@ def test_output_location_is_not_part_of_campaign_identity(oab_source, sites_dir)
 # --------------------------------------------------------------------------- #
 
 
+def _probe_result(
+    argv: list[str], *, returncode: int = 0, stdout: str = "", stderr: str = ""
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(
+        argv,
+        returncode=returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
+def test_preconditions_probe_the_docker_daemon_not_just_the_executable(
+    oab_source, monkeypatch
+):
+    monkeypatch.setattr(execution.shutil, "which", lambda name: f"/usr/bin/{name}")
+    calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        calls.append(list(argv))
+        if argv[-1] == "--version":
+            return _probe_result(list(argv), stdout="harbor, version 0.16.2\n")
+        return _probe_result(list(argv), returncode=1, stderr="daemon unavailable")
+
+    report = execution.oragentbench_preconditions(
+        source=oab_source,
+        task_name="single_task",
+        scaffold="oracle",
+        model="",
+        environ={},
+        command_runner=runner,
+    )
+
+    assert not report.ok
+    assert calls == [["/usr/bin/harbor", "--version"], ["/usr/bin/docker", "info"]]
+    assert any("daemon" in item and "docker info" in item for item in report.missing)
+    assert "daemon unavailable" not in json.dumps(report.to_dict())
+
+
+@pytest.mark.parametrize(
+    ("version_output", "expected_ok"),
+    [
+        ("0.16.1", True),
+        ("harbor, version 0.16.0", True),
+        ("harbor version v0.16.9", True),
+        ("harbor, version 0.15.7", False),
+        ("harbor development build", False),
+        ("harbor development build with Python 3.12", False),
+    ],
+)
+def test_preconditions_require_a_parseable_supported_harbor_version(
+    oab_source, monkeypatch, version_output, expected_ok
+):
+    monkeypatch.setattr(execution.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def runner(argv, **kwargs):
+        if argv[-1] == "--version":
+            return _probe_result(list(argv), stdout=version_output)
+        return _probe_result(list(argv))
+
+    report = execution.oragentbench_preconditions(
+        source=oab_source,
+        task_name="single_task",
+        scaffold="oracle",
+        model="",
+        environ={},
+        command_runner=runner,
+    )
+
+    assert report.ok is expected_ok
+    relevant = report.satisfied if expected_ok else report.missing
+    assert any("Harbor" in item and "0.16" in item for item in relevant)
+
+
+def test_preconditions_fail_closed_when_a_runner_probe_times_out(oab_source, monkeypatch):
+    monkeypatch.setattr(execution.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def runner(argv, **kwargs):
+        if argv[-1] == "--version":
+            return _probe_result(list(argv), stdout="harbor, version 0.16.1")
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    report = execution.oragentbench_preconditions(
+        source=oab_source,
+        task_name="single_task",
+        scaffold="oracle",
+        model="",
+        environ={},
+        command_runner=runner,
+    )
+
+    assert not report.ok
+    assert any("timed out" in item and "docker info" in item for item in report.missing)
+
+
 def test_preconditions_pass_with_everything_present(oab_source):
     report = execution.oragentbench_preconditions(
         source=oab_source,
         task_name="single_task",
         scaffold="claude-code",
         model="deepseek-v4-pro",
-        environ={"MODEL_API_KEY": "x", "MODEL_BASE_URL": "y"},
+        environ={
+            "MODEL_API_KEY": "x",
+            "MODEL_BASE_URL": "https://router.example.test/v1",
+        },
+        model_base_url="https://router.example.test/v1",
         require_docker=False,
         require_harbor=False,
     )
     assert report.ok, report.missing
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://router.example.test/v1",
+        "https://user:secret@router.example.test/v1",
+        "https://router.example.test/v1?token=secret",
+        "https://router.example.test/v1#fragment",
+        "not-a-url",
+    ],
+)
+def test_api_key_preconditions_reject_an_unsafe_provider_url_without_echoing_it(
+    oab_source, url
+):
+    api_key = "SENTINEL_API_VALUE_DO_NOT_LOG"
+    report = execution.oragentbench_preconditions(
+        source=oab_source,
+        task_name="single_task",
+        scaffold="codex",
+        model="gpt-5.5",
+        environ={"MODEL_API_KEY": api_key, "MODEL_BASE_URL": url},
+        model_base_url="https://pinned.example.test/v1",
+        require_docker=False,
+        require_harbor=False,
+    )
+
+    assert not report.ok
+    rendered = json.dumps(report.to_dict())
+    assert url not in rendered
+    assert api_key not in rendered
 
 
 def test_preconditions_fail_closed_without_the_secret(oab_source):
@@ -315,6 +503,7 @@ def test_preconditions_fail_closed_without_the_secret(oab_source):
         scaffold="claude-code",
         model="deepseek-v4-pro",
         environ={},
+        model_base_url="https://router.example.test/v1",
         require_docker=False,
         require_harbor=False,
     )
@@ -334,6 +523,7 @@ def test_an_upstream_dry_run_needs_no_credentials(oab_source):
         require_docker=False,
         require_harbor=False,
         require_secrets=False,
+        model_base_url="https://router.example.test/v1",
     )
     assert report.ok, report.missing
 
@@ -397,6 +587,50 @@ def test_codex_auth_json_preconditions_require_a_private_auth_file(oab_source, t
     )
     assert not exposed.ok
     assert any("private" in item for item in exposed.missing)
+
+
+@pytest.mark.parametrize("payload", ["not json", "[]", "{}"])
+def test_codex_auth_json_preconditions_parse_a_nonempty_object(oab_source, tmp_path, payload):
+    auth = tmp_path / "auth.json"
+    auth.write_text(payload, encoding="utf-8")
+    auth.chmod(0o600)
+
+    report = execution.oragentbench_preconditions(
+        source=oab_source,
+        task_name="single_task",
+        scaffold="codex",
+        model="gpt-5.5",
+        auth_mode="codex-auth-json",
+        model_base_url="https://router.example.test/v1",
+        environ={"CODEX_AUTH_JSON_PATH": str(auth)},
+        require_docker=False,
+        require_harbor=False,
+    )
+
+    assert not report.ok
+    assert any("valid JSON" in item and "object" in item for item in report.missing)
+    assert payload not in json.dumps(report.to_dict())
+
+
+def test_codex_auth_json_is_blocked_for_an_internet_enabled_task(oab_source, tmp_path):
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"auth_mode":"chatgpt"}\n')
+    auth.chmod(0o600)
+
+    report = execution.oragentbench_preconditions(
+        source=oab_source,
+        task_name="multi_task",
+        scaffold="codex",
+        model="gpt-5.5",
+        auth_mode="codex-auth-json",
+        model_base_url="https://router.example.test/v1",
+        environ={"CODEX_AUTH_JSON_PATH": str(auth)},
+        require_docker=False,
+        require_harbor=False,
+    )
+
+    assert not report.ok
+    assert any("long-lived" in item and "internet" in item for item in report.missing)
 
 
 def test_codex_base_url_can_be_discovered_without_reading_a_secret(tmp_path):
@@ -581,6 +815,28 @@ def test_frontieror_requires_isolation_licence_key_and_images(fo_source, tmp_pat
     assert report.ok, report.missing
 
 
+def test_frontieror_preconditions_also_require_a_reachable_docker_daemon(
+    fo_source, tmp_path, monkeypatch
+):
+    licence = tmp_path / "gurobi.lic"
+    licence.write_text("placeholder\n", encoding="utf-8")
+    monkeypatch.setattr(execution.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    report = execution.frontieror_preconditions(
+        source=fo_source,
+        environ={
+            "OPENROUTER_API_KEY": "x",
+            "GRB_LICENSE_FILE": str(licence),
+            "ORBENCH_PERF_ISOLATED": "true",
+        },
+        available_images=execution.FRONTIEROR_REQUIRED_IMAGES,
+        command_runner=lambda argv, **kwargs: _probe_result(list(argv), returncode=1),
+    )
+
+    assert not report.ok
+    assert any("docker info" in item and "daemon" in item for item in report.missing)
+
+
 def test_frontieror_refuses_a_shared_host(fo_source, tmp_path):
     licence = tmp_path / "gurobi.lic"
     licence.write_text("placeholder\n", encoding="utf-8")
@@ -727,18 +983,20 @@ def test_script_dry_run_builds_the_command_without_executing(oab_source, capsys,
             "--source", str(oab_source),
             "--task", "single_task",
             "--scaffold", "claude-code",
+            "--scaffold-version", "fixture-cli-1.2.3",
             "--model", "deepseek-v4-pro",
             "--date", "2026-08-22",
             "--campaign-slug", "script-check",
             "--dataset-digest", "sha256:" + "a" * 64,
             "--output-root", str(tmp_path / "out"),
             "--allow-missing-tooling",
+            "--model-base-url", "https://router.example.test/v1",
         ]
     )
     assert code == 0
     receipt = json.loads(capsys.readouterr().out)
     assert receipt["executed"] is False
-    assert receipt["upstream_command"]["argv"][-1] == "--skip-build"
+    assert "--skip-build" not in receipt["upstream_command"]["argv"]
     assert receipt["evidence_label"] == "exploratory"
     assert any("dry run" in note for note in receipt["notes"])
 
@@ -751,12 +1009,14 @@ def test_script_output_root_is_named_after_the_campaign(oab_source, capsys, tmp_
             "--source", str(oab_source),
             "--task", "single_task",
             "--scaffold", "claude-code",
+            "--scaffold-version", "fixture-cli-1.2.3",
             "--model", "deepseek-v4-pro",
             "--date", "2026-08-22",
             "--campaign-slug", "script-check",
             "--dataset-digest", "sha256:" + "a" * 64,
             "--output-root", str(tmp_path / "out"),
             "--allow-missing-tooling",
+            "--model-base-url", "https://router.example.test/v1",
         ]
     )
     receipt = json.loads(capsys.readouterr().out)
@@ -785,7 +1045,7 @@ def test_script_refuses_to_execute_without_the_tooling_it_skipped_checking(oab_s
 def test_script_refuses_a_paid_run_without_acknowledgement(oab_source, tmp_path, monkeypatch):
     module = _script_main()
     monkeypatch.setenv("MODEL_API_KEY", "x")
-    monkeypatch.setenv("MODEL_BASE_URL", "y")
+    monkeypatch.setenv("MODEL_BASE_URL", "https://router.example.test/v1")
     monkeypatch.setattr(execution.shutil, "which", lambda name: f"/usr/bin/{name}")
     code = module.main(
         [
@@ -793,6 +1053,7 @@ def test_script_refuses_a_paid_run_without_acknowledgement(oab_source, tmp_path,
             "--source", str(oab_source),
             "--task", "single_task",
             "--scaffold", "claude-code",
+            "--scaffold-version", "fixture-cli-1.2.3",
             "--model", "deepseek-v4-pro",
             "--date", "2026-08-22",
             "--dataset-digest", "sha256:" + "a" * 64,

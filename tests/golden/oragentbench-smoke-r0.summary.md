@@ -1,4 +1,4 @@
-# ORBenchLab report — oragentbench-smoke-20260822-9f68d0e2
+# ORBenchLab report — oragentbench-smoke-20260822-796d74b1
 
 **Evidence label: EXPLORATORY**
 
@@ -16,7 +16,7 @@ Not every capability measurement reaches `R1`: the weakest (task, agent) configu
 
 | field | value |
 | --- | --- |
-| campaign_id | `oragentbench-smoke-20260822-9f68d0e2` |
+| campaign_id | `oragentbench-smoke-20260822-796d74b1` |
 | integration | `oragentbench` |
 | site | `local-docker` |
 | perf_isolated | `false` |
@@ -56,13 +56,14 @@ Not every capability measurement reaches `R1`: the weakest (task, agent) configu
 
 ## Mandatory disclosures
 
-These counts are always shown. Trials flagged `infra_suspect` stay in the capability denominator: a busy host correlating with a timeout is a reason to trust the number less, not a licence to delete it.
+These counts are always shown. `infra_suspect` and capability inclusion are separate fields: soft load evidence alone does not reassign blame, while hard or contradictory evidence may explicitly exclude a trial with an `exclusion_basis`.
 
 | metric | value | n | strength | claim | definition |
 | --- | --- | --- | --- | --- | --- |
-| `infra_suspect_share` | 0.000 | 6 | `E-T/R0` | `[C011]` | count(infra_suspect) / count(trials); these trials stay in the capability denominator — a soft signal lowers confidence, it does not reassign blame |
-| `orphan_trial_count` | 1 | 6 | `E-T/R0` | `[C012]` | count(trials with no plan-ledger match) |
-| `no_load_sampling_share` | 1.000 | 6 | `E-T/R0` | `[C013]` | share of trials with load_source = 'none'; with no sampler there are no soft infrastructure signals and infra_suspect is always false |
+| `infra_suspect_share` | 0.000 | 6 | `E-T/R0` | `[C011]` | count(infra_suspect) / count(trials); denominator inclusion is reported separately by counts_toward_capability and excluded_trial_share |
+| `excluded_trial_share` | 0.000 | 6 | `E-T/R0` | `[C012]` | count(trials excluded from capability metrics) / count(trials); exclusion is explicit and each excluded trial carries an exclusion_basis |
+| `orphan_trial_count` | 1 | 6 | `E-T/R0` | `[C013]` | count(trials with no plan-ledger match) |
+| `no_load_sampling_share` | 1.000 | 6 | `E-T/R0` | `[C014]` | share of trials with load_source = 'none'; load-based suspicion is unavailable, but hard or contradictory evidence may still set infra_suspect |
 
 ## Evidence index
 
@@ -79,8 +80,9 @@ These counts are always shown. Trials flagged `infra_suspect` stay in the capabi
 | `C009` | `oracle_pass_rate` | `control:oracle` | `E-V/R0` | 3 run id(s) |
 | `C010` | `nop_fail_rate` | `control:nop` | `E-V/R0` | 3 run id(s) |
 | `C011` | `infra_suspect_share` | `disclosure` | `E-T/R0` | 6 run id(s) |
-| `C012` | `orphan_trial_count` | `disclosure` | `E-T/R0` | n/a |
-| `C013` | `no_load_sampling_share` | `disclosure` | `E-T/R0` | n/a |
+| `C012` | `excluded_trial_share` | `disclosure` | `E-T/R0` | 6 run id(s) |
+| `C013` | `orphan_trial_count` | `disclosure` | `E-T/R0` | n/a |
+| `C014` | `no_load_sampling_share` | `disclosure` | `E-T/R0` | 6 run id(s) |
 
 Full run-id lists are in `evidence_index.json`. Each claim resolves to the run ids it was computed from, so any figure here can be traced back to the underlying runs.
 

@@ -28,16 +28,20 @@ recalled. Their provenance is in `UpstreamCommand.provenance`.
 
 from __future__ import annotations
 
+import json
+import hashlib
 import os
 import re
 import shutil
 import stat
+import subprocess
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .core.errors import PreconditionError, SpecError
+from .core.urls import provider_route_digest, validate_https_base_url
 
 # --------------------------------------------------------------------------- #
 # ORAgentBench — upstream execution surface
@@ -54,6 +58,15 @@ ORAGENTBENCH_CHECKOUT_DIRNAME = "ORAgentBench"
 #: for agent runs. It pre-builds the agent CLI into the base image, applies
 #: dynamic skills, then execs `harbor run -c <transformed config>`.
 ORAGENTBENCH_PREBUILD_WRAPPER = "source/scripts/run_harbor_prebuild.py"
+
+#: Pinned upstream entry point for zero-model-cost controls.  Unlike calling
+#: ``harbor run`` ourselves, this script first builds the shared base image on
+#: a fresh host and then delegates to Harbor with the supplied config.
+ORAGENTBENCH_ORACLE_RUNNER = "experiments/scripts/run_oracle_all.sh"
+
+#: Both upstream control and prebuilt-agent paths build through this fixed
+#: alias before Harbor starts.  ORBenchLab serializes all use of it per host.
+ORAGENTBENCH_FIXED_BASE_IMAGE = "oragentbench-base:py311-scip"
 
 #: The dataset path that appears in every upstream job config.
 ORAGENTBENCH_DATASET_PATH = f"{ORAGENTBENCH_CHECKOUT_DIRNAME}/harbor_tasks"
@@ -118,6 +131,24 @@ AGENT_PROFILES: dict[str, dict[str, Any]] = {
 
 #: Zero-model-cost controls. Harbor built-ins; they take no credentials at all.
 CONTROL_SCAFFOLDS = ("oracle", "nop")
+
+# These upstream adapters send their API credential to a configurable base
+# URL. The destination is therefore a required identity input, not merely an
+# optional runtime variable. mini-swe-agent's recorded profile has no base-URL
+# variable and remains route-free.
+ROUTE_PINNED_SCAFFOLDS = frozenset({"claude-code", "codex"})
+
+#: The first Harbor release whose Codex adapter supports the auth/runtime path
+#: documented by ORBenchLab.  Keep the compatibility floor explicit so a CLI
+#: from an unrelated or stale Harbor installation cannot pass ``doctor`` just
+#: because an executable with the same name happens to be on PATH.
+MINIMUM_HARBOR_VERSION = (0, 16, 0)
+
+#: Runner probes must never make ``doctor`` hang behind an unhealthy Docker
+#: socket or a broken wrapper installation.
+RUNNER_PROBE_TIMEOUT_SECONDS = 5.0
+
+CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 
 def discover_codex_base_url(environ: Mapping[str, str] | None = None) -> str:
@@ -360,6 +391,17 @@ def validate_oragentbench_task(source: Path, task_name: str) -> str:
     return task_name
 
 
+def oragentbench_task_allows_internet(source: Path, task_name: str) -> bool:
+    """Read the selected task's declared agent-network policy."""
+    validate_oragentbench_task(source, task_name)
+    path = Path(source) / "harbor_tasks" / task_name / "task.toml"
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise SpecError(f"cannot read the selected task policy from task.toml: {exc}") from None
+    return (data.get("environment") or {}).get("allow_internet") is True
+
+
 def validate_frontieror_source(source: Path) -> Path:
     source = Path(source).resolve()
     if not source.is_dir():
@@ -448,6 +490,36 @@ def validate_pinned_model(model: str) -> str:
     return model
 
 
+def validate_pinned_scaffold_version(version: str) -> str:
+    """Require the CLI baked into a paid image to have an exact version."""
+    value = str(version or "").strip()
+    if not value:
+        raise SpecError("a pinned scaffold CLI version is required for a model agent")
+    if value.lower() in {"latest", "auto", "stable", "main", "master"} or "*" in value:
+        raise SpecError(
+            f"scaffold version {value!r} is floating; pin an exact released CLI version"
+        )
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,79}", value):
+        raise SpecError("scaffold version contains unsupported characters")
+    return value
+
+
+def _oragentbench_prebuilt_image_tag(
+    *, scaffold: str, scaffold_version: str, dataset_digest: str
+) -> str:
+    payload = json.dumps(
+        {
+            "dataset_digest": dataset_digest,
+            "scaffold": scaffold,
+            "scaffold_version": scaffold_version,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    return f"orbench-oab-{scaffold}:{digest}"
+
+
 def validate_run_id(run_id: str) -> str:
     if not _RUN_ID_RE.match(run_id or ""):
         raise SpecError(
@@ -483,22 +555,29 @@ def validate_extra_flags(extra: Sequence[str]) -> tuple[str, ...]:
 
 
 def oragentbench_controls_command(
-    *, source: Path, job_config: Path, python: str = "python3"
+    *, source: Path, job_config: Path
 ) -> UpstreamCommand:
-    """`harbor run -c <config>`, the path upstream's run_oracle_all.sh takes.
+    """Delegate controls to upstream's pinned oracle runner.
 
-    Controls use Harbor's built-in oracle and nop agents, so this makes no model
-    calls at all.
+    The script accepts any Harbor config, builds the shared base image unless
+    explicitly told not to, and then execs ``harbor run -c``.  We deliberately
+    do not pass ``--skip-build``: a one-click run must also work on a fresh
+    execution host instead of depending on an unrecorded local image cache.
     """
     source = validate_oragentbench_source(source)
+    runner = source / ORAGENTBENCH_ORACLE_RUNNER
+    if not runner.is_file():
+        raise PreconditionError(
+            "the pinned ORAgentBench checkout does not ship its oracle runner"
+        )
     return UpstreamCommand(
-        argv=("harbor", "run", "-c", str(Path(job_config).resolve())),
+        argv=("bash", str(runner), "--config", str(Path(job_config).resolve())),
         cwd=str(source.parent),
         required_env=(),
         provenance=(
-            "ORAgentBench experiments/scripts/run_oracle_all.sh: "
-            "`command=(harbor run -c \"${CONFIG}\" \"${args[@]}\")` executed from the "
-            "checkout's parent directory"
+            "ORAgentBench experiments/scripts/run_oracle_all.sh --config: builds the "
+            "shared base image, then execs `harbor run -c <config>` from the "
+            "checkout parent"
         ),
         description="Harbor job over ORAgentBench tasks using built-in control agents",
         makes_model_calls=False,
@@ -510,7 +589,7 @@ def oragentbench_agent_command(
     source: Path,
     job_config: Path,
     python: str = "python3",
-    skip_build: bool = True,
+    skip_build: bool = False,
     dry_run: bool = False,
     resume: bool = False,
     required_env: Sequence[str] = (),
@@ -536,7 +615,10 @@ def oragentbench_agent_command(
     if skip_build:
         argv.append("--skip-build")
     if resume:
-        argv.append("--resume")
+        # The pinned wrapper's cleanup is campaign-scoped and refuses to run
+        # while another Harbor process is active.  A bare --resume can inherit
+        # orphan containers or incomplete trial directories after SIGKILL.
+        argv.extend(("--resume", "--cleanup-before-resume"))
     if dry_run:
         argv.append("--dry-run")
     return UpstreamCommand(
@@ -691,6 +773,7 @@ def oragentbench_agent_campaign_spec(
     dataset_digest: str,
     task_name: str,
     scaffold: str,
+    scaffold_version: str,
     model: str,
     seeds: Sequence[int] = (1,),
     wall_clock_sec: int = 2700,
@@ -715,6 +798,7 @@ def oragentbench_agent_campaign_spec(
         )
     profile = AGENT_PROFILES[scaffold]
     validate_pinned_model(model)
+    validate_pinned_scaffold_version(scaffold_version)
 
     if auth_mode not in {"api-key", "codex-auth-json"}:
         raise SpecError(
@@ -722,12 +806,22 @@ def oragentbench_agent_campaign_spec(
         )
     if auth_mode == "codex-auth-json" and scaffold != "codex":
         raise SpecError("codex-auth-json is only valid for the codex scaffold")
+    if scaffold in ROUTE_PINNED_SCAFFOLDS:
+        # Fail before a campaign workspace is created. The normalized URL is
+        # retained only in process memory; its digest is the persisted identity
+        # input for API-key campaigns.
+        if not model_base_url:
+            raise SpecError(
+                f"scaffold {scaffold!r} requires a pinned HTTPS provider route"
+            )
+        model_base_url = validate_https_base_url(model_base_url)
+    elif model_base_url:
+        model_base_url = validate_https_base_url(model_base_url)
 
     env_literals: dict[str, str] = {}
     env_from_secret = dict(profile["env_from_secret"])
     if auth_mode == "codex-auth-json":
-        if not model_base_url.strip():
-            raise SpecError("codex-auth-json requires a pinned model_base_url")
+        model_base_url = validate_https_base_url(model_base_url)
         env_from_secret = {}
         env_literals = {
             "CODEX_FORCE_AUTH_JSON": "true",
@@ -744,9 +838,12 @@ def oragentbench_agent_campaign_spec(
         "model": model,
         "env_from_secret": env_from_secret,
         "env_literals": env_literals,
-        "agent_kwargs": dict(profile["kwargs"]),
+        "scaffold_version": scaffold_version,
+        "agent_kwargs": {**dict(profile["kwargs"]), "version": scaffold_version},
         "setup_timeout_sec": profile.get("setup_timeout_sec"),
     }
+    if model_base_url:
+        agent["provider_route_digest"] = provider_route_digest(model_base_url)
     if auth_mode != "api-key":
         agent["auth_mode"] = auth_mode
 
@@ -770,7 +867,19 @@ def oragentbench_agent_campaign_spec(
             "n_concurrent_trials": n_concurrent_trials,
             "environment_type": "docker",
             # Consumed by upstream's prebuild wrapper; Harbor ignores it.
-            "pre_build": {"enabled": True, "agent": scaffold, "rebuild_base": False},
+            "pre_build": {
+                "enabled": True,
+                "agent": scaffold,
+                "rebuild_base": True,
+                # This tag is a pure function of every source/build identity
+                # input plus the exact scaffold CLI version.  The post-run
+                # receipt additionally records Docker's actual image ID.
+                "image_tag": _oragentbench_prebuilt_image_tag(
+                    scaffold=scaffold,
+                    scaffold_version=scaffold_version,
+                    dataset_digest=dataset_digest,
+                ),
+            },
         },
         "retry": {"max_retries": 0, "include_exceptions": []},
         "metrics": [
@@ -782,6 +891,106 @@ def oragentbench_agent_campaign_spec(
 # --------------------------------------------------------------------------- #
 # preconditions
 # --------------------------------------------------------------------------- #
+
+
+_HARBOR_BARE_VERSION_RE = re.compile(
+    r"(?i)^\s*v?(\d+)\.(\d+)(?:\.(\d+))?(?:[-+][A-Za-z0-9_.-]+)?\s*$"
+)
+_HARBOR_LABELED_VERSION_RE = re.compile(
+    r"(?i)\bharbor\b(?:\s+cli)?\s*,?\s*(?:version\s+)?"
+    r"v?(\d+)\.(\d+)(?:\.(\d+))?"
+)
+
+
+def _probe_docker_daemon(
+    executable: str,
+    *,
+    command_runner: CommandRunner | None = None,
+) -> tuple[bool, str]:
+    """Check that Docker's client can reach a daemon, without logging output."""
+    runner = subprocess.run if command_runner is None else command_runner
+    argv = [executable, "info"]
+    try:
+        result = runner(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=RUNNER_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, (
+            f"docker info timed out after {RUNNER_PROBE_TIMEOUT_SECONDS:g}s; "
+            "the Docker daemon is not confirmed reachable"
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False, "docker info could not run; the Docker daemon is not confirmed reachable"
+    if result.returncode != 0:
+        return False, "docker info failed; the Docker daemon is not reachable by this runner"
+    return True, "docker info succeeded; the Docker daemon is reachable by this runner"
+
+
+def _parse_harbor_version(output: str) -> tuple[int, int, int] | None:
+    match = _HARBOR_BARE_VERSION_RE.fullmatch(output)
+    if match is None:
+        match = _HARBOR_LABELED_VERSION_RE.search(output)
+    if match is None:
+        return None
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch or 0)
+
+
+def _format_version(version: tuple[int, int, int]) -> str:
+    return ".".join(str(part) for part in version)
+
+
+def _probe_harbor_version(
+    executable: str,
+    *,
+    command_runner: CommandRunner | None = None,
+) -> tuple[bool, str]:
+    """Run the real CLI and enforce the documented Harbor compatibility floor."""
+    runner = subprocess.run if command_runner is None else command_runner
+    argv = [executable, "--version"]
+    minimum = _format_version(MINIMUM_HARBOR_VERSION)
+    try:
+        result = runner(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=RUNNER_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, (
+            f"harbor --version timed out after {RUNNER_PROBE_TIMEOUT_SECONDS:g}s; "
+            f"require Harbor >= {minimum}"
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False, f"harbor --version could not run; require Harbor >= {minimum}"
+    if result.returncode != 0:
+        return False, f"harbor --version failed; require Harbor >= {minimum}"
+    output = f"{result.stdout or ''}\n{result.stderr or ''}"
+    version = _parse_harbor_version(output)
+    if version is None:
+        return False, f"Harbor CLI version is not parseable; require Harbor >= {minimum}"
+    rendered = _format_version(version)
+    if version < MINIMUM_HARBOR_VERSION:
+        return False, (
+            f"Harbor CLI {rendered} is below the supported minimum Harbor {minimum}"
+        )
+    return True, f"Harbor CLI {rendered} is compatible (minimum Harbor {minimum})"
+
+
+def _codex_auth_json_has_basic_structure(path: Path) -> bool:
+    """Validate only the non-secret container shape; never return its contents."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and bool(payload) and all(
+        isinstance(key, str) and bool(key) for key in payload
+    )
 
 
 def oragentbench_preconditions(
@@ -796,6 +1005,7 @@ def oragentbench_preconditions(
     require_secrets: bool = True,
     auth_mode: str = "api-key",
     model_base_url: str = "",
+    command_runner: CommandRunner | None = None,
 ) -> PreconditionReport:
     """Everything that must hold before an ORAgentBench agent run may start."""
     environ = os.environ if environ is None else environ
@@ -818,6 +1028,13 @@ def oragentbench_preconditions(
         report.require(True, f"scaffold {scaffold!r} is a Harbor built-in control (no cost)")
     elif scaffold in AGENT_PROFILES:
         report.require(True, f"scaffold {scaffold!r} has a recorded upstream agent profile")
+        normalized_pinned_route = ""
+        if scaffold in ROUTE_PINNED_SCAFFOLDS:
+            try:
+                normalized_pinned_route = validate_https_base_url(model_base_url)
+                report.require(True, "a credential-safe HTTPS provider route is pinned")
+            except SpecError as exc:
+                report.require(False, str(exc))
         try:
             validate_pinned_model(model)
             report.require(True, f"model {model!r} is pinned")
@@ -828,10 +1045,16 @@ def oragentbench_preconditions(
                 scaffold == "codex",
                 "codex-auth-json is only valid for the codex scaffold",
             )
-            report.require(
-                bool(model_base_url.strip()),
-                "codex-auth-json has a pinned OPENAI_BASE_URL",
-            )
+            # The shared provider-route check above covers this transport too.
+            try:
+                internet_enabled = oragentbench_task_allows_internet(resolved, task_name)
+                report.require(
+                    not internet_enabled,
+                    "codex-auth-json refuses to expose a long-lived Codex login to an "
+                    "internet-enabled benchmark task; use an ephemeral scoped API credential",
+                )
+            except SpecError as exc:
+                report.require(False, str(exc))
             if require_secrets:
                 explicit = environ.get("CODEX_AUTH_JSON_PATH")
                 auth_path = (
@@ -841,10 +1064,18 @@ def oragentbench_preconditions(
                 )
                 report.require(
                     auth_path.is_file(),
-                    f"Codex auth file exists at {auth_path} (contents never read or logged)",
+                    f"Codex auth file exists at {auth_path}",
                 )
                 if auth_path.is_file():
-                    mode = stat.S_IMODE(auth_path.stat().st_mode)
+                    report.require(
+                        _codex_auth_json_has_basic_structure(auth_path),
+                        "Codex auth file is valid JSON with a non-empty object root "
+                        "(parsed locally; contents never logged)",
+                    )
+                    try:
+                        mode = stat.S_IMODE(auth_path.stat().st_mode)
+                    except OSError:
+                        mode = 0o777
                     report.require(
                         mode & 0o077 == 0,
                         f"Codex auth file is private (mode {mode:04o}; require no group/world access)",
@@ -867,12 +1098,37 @@ def oragentbench_preconditions(
             )
             names = []
         for name in names:
-            # Emptiness only. The value is never read, logged or hashed.
             kind = "variable" if name in non_secret else "secret"
+            configured = bool(environ.get(name))
             report.require(
-                bool(environ.get(name)),
-                f"{kind} {name} is set (value never read or logged)",
+                configured,
+                f"{kind} {name} is set (value never logged or persisted)",
             )
+            if configured and name == "MODEL_BASE_URL":
+                try:
+                    normalized_runtime_route = validate_https_base_url(environ[name])
+                    report.require(
+                        True,
+                        "provider endpoint uses a credential-safe HTTPS URL",
+                    )
+                    if (
+                        normalized_pinned_route
+                        and normalized_runtime_route == normalized_pinned_route
+                    ):
+                        report.require(
+                            True,
+                            "runtime provider route matches the pinned campaign route",
+                        )
+                    else:
+                        report.require(
+                            False,
+                            "runtime provider route does not match the pinned campaign route",
+                        )
+                except SpecError as exc:
+                    # The validator deliberately reports only the violated
+                    # policy.  Never echo the URL: it decides where the API
+                    # credential will be sent and may itself contain userinfo.
+                    report.require(False, str(exc))
     else:
         report.require(
             False,
@@ -881,11 +1137,23 @@ def oragentbench_preconditions(
         )
 
     if require_harbor:
-        report.require(
-            shutil.which("harbor") is not None, "the harbor CLI is on PATH on this host"
-        )
+        harbor = shutil.which("harbor")
+        if harbor is None:
+            report.require(False, "the Harbor CLI is on PATH on this host")
+        else:
+            ok, description = _probe_harbor_version(
+                harbor, command_runner=command_runner
+            )
+            report.require(ok, description)
     if require_docker:
-        report.require(shutil.which("docker") is not None, "docker is on PATH on this host")
+        docker = shutil.which("docker")
+        if docker is None:
+            report.require(False, "docker is on PATH on this host")
+        else:
+            ok, description = _probe_docker_daemon(
+                docker, command_runner=command_runner
+            )
+            report.require(ok, description)
     return report
 
 
@@ -897,6 +1165,7 @@ def frontieror_preconditions(
     require_perf_isolation: bool = True,
     require_images: bool = True,
     available_images: Iterable[str] | None = None,
+    command_runner: CommandRunner | None = None,
 ) -> PreconditionReport:
     """Everything that must hold before a FrontierOR agent run may start.
 
@@ -925,7 +1194,14 @@ def frontieror_preconditions(
         "GRB_LICENSE_FILE points at a readable Gurobi licence file",
     )
     if require_docker:
-        report.require(shutil.which("docker") is not None, "docker is on PATH on this host")
+        docker = shutil.which("docker")
+        if docker is None:
+            report.require(False, "docker is on PATH on this host")
+        else:
+            ok, description = _probe_docker_daemon(
+                docker, command_runner=command_runner
+            )
+            report.require(ok, description)
     if require_perf_isolation:
         report.require(
             environ.get("ORBENCH_PERF_ISOLATED") == "true",
@@ -958,6 +1234,45 @@ def docker_images_present(*, images: Iterable[str] | None = None) -> list[str]:
     except (OSError, subprocess.SubprocessError):  # pragma: no cover - host dependent
         return []
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def docker_image_fingerprint(
+    image: str, *, command_runner: CommandRunner | None = None
+) -> dict[str, Any] | None:
+    """Read Docker's actual immutable identity for one local image tag."""
+    runner = subprocess.run if command_runner is None else command_runner
+    try:
+        result = runner(
+            ["docker", "image", "inspect", image],
+            capture_output=True,
+            text=True,
+            timeout=RUNNER_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], Mapping):
+        return None
+    row = payload[0]
+    image_id = row.get("Id")
+    repo_digests = row.get("RepoDigests") or []
+    if not isinstance(image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+        return None
+    if not isinstance(repo_digests, list) or not all(
+        isinstance(value, str) for value in repo_digests
+    ):
+        return None
+    return {
+        "requested_tag": image,
+        "image_id": image_id,
+        "repo_digests": sorted(set(repo_digests)),
+    }
 
 
 # --------------------------------------------------------------------------- #

@@ -135,8 +135,9 @@ def test_codex_auth_json_is_a_narrow_secretless_exception(controls_raw, sites_di
     raw["agents"] = [
         {
             "id": "codex-plan",
-            "scaffold": "codex",
-            "model": "gpt-5.5",
+                "scaffold": "codex",
+                "scaffold_version": "fixture-cli-1.2.3",
+                "model": "gpt-5.5",
             "auth_mode": "codex-auth-json",
             "env_literals": {
                 "CODEX_FORCE_AUTH_JSON": "true",
@@ -150,6 +151,7 @@ def test_codex_auth_json_is_a_narrow_secretless_exception(controls_raw, sites_di
 
     assert spec.agents[0].auth_mode == "codex-auth-json"
     assert spec.agents[0].secret_names == ()
+    assert spec.agents[0].provider_route_digest is not None
 
 
 @pytest.mark.parametrize(
@@ -302,9 +304,11 @@ def test_job_configs_contain_no_secret_values(controls_raw, sites_dir):
     raw["agents"] = [
         {
             "id": "pinned",
-            "scaffold": "claude-code",
-            "model": "pinned-model-1",
+                "scaffold": "claude-code",
+                "scaffold_version": "fixture-cli-1.2.3",
+                "model": "pinned-model-1",
             "env_keys": ["ANTHROPIC_AUTH_TOKEN"],
+            "provider_route_digest": "sha256:" + "a" * 64,
         }
     ]
     raw["budget"]["max_cost_usd"] = 10

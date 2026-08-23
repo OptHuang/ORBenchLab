@@ -11,13 +11,14 @@ import json
 import signal
 import shutil
 import subprocess
+import tempfile
 from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
 
 from orbenchlab.cli import main
-from orbenchlab.core.errors import EvidenceError
+from orbenchlab.core.errors import EvidenceError, PreconditionError
 
 
 def _copy_named_checkout(upstream_fixtures: Path, tmp_path: Path) -> Path:
@@ -25,6 +26,186 @@ def _copy_named_checkout(upstream_fixtures: Path, tmp_path: Path) -> Path:
     source = tmp_path / "ORAgentBench"
     shutil.copytree(upstream_fixtures / "oragentbench_min", source)
     return source
+
+
+def _install_passing_runner_probes(monkeypatch, execution) -> None:
+    """Make execution-path tests independent of the developer's Docker host."""
+    monkeypatch.setattr(execution.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def probe(argv, **kwargs):
+        stdout = "harbor, version 0.16.2\n" if argv[-1] == "--version" else ""
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(execution.subprocess, "run", probe)
+
+
+def test_different_campaigns_share_one_host_docker_alias_lock_until_fingerprinted(
+    monkeypatch, upstream_fixtures: Path, tmp_path: Path
+):
+    """A second workspace cannot race the fixed upstream Docker alias."""
+    from orbenchlab import execution, workflow
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    first = workflow.prepare_oragentbench_run(
+        source=source,
+        task="single_task",
+        agent="oracle",
+        model="",
+        date="2026-08-24",
+        workspace=tmp_path / "runs-a",
+        wall_clock_sec=20,
+    )
+    second = workflow.prepare_oragentbench_run(
+        source=source,
+        task="single_task",
+        agent="oracle",
+        model="",
+        date="2026-08-25",
+        workspace=tmp_path / "runs-b",
+        wall_clock_sec=20,
+    )
+    assert first.campaign_id != second.campaign_id
+    _install_passing_runner_probes(monkeypatch, execution)
+    monkeypatch.setattr(workflow, "_run_process_group", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(workflow, "ingest_harbor_bundle", lambda **kwargs: SimpleNamespace())
+    environ = {"ORBENCH_HOST_LOCK_DIR": str(tmp_path / "host-locks")}
+    attempted_while_fingerprinting = False
+
+    def fingerprint(image):
+        nonlocal attempted_while_fingerprinting
+        if not attempted_while_fingerprinting:
+            attempted_while_fingerprinting = True
+            with pytest.raises(PreconditionError, match="shared Docker image alias"):
+                workflow.execute_prepared_run(second, environ=environ)
+            second_manifest = json.loads(
+                (second.run_root / "manifest.json").read_text(encoding="utf-8")
+            )
+            assert second_manifest["state"] == "prepared"
+        return {
+            "requested_tag": image,
+            "image_id": "sha256:" + "1" * 64,
+            "repo_digests": [],
+        }
+
+    monkeypatch.setattr(execution, "docker_image_fingerprint", fingerprint)
+
+    workflow.execute_prepared_run(first, environ=environ)
+    assert attempted_while_fingerprinting
+
+    # The same host lock is released after fingerprinting, so the rejected
+    # campaign can subsequently run without repairing or recreating its plan.
+    workflow.execute_prepared_run(second, environ=environ)
+    second_manifest = json.loads(
+        (second.run_root / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert second_manifest["state"] == "completed"
+    assert second_manifest["runtime_image_alias_verification"][
+        "matches_runtime_image"
+    ] is True
+
+
+def test_paid_runtime_image_must_match_the_fixed_upstream_alias(
+    monkeypatch, upstream_fixtures: Path, tmp_path: Path
+):
+    from orbenchlab import execution, workflow
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    prepared = workflow.prepare_oragentbench_run(
+        source=source,
+        task="single_task",
+        agent="codex",
+        scaffold_version="fixture-cli-1.2.3",
+        model="gpt-5.5",
+        auth_mode="api-key",
+        model_base_url="https://router.example.test/v1",
+        date="2026-08-24",
+        workspace=tmp_path / "runs",
+        wall_clock_sec=20,
+    )
+    _install_passing_runner_probes(monkeypatch, execution)
+    monkeypatch.setattr(workflow, "_run_process_group", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        workflow,
+        "ingest_harbor_bundle",
+        lambda **kwargs: pytest.fail("mismatched image reached result ingest"),
+    )
+
+    def fingerprint(image):
+        image_id = "1" if image == prepared.runtime_image_tag else "2"
+        return {
+            "requested_tag": image,
+            "image_id": "sha256:" + image_id * 64,
+            "repo_digests": [],
+        }
+
+    monkeypatch.setattr(execution, "docker_image_fingerprint", fingerprint)
+    environ = {
+        "MODEL_API_KEY": "ephemeral-test-value",
+        "MODEL_BASE_URL": "https://router.example.test/v1",
+        "ORBENCH_HOST_LOCK_DIR": str(tmp_path / "host-locks"),
+    }
+
+    with pytest.raises(EvidenceError, match="fixed ORAgentBench base alias"):
+        workflow.execute_prepared_run(
+            prepared,
+            acknowledge_cost="i-accept-model-costs",
+            environ=environ,
+        )
+
+    manifest = json.loads(
+        (prepared.run_root / "manifest.json").read_text(encoding="utf-8")
+    )
+    receipt = json.loads(
+        (prepared.run_root / "receipt.json").read_text(encoding="utf-8")
+    )
+    verification = manifest["runtime_image_alias_verification"]
+    assert manifest["state"] == "failed"
+    assert verification["fixed_alias"] == execution.ORAGENTBENCH_FIXED_BASE_IMAGE
+    assert verification["matches_runtime_image"] is False
+    assert receipt["runtime_image_alias_verification"] == verification
+    assert set(manifest["runtime_image"]) == {
+        "requested_tag",
+        "image_id",
+        "repo_digests",
+    }
+
+    # Failure does not strand the host-wide lock.
+    with workflow._oragentbench_docker_alias_lock(environ=environ):
+        pass
+
+
+def test_host_docker_alias_lock_rejects_a_symlink_directory(
+    monkeypatch, tmp_path: Path
+):
+    from orbenchlab import workflow
+
+    target = tmp_path / "real-locks"
+    target.mkdir(mode=0o700)
+    link = tmp_path / "lock-link"
+    link.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(PreconditionError, match="unavailable or unsafe"):
+        with workflow._oragentbench_docker_alias_lock(
+            environ={"ORBENCH_HOST_LOCK_DIR": str(link)}
+        ):
+            pytest.fail("unsafe host lock directory was accepted")
+
+
+def test_host_docker_alias_lock_rejects_a_foreign_owner(
+    monkeypatch, tmp_path: Path
+):
+    from orbenchlab import workflow
+
+    lock_dir = tmp_path / "host-locks"
+    lock_dir.mkdir(mode=0o700)
+    actual_uid = workflow.os.getuid()
+    monkeypatch.setattr(workflow.os, "getuid", lambda: actual_uid + 1)
+
+    with pytest.raises(PreconditionError, match="not owned by the current user"):
+        with workflow._oragentbench_docker_alias_lock(
+            environ={"ORBENCH_HOST_LOCK_DIR": str(lock_dir)}
+        ):
+            pytest.fail("foreign-owned host lock directory was accepted")
 
 
 def test_one_command_prepares_an_auditable_workspace(
@@ -86,6 +267,34 @@ def test_one_command_prepares_an_auditable_workspace(
     payload_2 = json.loads(capsys.readouterr().out)
     assert payload_2["run_root"] == payload["run_root"]
     assert payload_2["resumed"] is True
+
+
+def test_one_command_refuses_a_failed_upstream_inspection(
+    capsys, upstream_fixtures: Path, tmp_path: Path
+):
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    (source / "metrics" / "per_dimension_reward.py").unlink()
+
+    code = main(
+        [
+            "run",
+            "oragentbench",
+            "--source",
+            str(source),
+            "--task",
+            "single_task",
+            "--agent",
+            "oracle",
+            "--date",
+            "2026-08-24",
+            "--workspace",
+            str(tmp_path / "runs"),
+            "--prepare-only",
+        ]
+    )
+
+    assert code == 5
+    assert "official_metric_script" in capsys.readouterr().err
 
 
 def test_harbor_bundle_ingest_builds_normalized_data_and_report(tmp_path: Path):
@@ -210,6 +419,8 @@ def test_one_command_prepares_a_codex_plan_without_serializing_a_secret(
             "single_task",
             "--agent",
             "codex",
+            "--scaffold-version",
+            "fixture-cli-1.2.3",
             "--model",
             "gpt-5.5",
             "--auth-mode",
@@ -247,7 +458,7 @@ def test_doctor_checks_the_actual_codex_plan_runtime(
     auth.chmod(0o600)
     monkeypatch.setenv("CODEX_AUTH_JSON_PATH", str(auth))
     monkeypatch.setenv("ORBENCH_MODEL_BASE_URL", "https://router.example.test/v1")
-    monkeypatch.setattr(execution.shutil, "which", lambda name: f"/usr/bin/{name}")
+    _install_passing_runner_probes(monkeypatch, execution)
 
     code = main(
         [
@@ -259,6 +470,8 @@ def test_doctor_checks_the_actual_codex_plan_runtime(
             "single_task",
             "--agent",
             "codex",
+            "--scaffold-version",
+            "fixture-cli-1.2.3",
             "--model",
             "gpt-5.5",
             "--auth-mode",
@@ -271,6 +484,44 @@ def test_doctor_checks_the_actual_codex_plan_runtime(
     assert payload["ok"] is True
     assert payload["model_base_url_configured"] is True
     assert "router.example.test" not in json.dumps(payload)
+
+
+def test_doctor_fails_when_docker_is_installed_but_the_daemon_is_unreachable(
+    capsys, monkeypatch, upstream_fixtures: Path, tmp_path: Path
+):
+    from orbenchlab import execution
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    monkeypatch.setattr(execution.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def probe(argv, **kwargs):
+        if argv[-1] == "--version":
+            return subprocess.CompletedProcess(
+                argv, returncode=0, stdout="harbor, version 0.16.2\n", stderr=""
+            )
+        return subprocess.CompletedProcess(
+            argv, returncode=1, stdout="", stderr="sensitive host detail"
+        )
+
+    monkeypatch.setattr(execution.subprocess, "run", probe)
+    code = main(
+        [
+            "doctor",
+            "oragentbench",
+            "--source",
+            str(source),
+            "--task",
+            "single_task",
+            "--agent",
+            "oracle",
+        ]
+    )
+
+    assert code == 5
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert any("docker info" in item for item in payload["checks"]["missing"])
+    assert "sensitive host detail" not in json.dumps(payload)
 
 
 def test_ingest_refuses_a_partial_job_that_silently_drops_a_planned_run(tmp_path: Path):
@@ -346,27 +597,22 @@ def test_completed_resume_refreshes_integrity_after_reingest(
     from orbenchlab import execution, workflow
 
     source = _copy_named_checkout(upstream_fixtures, tmp_path)
-    run_root = tmp_path / "runs" / "campaign"
-    run_root.mkdir(parents=True)
-    (run_root / "manifest.json").write_text('{"state":"completed"}\n')
-    workflow._write_integrity(run_root)
-    prepared = workflow.PreparedRun(
-        run_root=run_root,
-        campaign_id="campaign",
-        command=execution.UpstreamCommand(
-            argv=("unused",), cwd=str(source.parent), required_env=(), provenance="test", description="test"
-        ),
-        preconditions=execution.PreconditionReport(),
-        resumed=True,
+    prepared = workflow.prepare_oragentbench_run(
+        source=source,
+        task="single_task",
         agent="oracle",
         model="",
-        task="single_task",
-        source=source,
+        date="2026-08-24",
+        workspace=tmp_path / "runs",
         wall_clock_sec=20,
-        auth_mode="api-key",
-        model_base_url="",
     )
-    monkeypatch.setattr(execution.shutil, "which", lambda name: f"/usr/bin/{name}")
+    run_root = prepared.run_root
+    manifest_path = run_root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["state"] = "completed"
+    workflow._atomic_json(manifest_path, manifest)
+    workflow._write_integrity(run_root)
+    _install_passing_runner_probes(monkeypatch, execution)
 
     def fake_ingest(**kwargs):
         (run_root / "normalized").mkdir()
@@ -381,6 +627,116 @@ def test_completed_resume_refreshes_integrity_after_reingest(
     assert "normalized/rollout.json" in integrity
 
 
+def test_running_state_is_integrity_checked_before_upstream_starts(
+    monkeypatch, upstream_fixtures: Path, tmp_path: Path
+):
+    from orbenchlab import execution, workflow
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    prepared = workflow.prepare_oragentbench_run(
+        source=source,
+        task="single_task",
+        agent="oracle",
+        model="",
+        date="2026-08-24",
+        workspace=tmp_path / "runs",
+        wall_clock_sec=20,
+    )
+    _install_passing_runner_probes(monkeypatch, execution)
+
+    def inspect_integrity_before_launch(*args, **kwargs):
+        workflow._verify_integrity(prepared.run_root)
+        manifest = json.loads((prepared.run_root / "manifest.json").read_text())
+        assert manifest["state"] == "running"
+        assert manifest["runner_pid"]
+        return 9
+
+    monkeypatch.setattr(workflow, "_run_process_group", inspect_integrity_before_launch)
+    with pytest.raises(Exception, match="exited with code 9"):
+        workflow.execute_prepared_run(prepared)
+
+
+def test_unexpected_ingest_failure_marks_campaign_failed_and_refreshes_integrity(
+    monkeypatch, upstream_fixtures: Path, tmp_path: Path
+):
+    from orbenchlab import execution, workflow
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    prepared = workflow.prepare_oragentbench_run(
+        source=source,
+        task="single_task",
+        agent="oracle",
+        model="",
+        date="2026-08-24",
+        workspace=tmp_path / "runs",
+        wall_clock_sec=20,
+    )
+    _install_passing_runner_probes(monkeypatch, execution)
+    monkeypatch.setattr(workflow, "_run_process_group", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        execution,
+        "docker_image_fingerprint",
+        lambda image: {
+            "requested_tag": image,
+            "image_id": "sha256:" + "1" * 64,
+            "repo_digests": [],
+        },
+    )
+    monkeypatch.setattr(
+        workflow,
+        "ingest_harbor_bundle",
+        lambda **kwargs: (_ for _ in ()).throw(OSError("do not serialize this detail")),
+    )
+
+    with pytest.raises(OSError):
+        workflow.execute_prepared_run(prepared)
+
+    manifest = json.loads((prepared.run_root / "manifest.json").read_text())
+    assert manifest["state"] == "failed"
+    assert manifest["failure_type"] == "OSError"
+    assert "do not serialize" not in json.dumps(manifest)
+    assert "runner_pid" not in manifest
+    workflow._verify_integrity(prepared.run_root)
+
+
+def test_successful_upstream_without_an_image_identity_fails_before_ingest(
+    monkeypatch, upstream_fixtures: Path, tmp_path: Path
+):
+    """Exit zero is not completion unless Docker identifies what actually ran."""
+    from orbenchlab import execution, workflow
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    prepared = workflow.prepare_oragentbench_run(
+        source=source,
+        task="single_task",
+        agent="oracle",
+        model="",
+        date="2026-08-24",
+        workspace=tmp_path / "runs",
+        wall_clock_sec=20,
+    )
+    _install_passing_runner_probes(monkeypatch, execution)
+    monkeypatch.setattr(workflow, "_run_process_group", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(execution, "docker_image_fingerprint", lambda image: None)
+    monkeypatch.setattr(
+        workflow,
+        "ingest_harbor_bundle",
+        lambda **kwargs: pytest.fail("unidentified image reached result ingest"),
+    )
+
+    with pytest.raises(EvidenceError, match="Docker image identity"):
+        workflow.execute_prepared_run(prepared)
+
+    manifest = json.loads((prepared.run_root / "manifest.json").read_text())
+    receipt = json.loads((prepared.run_root / "receipt.json").read_text())
+    assert manifest["state"] == "failed"
+    assert manifest["failure"] == "upstream image identity could not be verified"
+    assert manifest["runtime_image"] is None
+    assert receipt["runtime_image"] is None
+    assert "runner_pid" not in manifest
+    workflow._verify_integrity(prepared.run_root)
+
+
 def test_failed_agent_workspace_uses_upstream_resume_when_job_config_exists(
     upstream_fixtures: Path, tmp_path: Path
 ):
@@ -390,10 +746,14 @@ def test_failed_agent_workspace_uses_upstream_resume_when_job_config_exists(
     wrapper = source / "source" / "scripts" / "run_harbor_prebuild.py"
     wrapper.parent.mkdir(parents=True, exist_ok=True)
     wrapper.write_text("# fixture wrapper\n")
+    skill = source / "skills" / "fixture-skill" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("# Fixture skill\n", encoding="utf-8")
     kwargs = dict(
         source=source,
         task="single_task",
         agent="codex",
+        scaffold_version="fixture-cli-1.2.3",
         model="gpt-5.5",
         auth_mode="codex-auth-json",
         model_base_url="https://router.example.test/v1",
@@ -406,7 +766,38 @@ def test_failed_agent_workspace_uses_upstream_resume_when_job_config_exists(
     job_name = plan["jobs"][0]["job_name"]
     job_dir = first.run_root / "jobs" / job_name
     job_dir.mkdir(parents=True)
-    (job_dir / "config.json").write_text("{}\n")
+    import yaml
+
+    config = yaml.safe_load(
+        (first.run_root / "plan" / "jobs" / f"{job_name}.yaml").read_text()
+    )
+    config.pop("pre_build")
+    config["agents"][0]["name"] = None
+    config["agents"][0]["import_path"] = (
+        "ORAgentBench.harbor_agents.prebuilt_agents:PrebuiltCodex"
+    )
+    dynamic_root = Path(tempfile.mkdtemp(prefix="oragentbench-skills-"))
+    dynamic_dataset = dynamic_root / "harbor_tasks"
+    dynamic_task = dynamic_dataset / "single_task"
+    shutil.copytree(first.source / "harbor_tasks" / "single_task", dynamic_task)
+    for directory in [dynamic_task, *dynamic_task.rglob("*")]:
+        if directory.is_dir():
+            directory.chmod(0o755)
+        elif directory.is_file():
+            directory.chmod(0o644)
+    task_toml = dynamic_task / "task.toml"
+    task_toml.write_text(
+        task_toml.read_text(encoding="utf-8").replace(
+            "[environment]\n", '[environment]\nskills_dir = "/skills"\n'
+        ),
+        encoding="utf-8",
+    )
+    shutil.copytree(
+        first.source / "skills" / "fixture-skill",
+        dynamic_task / "environment" / "skills" / "fixture-skill",
+    )
+    config["datasets"][0]["path"] = str(dynamic_dataset)
+    (job_dir / "config.json").write_text(json.dumps(config) + "\n")
     manifest_path = first.run_root / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["state"] = "failed"
@@ -417,3 +808,7 @@ def test_failed_agent_workspace_uses_upstream_resume_when_job_config_exists(
 
     assert resumed.resumed is True
     assert "--resume" in resumed.command.argv
+    assert "--cleanup-before-resume" in resumed.command.argv
+    binding = json.loads((resumed.run_root / "resume-binding.json").read_text())
+    assert binding["job_name"] == job_name
+    assert binding["scaffold_version"] == "fixture-cli-1.2.3"

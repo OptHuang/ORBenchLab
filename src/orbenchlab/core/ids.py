@@ -74,6 +74,7 @@ def agent_uid(
     env_from_secret: Mapping[str, str] | None = None,
     env_literals: Mapping[str, str] | None = None,
     auth_mode: str | None = None,
+    provider_route_digest: str | None = None,
     import_path: str | None = None,
     setup_timeout_sec: int | None = None,
 ) -> str:
@@ -108,6 +109,11 @@ def agent_uid(
         # API-key is the historical default; only a non-default transport
         # changes identity so existing campaigns keep stable ids.
         payload["auth_mode"] = auth_mode
+    if provider_route_digest:
+        # This is a digest of the normalized credential destination, never the
+        # URL or a credential. Provider routing changes what was measured and
+        # must therefore change agent and run identity.
+        payload["provider_route_digest"] = provider_route_digest
     if import_path:
         payload["import_path"] = import_path
     if setup_timeout_sec is not None:

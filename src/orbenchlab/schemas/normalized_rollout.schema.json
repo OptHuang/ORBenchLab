@@ -100,6 +100,25 @@
               "hard_infra_evidence",
               "repetition_controlled",
               "provider_or_verifier_error",
+              "ambiguous_reward_with_exception",
+              null
+            ]
+          },
+          "reward_schema_version": {
+            "type": ["string", "null"],
+            "enum": [
+              "oragentbench-rewards-v1",
+              "oragentbench-multistep-rewards-v1",
+              "oragentbench-preserved-timeout-rewards-v1",
+              null
+            ]
+          },
+          "reward_provenance": {
+            "type": ["string", "null"],
+            "description": "Whether scores came from the ordinary upstream verifier result or the pinned ORAgentBench wrapper's exact preserved-timeout fallback.",
+            "enum": [
+              "upstream-verifier",
+              "oragentbench-wrapper-preserved-timeout-fallback",
               null
             ]
           },
@@ -111,7 +130,8 @@
             "description": "Numeric reward keys as emitted by the upstream verifier. Keys are not renamed here.",
             "properties": {
               "feasibility": { "type": "number" },
-              "quality": { "type": "number" }
+              "quality": { "type": "number" },
+              "reward": { "type": "number" }
             }
           }
         }

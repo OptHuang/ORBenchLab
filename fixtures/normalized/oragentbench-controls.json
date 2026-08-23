@@ -1,6 +1,6 @@
 {
   "_note": "Synthetic scores over real planner output. Exercises the durability gate: the campaign asks for 'validated' but only one replica exists, so the report renders as 'partial'.",
-  "campaign_id": "oragentbench-controls-20260822-7a6d8ee1",
+  "campaign_id": "oragentbench-controls-20260822-159af0a0",
   "durability": {
     "min_replica_count": 1,
     "verified": false
@@ -42,7 +42,7 @@
       "exclusion_basis": "hard_infra_evidence",
       "infra_suspect": false,
       "replica_count": 1,
-      "run_id": "a75cedf3d7a14cb4",
+      "run_id": "b43b901e7ef0ed51",
       "scaffold": "nop",
       "scores": {},
       "seed": 1,
@@ -58,7 +58,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 1,
-      "run_id": "fda64fef4d8d194a",
+      "run_id": "dfc0a2cbe9538b8c",
       "scaffold": "nop",
       "scores": {
         "feasibility": 0.0,
@@ -77,7 +77,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 1,
-      "run_id": "b481ef1ce1f85e9c",
+      "run_id": "a033f025996a7e6e",
       "scaffold": "nop",
       "scores": {
         "feasibility": 0.0,
@@ -96,7 +96,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 1,
-      "run_id": "752887f0f699ed6e",
+      "run_id": "3919ed542615b403",
       "scaffold": "nop",
       "scores": {
         "feasibility": 0.0,
@@ -115,7 +115,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 1,
-      "run_id": "6c57962b2ac50194",
+      "run_id": "c65d34454bb168b8",
       "scaffold": "nop",
       "scores": {
         "feasibility": 0.0,
@@ -134,7 +134,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 1,
-      "run_id": "142a991ec1d791d9",
+      "run_id": "b063025f94d79052",
       "scaffold": "nop",
       "scores": {
         "feasibility": 0.0,
@@ -153,7 +153,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 1,
-      "run_id": "1ba0b62afd776251",
+      "run_id": "08aa2a6570616e9d",
       "scaffold": "nop",
       "scores": {
         "feasibility": 0.0,
@@ -172,7 +172,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 1,
-      "run_id": "4612e9d18d66e9c2",
+      "run_id": "ba608b5b06d7fcc7",
       "scaffold": "nop",
       "scores": {
         "feasibility": 0.0,
@@ -191,7 +191,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 1,
-      "run_id": "0c7fc04b30865917",
+      "run_id": "164962c685a99dac",
       "scaffold": "nop",
       "scores": {
         "feasibility": 0.0,
@@ -210,7 +210,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 1,
-      "run_id": "14606cb212837f2e",
+      "run_id": "36cd5966e6bd5d4f",
       "scaffold": "oracle",
       "scores": {
         "feasibility": 1.0,
@@ -229,7 +229,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 1,
-      "run_id": "ff0cf18c4f5279e8",
+      "run_id": "b717edd51795f2af",
       "scaffold": "oracle",
       "scores": {
         "feasibility": 1.0,
@@ -248,7 +248,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 1,
-      "run_id": "ef1b959f66fd5cdb",
+      "run_id": "3ec5f7d0f7f4d8a4",
       "scaffold": "oracle",
       "scores": {
         "feasibility": 1.0,
@@ -267,7 +267,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 1,
-      "run_id": "62f75181b1ecaf18",
+      "run_id": "8a9ac4adfad319c8",
       "scaffold": "oracle",
       "scores": {
         "feasibility": 1.0,
@@ -286,7 +286,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 1,
-      "run_id": "245ebfcd8856bfa0",
+      "run_id": "1ebf8079739139b2",
       "scaffold": "oracle",
       "scores": {
         "feasibility": 1.0,
@@ -305,7 +305,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 1,
-      "run_id": "70fc971b131f4760",
+      "run_id": "269148c8bdb7c900",
       "scaffold": "oracle",
       "scores": {
         "feasibility": 1.0,
@@ -324,7 +324,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 1,
-      "run_id": "db9699a598107f82",
+      "run_id": "dd09aec191a1220d",
       "scaffold": "oracle",
       "scores": {
         "feasibility": 1.0,
@@ -343,7 +343,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 1,
-      "run_id": "ca45171464d5dc38",
+      "run_id": "ca14a5175b12a092",
       "scaffold": "oracle",
       "scores": {
         "feasibility": 1.0,
@@ -362,7 +362,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 1,
-      "run_id": "a76861434bc5535e",
+      "run_id": "be165606f0b0f8f4",
       "scaffold": "oracle",
       "scores": {
         "feasibility": 1.0,

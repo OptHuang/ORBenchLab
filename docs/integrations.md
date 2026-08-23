@@ -168,44 +168,64 @@ Official final instances are unpublished server-only data. What is downloadable
 from HuggingFace is suitable for local integration tests, **not** for
 leaderboard scoring.
 
-## Running an agent
+## Running a benchmark
 
-`tools/run_benchmark_smoke.py` is the only thing in this repository that starts
-an upstream process. It validates the inputs against the checkout, builds the
-command upstream documents for itself, checks the preconditions, hands the argv
-over, and writes a sanitized receipt. Command construction lives in
-`orbenchlab.execution` and is unit-tested, so what runs on a self-hosted runner
-is exactly what the tests asserted.
+`orbench run` is the primary lifecycle boundary. It validates the checkout,
+compiles a deterministic plan, writes an integrity-protected workspace, invokes
+the pinned upstream runner only with `--execute`, reconciles Harbor output, and
+renders the report. Repeating the same command verifies and resumes the same
+campaign. A paid path additionally needs the exact scaffold CLI version and
+`--acknowledge-cost i-accept-model-costs`.
 
-Dry run is the default. Execution needs `--execute`, and a paid path needs
-`--acknowledge-cost i-accept-model-costs` as well.
+`tools/run_benchmark_smoke.py` remains a legacy zero-cost command-construction
+and upstream-dry-run helper. It is not the evidence lifecycle used by the
+self-hosted execution jobs.
 
 ### ORAgentBench
 
-**The command that runs**, from the parent of the checkout:
+**Controls.** A fresh-host oracle or nop run delegates to upstream's own build
+and control script, from the parent of the checkout:
+
+```bash
+bash <checkout>/experiments/scripts/run_oracle_all.sh \
+    --config <compiled job config>
+```
+
+It builds the required base image rather than trusting a floating local cache.
+
+**Paid agents.** The lifecycle invokes the pinned Python prebuild wrapper:
 
 ```bash
 python3 <checkout>/source/scripts/run_harbor_prebuild.py \
-    -c <compiled job config> --skip-build
+    -c <compiled job config>
 ```
 
-That is upstream's own wrapper — `experiments/scripts/run_claude_code.sh` is
-`bash scripts/run_harbor_prebuild.sh -c <config> --skip-build`, and that shell
-script execs the Python entry point above. The wrapper pre-builds the agent CLI
-into the base image, applies dynamic skills, swaps in upstream's prebuilt agent
-class, and then execs `harbor run -c <transformed config>`.
+The compiled config requests a fresh base rebuild, a content-derived image tag,
+and an exact scaffold version; floating `latest` versions are rejected. The
+wrapper applies dynamic skills, swaps in upstream's prebuilt agent class, and
+execs `harbor run -c <transformed config>`. A crash recovery adds upstream's
+`--resume --cleanup-before-resume` and first binds the recovered Harbor config
+and copied task/skills content back to the compiled campaign. ORBenchLab does
+not use `--skip-build` for evidence runs.
 
 **Driving it:**
 
 ```bash
-python tools/run_benchmark_smoke.py oragentbench \
+export MODEL_API_KEY='<short-lived provider key>'
+export MODEL_BASE_URL='https://provider.example/v1'
+orbench doctor oragentbench \
     --source upstream/ORAgentBench \
     --task additive_microfactory_order_planning \
-    --scaffold claude-code --model <pinned-model-id> \
-    --date 2026-08-22 \
-    --output-root out/benchmark-smoke \
-    --receipt out/agent-receipt.json \
-    --execute --acknowledge-cost i-accept-model-costs
+    --agent claude-code --model <pinned-model-id> \
+    --scaffold-version <exact-cli-version>
+orbench run oragentbench \
+    --source upstream/ORAgentBench \
+    --task additive_microfactory_order_planning \
+    --agent claude-code --model <pinned-model-id> \
+    --scaffold-version <exact-cli-version> \
+    --date 2026-08-24 --workspace ./orbench-runs --execute \
+    --acknowledge-cost i-accept-model-costs
+unset MODEL_API_KEY MODEL_BASE_URL
 ```
 
 **The checkout directory must be named `ORAgentBench`.** Upstream resolves the
@@ -236,8 +256,10 @@ kwargs upstream pins:
 | `codex` | `OPENAI_API_KEY` ← `MODEL_API_KEY`; `OPENAI_BASE_URL` ← `MODEL_BASE_URL` | `reasoning_effort: high`, `web_search: disabled` |
 | `mini-swe-agent` | `MSWEA_API_KEY` ← `MODEL_API_KEY` | — |
 
-Only names appear anywhere. The compiled job config carries `${MODEL_API_KEY}`;
-the runner substitutes the value.
+Only variable names appear in the plan. The compiled job config carries
+`${MODEL_API_KEY}`; the runner substitutes the value. The normalized provider
+route digest, not the route string, enters campaign identity, and execution
+requires the runtime route to match it.
 
 ### FrontierOR
 
@@ -307,6 +329,7 @@ exploratory by construction, because the score contains a wall-clock term.
 | *(none)* | `ci.yml`, `integration-contract.yml`, `report.yml` | always | These reference no secrets; a test enforces it |
 | `MODEL_API_KEY` (secret) | `benchmark-smoke.yml`, `mode=agent`, ORAgentBench | agent campaigns only | Set a provider-side spend cap on the key. CI cannot interrupt spend |
 | `MODEL_BASE_URL` (variable) | `benchmark-smoke.yml`, `mode=agent`, ORAgentBench | agent campaigns only | The provider base URL. Required, but not itself a credential — a repository *variable*, not a secret |
+| `ORBENCH_RUNS_ROOT` (variable) | `benchmark-smoke.yml`, self-hosted ORAgentBench jobs | controls and agent campaigns | Persistent runner-owned workspace used for deterministic recovery; never point it at `RUNNER_TEMP` or the checkout |
 | `OPENROUTER_API_KEY` (secret) | `benchmark-smoke.yml`, `mode=agent`, FrontierOR | agent campaigns only | FrontierOR routes model calls through OpenRouter and hands the agent container only an ephemeral proxy token |
 
 ### GitHub Environments
@@ -332,6 +355,8 @@ Runner-side environment variables the smoke workflow checks:
 | --- | --- |
 | `GRB_LICENSE_FILE` | path to a readable Gurobi licence (FrontierOR) |
 | `ORBENCH_PERF_ISOLATED` | `true` only on a machine whose cores are actually pinned (FrontierOR) |
+| `ORBENCH_RUNS_ROOT` | absolute, current-user-owned persistent workspace outside the checkout and runner temp directory |
+| `ORBENCH_HOST_LOCK_DIR` | optional private absolute directory for the runner-account-wide ORAgentBench Docker alias lock; do not share one daemon across Unix accounts |
 
 Upstream checkouts are cloned by the workflow itself, at the pinned commit, via
 `.github/scripts/clone-upstream.sh` — so a runner does not need one prepared in
@@ -379,30 +404,18 @@ cat out/report/summary.md
 orbench report build --input fixtures/normalized/oragentbench-smoke-r0.json \
   --out out/report-gate --require-label validated || echo "refused as designed"
 
-# 8. build the exact upstream agent commands, without running them
-python tools/run_benchmark_smoke.py oragentbench \
+# 8. prepare the one-command ORAgentBench lifecycle without executing Docker.
+orbench run oragentbench \
   --source /tmp/ORAgentBench --task additive_microfactory_order_planning \
-  --scaffold claude-code --model <pinned-model-id> --date 2026-08-22 \
-  --output-root out/benchmark-smoke --allow-missing-tooling
-python tools/run_benchmark_smoke.py frontieror \
-  --source /tmp/FrontierOR --paper-id bierwirth2017 \
-  --primary-model openai/gpt-5.4 --allow-missing-tooling
+  --agent oracle --date 2026-08-24 --workspace /tmp/orbench-runs
 
-# 9. let upstream's own wrapper prove the compiled config is consumable.
-#    Zero cost: no Harbor, no Docker, no credential, no model call.
-python tools/run_benchmark_smoke.py oragentbench \
-  --source /tmp/ORAgentBench --task additive_microfactory_order_planning \
-  --scaffold claude-code --model <pinned-model-id> --date 2026-08-22 \
-  --output-root out/benchmark-smoke --upstream-dry-run --execute
-
-# 10. the full test suite
+# 9. the full test suite
 python -m pytest -q
 ```
 
-Step 9 is the one worth internalising: it runs upstream's real wrapper, which
-transforms the compiled config, applies dynamic skills and prints the
-`harbor run -c ...` command it would execute — then stops. If our job config
-were malformed, that is where it would show, for free.
+Step 8 is safe by default: it writes the inspected source snapshot, compiled
+plan, manifest, receipt and integrity ledger but does not start Docker or call a
+model. Add `orbench doctor ...` before any real execution.
 
 ### Running an actual ORAgentBench control campaign
 
@@ -410,15 +423,23 @@ This one does execute containers, on your machine, with no model spend. It needs
 Docker and the Harbor CLI, which ORBenchLab does not install:
 
 ```bash
-orbench campaign plan campaigns/oragentbench-controls.yaml --out out/plan
-for config in out/plan/jobs/*.yaml; do
-  harbor run -c "$config"      # execution is Harbor's, not ORBenchLab's
-done
+orbench doctor oragentbench \
+  --source /tmp/ORAgentBench \
+  --task additive_microfactory_order_planning --agent oracle
+orbench run oragentbench \
+  --source /tmp/ORAgentBench \
+  --task additive_microfactory_order_planning \
+  --agent oracle --date 2026-08-24 \
+  --workspace /srv/orbench/runs --execute
+orbench export \
+  --run-root /srv/orbench/runs/<campaign-id> \
+  --destination ./share/<campaign-id>
 ```
 
-Producing a normalized slice from the resulting job directories is **not yet
-implemented**; today the report path is exercised with the fixtures in
-`fixtures/normalized/`.
+The lifecycle invokes upstream, ingests and reconciles the resulting Harbor
+trial, renders the report, and marks the campaign complete only after Docker
+image identity and evidence integrity checks pass. `orbench export` is the only
+supported host-to-share boundary; raw jobs, trajectories and logs remain local.
 
 ## Adding a third benchmark
 

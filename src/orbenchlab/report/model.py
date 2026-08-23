@@ -264,8 +264,9 @@ def _control_metrics(rollout: NormalizedRollout, rule: StrictPassRule) -> list[M
     """Task-health controls. Both cost nothing: Harbor provides oracle and nop."""
     results: list[MetricResult] = []
 
-    oracle = [t for t in rollout.trials if t.scaffold == ORACLE_SCAFFOLD]
-    if oracle:
+    all_oracle = [t for t in rollout.trials if t.scaffold == ORACLE_SCAFFOLD]
+    oracle = [t for t in all_oracle if t.counts_toward_capability]
+    if all_oracle:
         passed = [t for t in oracle if rule.holds_for(t)]
         rep_count = _min_repetitions_per_config(oracle)
         rep = repetition_class(rep_count)
@@ -279,12 +280,16 @@ def _control_metrics(rollout: NormalizedRollout, rule: StrictPassRule) -> list[M
                 formula="count(oracle strict pass) / count(oracle trials); a healthy task set is 1.0",
                 run_ids=tuple(sorted(t.run_id for t in oracle)),
                 scope="control:oracle",
+                unmet_requirement=(
+                    None if oracle else "all oracle trials were excluded from capability metrics"
+                ),
                 repetitions=rep_count,
             )
         )
 
-    nop = [t for t in rollout.trials if t.scaffold == NOP_SCAFFOLD]
-    if nop:
+    all_nop = [t for t in rollout.trials if t.scaffold == NOP_SCAFFOLD]
+    nop = [t for t in all_nop if t.counts_toward_capability]
+    if all_nop:
         failed = [t for t in nop if not rule.holds_for(t)]
         rep_count = _min_repetitions_per_config(nop)
         rep = repetition_class(rep_count)
@@ -298,6 +303,9 @@ def _control_metrics(rollout: NormalizedRollout, rule: StrictPassRule) -> list[M
                 formula="count(nop non-pass) / count(nop trials); a task passable by doing nothing is broken",
                 run_ids=tuple(sorted(t.run_id for t in nop)),
                 scope="control:nop",
+                unmet_requirement=(
+                    None if nop else "all nop trials were excluded from capability metrics"
+                ),
                 repetitions=rep_count,
             )
         )
@@ -309,6 +317,7 @@ def _disclosure_metrics(rollout: NormalizedRollout) -> list[MetricResult]:
     trials = rollout.trials
     run_ids = tuple(sorted(t.run_id for t in trials))
     suspect = [t for t in trials if t.infra_suspect]
+    excluded = [t for t in trials if not t.counts_toward_capability]
     no_load = [t for t in trials if rollout.site.get("load_source") == "none"]
     return [
         MetricResult(
@@ -318,9 +327,25 @@ def _disclosure_metrics(rollout: NormalizedRollout) -> list[MetricResult]:
             grade=EvidenceGrade.DETERMINISTIC_TRACE,
             repetition=RepetitionClass.R0,
             formula=(
-                "count(infra_suspect) / count(trials); these trials stay in the capability "
-                "denominator — a soft signal lowers confidence, it does not reassign blame"
+                "count(infra_suspect) / count(trials); denominator inclusion is reported "
+                "separately by counts_toward_capability and excluded_trial_share"
             ),
+            run_ids=run_ids,
+            scope="disclosure",
+        ),
+        MetricResult(
+            name="excluded_trial_share",
+            value=_ratio(len(excluded), len(trials)),
+            n=len(trials),
+            grade=EvidenceGrade.DETERMINISTIC_TRACE,
+            repetition=RepetitionClass.R0,
+            formula=(
+                "count(trials excluded from capability metrics) / count(trials); "
+                "exclusion is explicit and each excluded trial carries an exclusion_basis"
+            ),
+            # This is a ratio over the complete panel.  Keep both numerator and
+            # denominator samples in the claim provenance; exclusion_basis on
+            # each normalized trial identifies the numerator members.
             run_ids=run_ids,
             scope="disclosure",
         ),
@@ -341,10 +366,10 @@ def _disclosure_metrics(rollout: NormalizedRollout) -> list[MetricResult]:
             grade=EvidenceGrade.DETERMINISTIC_TRACE,
             repetition=RepetitionClass.R0,
             formula=(
-                "share of trials with load_source = 'none'; with no sampler there are no "
-                "soft infrastructure signals and infra_suspect is always false"
+                "share of trials with load_source = 'none'; load-based suspicion is "
+                "unavailable, but hard or contradictory evidence may still set infra_suspect"
             ),
-            run_ids=(),
+            run_ids=run_ids,
             scope="disclosure",
         ),
     ]

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -19,11 +20,13 @@ from .campaign import compile as compile_mod
 from .campaign import spec as spec_mod
 from .core import schema as schema_mod
 from .core.errors import ORBenchError
+from .core.urls import validate_https_base_url
 from .integrations import registry
 from .report import render as render_mod
 from .report.model import NormalizedRollout
 from . import workflow as workflow_mod
 from . import execution as execution_mod
+from . import export as export_mod
 
 PROG = "orbench"
 
@@ -48,8 +51,8 @@ def _build_parser() -> argparse.ArgumentParser:
         prog=PROG,
         description=(
             "Control plane for operations-research agent benchmarks. Registers upstream "
-            "integrations, compiles campaigns into plans with stable run ids, and renders "
-            "evidence-labelled reports. It does not execute benchmarks."
+            "integrations, compiles campaigns into plans with stable run ids, delegates "
+            "execution to pinned upstream runners, and renders evidence-labelled reports."
         ),
     )
     parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")
@@ -62,6 +65,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_schema(sub)
     _add_doctor(sub)
     _add_run(sub)
+    _add_export(sub)
     return parser
 
 
@@ -80,6 +84,7 @@ def _add_doctor(sub: argparse._SubParsersAction) -> None:
     parser.add_argument("--task", required=True)
     parser.add_argument("--agent", default="oracle")
     parser.add_argument("--model", default="")
+    parser.add_argument("--scaffold-version", default="")
     parser.add_argument(
         "--auth-mode",
         choices=["api-key", "codex-auth-json"],
@@ -90,15 +95,22 @@ def _add_doctor(sub: argparse._SubParsersAction) -> None:
 
 
 def _resolved_model_base_url(args: argparse.Namespace) -> str:
-    if args.model_base_url:
-        return str(args.model_base_url).strip()
-    if args.auth_mode == "codex-auth-json":
-        return execution_mod.discover_codex_base_url()
-    return ""
+    if args.agent in execution_mod.CONTROL_SCAFFOLDS:
+        return ""
+    candidate = str(args.model_base_url).strip() if args.model_base_url else ""
+    if not candidate and args.auth_mode == "codex-auth-json":
+        candidate = execution_mod.discover_codex_base_url()
+    if not candidate and args.agent in execution_mod.ROUTE_PINNED_SCAFFOLDS:
+        # MODEL_BASE_URL is configuration, not a secret. Resolve it without
+        # placing it on argv or stdout; validation errors never echo the value.
+        candidate = os.environ.get("MODEL_BASE_URL", "")
+    return validate_https_base_url(candidate) if candidate else ""
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
     base_url = _resolved_model_base_url(args)
+    if args.agent not in execution_mod.CONTROL_SCAFFOLDS:
+        execution_mod.validate_pinned_scaffold_version(args.scaffold_version)
     report = execution_mod.oragentbench_preconditions(
         source=Path(args.source),
         task_name=args.task,
@@ -142,20 +154,39 @@ def _add_run(sub: argparse._SubParsersAction) -> None:
     )
     parser.add_argument("--model", default="", help="pinned model id for a model agent")
     parser.add_argument(
+        "--scaffold-version",
+        default="",
+        help="exact released CLI version baked into a paid scaffold image",
+    )
+    parser.add_argument(
         "--auth-mode",
         choices=["api-key", "codex-auth-json"],
         default="api-key",
-        help="credential transport; codex-auth-json reuses a private local Codex login",
+        help=(
+            "credential transport; api-key is the safe default. codex-auth-json is "
+            "allowed only for explicitly network-disabled tasks"
+        ),
     )
     parser.add_argument(
         "--model-base-url",
         default="",
-        help="non-secret pinned provider URL required by codex-auth-json",
+        help=(
+            "non-secret pinned HTTPS provider URL; only its normalized digest is "
+            "recorded in campaign artifacts"
+        ),
     )
     parser.add_argument("--date", required=True, help="explicit YYYY-MM-DD identity input")
     parser.add_argument("--workspace", default="orbench-runs")
     parser.add_argument("--wall-clock-sec", type=int, default=2700)
-    parser.add_argument("--max-cost-usd", type=float, default=25.0)
+    parser.add_argument(
+        "--max-cost-usd",
+        type=float,
+        default=25.0,
+        help=(
+            "declared audit envelope only; enforce the real spend ceiling at the "
+            "model provider (wall-clock-sec is enforced locally)"
+        ),
+    )
     action = parser.add_mutually_exclusive_group()
     action.add_argument(
         "--prepare-only",
@@ -178,6 +209,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         task=args.task,
         agent=args.agent,
         model=args.model,
+        scaffold_version=args.scaffold_version,
         date=args.date,
         workspace=args.workspace,
         wall_clock_sec=args.wall_clock_sec,
@@ -207,6 +239,27 @@ def _cmd_run(args: argparse.Namespace) -> int:
             }
         )
     _print_json(payload)
+    return 0
+
+
+def _add_export(sub: argparse._SubParsersAction) -> None:
+    parser = sub.add_parser(
+        "export",
+        help="export a completed run as a sanitized, integrity-checked share bundle",
+        description=(
+            "Verify a completed ORAgentBench workspace and atomically export only its "
+            "normalized rollout, rendered report and newly derived path-free metadata. "
+            "Raw jobs, logs, credentials and the host-local manifest are never copied."
+        ),
+    )
+    parser.add_argument("--run-root", required=True, help="completed local run workspace")
+    parser.add_argument("--destination", required=True, help="new share-bundle directory")
+    parser.set_defaults(handler=_cmd_export)
+
+
+def _cmd_export(args: argparse.Namespace) -> int:
+    result = export_mod.export_shareable_run(args.run_root, args.destination)
+    _print_json(result.to_dict())
     return 0
 
 

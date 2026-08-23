@@ -75,6 +75,16 @@ def test_secret_values_are_not_part_of_any_identifier():
     assert ids.agent_uid(**with_value_like_name) == signature
 
 
+def test_provider_route_digest_is_part_of_agent_identity():
+    first = ids.agent_uid(
+        **BASE_AGENT, provider_route_digest="sha256:" + "1" * 64
+    )
+    second = ids.agent_uid(
+        **BASE_AGENT, provider_route_digest="sha256:" + "2" * 64
+    )
+    assert first != second
+
+
 def test_campaign_cfg_digest_ignores_non_semantic_fields():
     base = {"slug": "x", "tasks": ["a"], "job_name": "one", "debug": False}
     other = {"slug": "x", "tasks": ["a"], "job_name": "two", "debug": True, "comments": "hi"}

@@ -13,7 +13,7 @@ on:
     inputs:
       artifact_run_id:
         description: >-
-          Run id of the workflow run holding a "normalized-slice" artifact.
+          Run id of a benchmark-smoke run holding a shareable evidence artifact.
           Leave empty to rebuild from the repository fixtures.
         required: false
         default: ""
@@ -50,37 +50,102 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 
-      - name: Download the normalized slice
-        if: inputs.artifact_run_id != ''
+      - name: Resolve the evidence artifact
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          WORKFLOW_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          REQUESTED_RUN_ID: ${{ inputs.artifact_run_id }}
+        run: |
+          set -euo pipefail
+          run_id=""
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            if [ "$WORKFLOW_CONCLUSION" != "success" ]; then
+              echo "::notice::benchmark-smoke did not succeed; no report will be built"
+              echo "source=none" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            run_id="$WORKFLOW_RUN_ID"
+          elif [ -n "$REQUESTED_RUN_ID" ]; then
+            run_id="$REQUESTED_RUN_ID"
+          else
+            echo "source=fixtures" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          case "$run_id" in
+            ''|*[!0-9]*) echo "::error::artifact run id must be numeric"; exit 1 ;;
+          esac
+          artifact_name=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
+            --paginate \
+            --jq '.artifacts[] | select(.expired == false) | .name | select(. == "controls-evidence" or . == "agent-evidence-oragentbench")')
+          artifact_count=$(printf '%s\n' "$artifact_name" | sed '/^$/d' | wc -l | tr -d ' ')
+          if [ "$artifact_count" -eq 0 ]; then
+            if [ "$EVENT_NAME" = "workflow_run" ]; then
+              echo "::notice::this benchmark-smoke run produced no shareable evidence (for example, validate-only)"
+              echo "source=none" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::run $run_id has no shareable ORBenchLab evidence artifact"
+            exit 1
+          fi
+          if [ "$artifact_count" -ne 1 ]; then
+            echo "::error::run $run_id has an ambiguous set of shareable evidence artifacts"
+            exit 1
+          fi
+          echo "source=artifact" >> "$GITHUB_OUTPUT"
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+
+      - name: Download the shareable evidence
+        if: steps.resolve.outputs.source == 'artifact'
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          name: normalized-slice
+          name: ${{ steps.resolve.outputs.artifact_name }}
           path: incoming
-          run-id: ${{ inputs.artifact_run_id }}
+          run-id: ${{ steps.resolve.outputs.run_id }}
           github-token: ${{ github.token }}
 
       - name: Select the input
         id: select
+        env:
+          INPUT_SOURCE: ${{ steps.resolve.outputs.source }}
         run: |
           set -euo pipefail
-          mkdir -p incoming
-          if [ -n "$(find incoming -name '*.json' -print -quit)" ]; then
-            echo "source=downloaded" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::no uploaded slice; rebuilding from repository fixtures"
-            cp fixtures/normalized/*.json incoming/
-            echo "source=fixtures" >> "$GITHUB_OUTPUT"
+          mkdir -p selected
+          if [ "$INPUT_SOURCE" = "none" ]; then
+            echo "have_input=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          ls -la incoming
+          if [ "$INPUT_SOURCE" = "fixtures" ]; then
+            cp fixtures/normalized/*.json selected/
+          else
+            python - <<'PY'
+          from pathlib import Path
+          import shutil
+
+          slices = sorted(Path("incoming").glob("**/normalized/rollout.json"))
+          if not slices:
+              raise SystemExit("shareable evidence artifact has no normalized/rollout.json")
+          for index, source in enumerate(slices):
+              shutil.copyfile(source, Path("selected") / f"slice-{index:03d}.json")
+          PY
+          fi
+          echo "have_input=true" >> "$GITHUB_OUTPUT"
+          ls -la selected
 
       - name: Guard — reject raw bundle content in the input
+        if: steps.select.outputs.have_input == 'true'
         run: |
           set -euo pipefail
           # A normalized slice is small and structured. If any of these appear,
           # something uploaded raw evidence into a public artifact path.
           forbidden='trajectory.json|test-stdout|test-stderr|reference_metrics|reference_objective|reference_runtime|BEGIN [A-Z ]*PRIVATE KEY'
           failed=0
-          for file in incoming/*.json; do
+          for file in selected/*.json; do
             size=$(wc -c < "$file")
             if [ "$size" -gt 5242880 ]; then
               echo "::error::$file is ${size} bytes; a normalized slice is kilobytes, not megabytes"
@@ -94,25 +159,30 @@ jobs:
           [ "$failed" -eq 0 ] || exit 1
 
       - name: Validate each slice against the published schema
+        if: steps.select.outputs.have_input == 'true'
         run: |
           set -euo pipefail
-          for file in incoming/*.json; do
+          for file in selected/*.json; do
             orbench schema validate "$file" --schema normalized_rollout.schema.json
           done
 
       - name: Build the reports
+        if: steps.select.outputs.have_input == 'true'
+        env:
+          REQUIRE_LABEL: ${{ inputs.require_label || 'exploratory' }}
         run: |
           set -euo pipefail
           mkdir -p out/reports
-          for file in incoming/*.json; do
+          for file in selected/*.json; do
             name=$(basename "$file" .json)
             orbench report build \
               --input "$file" \
               --out "out/reports/$name" \
-              --require-label "${{ inputs.require_label || 'exploratory' }}"
+              --require-label "$REQUIRE_LABEL"
           done
 
       - name: Show the labels the evidence actually supports
+        if: steps.select.outputs.have_input == 'true'
         run: |
           set -euo pipefail
           for summary in out/reports/*/summary.json; do
@@ -127,6 +197,7 @@ jobs:
           done
 
       - name: Upload the rendered reports
+        if: steps.select.outputs.have_input == 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: reports

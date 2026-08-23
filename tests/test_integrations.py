@@ -128,6 +128,89 @@ def test_oragentbench_dataset_digest_changes_with_task_content(tmp_path, request
     assert oragentbench.inspect(copy).facts["dataset_digest"] != before
 
 
+def test_oragentbench_dataset_digest_changes_with_verifier_content(tmp_path, request):
+    source = Path(request.config.rootpath) / "tests/fixtures/upstream/oragentbench_min"
+    import shutil
+
+    copy = tmp_path / "copy"
+    shutil.copytree(source, copy)
+    before = oragentbench.inspect(copy).facts["dataset_digest"]
+    verifier = copy / "harbor_tasks" / "single_task" / "tests" / "test.sh"
+    verifier.write_text(verifier.read_text() + "\n# verifier changed\n", encoding="utf-8")
+    assert oragentbench.inspect(copy).facts["dataset_digest"] != before
+
+
+def test_oragentbench_dataset_digest_changes_with_metric_content(tmp_path, request):
+    source = Path(request.config.rootpath) / "tests/fixtures/upstream/oragentbench_min"
+    import shutil
+
+    copy = tmp_path / "copy"
+    shutil.copytree(source, copy)
+    before = oragentbench.inspect(copy).facts["dataset_digest"]
+    metric = copy / "metrics" / "per_dimension_reward.py"
+    metric.write_text(metric.read_text() + "\n# metric changed\n", encoding="utf-8")
+    assert oragentbench.inspect(copy).facts["dataset_digest"] != before
+
+
+def test_oragentbench_dataset_digest_ignores_generated_python_bytecode(tmp_path, request):
+    source = Path(request.config.rootpath) / "tests/fixtures/upstream/oragentbench_min"
+    import shutil
+
+    copy = tmp_path / "copy"
+    shutil.copytree(source, copy)
+    before = oragentbench.inspect(copy).facts["dataset_digest"]
+    # Use a declared identity root that already exists.  Importing one of its
+    # modules may create this cache, but must not mutate benchmark identity.
+    cache = copy / "source" / "scripts" / "__pycache__"
+    cache.mkdir(parents=True, exist_ok=True)
+    (cache / "prebuilt_agents.cpython-312.pyc").write_bytes(b"generated-bytecode")
+    assert oragentbench.inspect(copy).facts["dataset_digest"] == before
+
+
+def test_oragentbench_identity_ignores_generated_names_only_inside_checkout(
+    tmp_path, request
+):
+    source = Path(request.config.rootpath) / "tests/fixtures/upstream/oragentbench_min"
+    import shutil
+
+    copy = tmp_path / "__pycache__" / "ORAgentBench"
+    shutil.copytree(source, copy)
+    before_report = oragentbench.inspect(copy)
+    before = before_report.facts["dataset_digest"]
+    assert before_report.facts["identity_file_count"] > 0
+    toml = copy / "harbor_tasks" / "single_task" / "task.toml"
+    toml.write_text(toml.read_text() + '\nkeywords = ["ancestor-regression"]\n')
+    after = oragentbench.inspect(copy)
+    assert after.facts["dataset_digest"] != before
+    assert after.status != "failed"
+
+
+def test_oragentbench_fails_when_an_identity_root_is_missing(tmp_path, request):
+    source = Path(request.config.rootpath) / "tests/fixtures/upstream/oragentbench_min"
+    import shutil
+
+    copy = tmp_path / "ORAgentBench"
+    shutil.copytree(source, copy)
+    (copy / "metrics" / "per_dimension_reward.py").unlink()
+    report = oragentbench.inspect(copy)
+    check = _checks(report.to_dict())["dataset_identity_inputs"]
+    assert report.status == "failed"
+    assert check["status"] == "fail"
+    assert "metrics/per_dimension_reward.py" in check["evidence"]["paths"]
+
+
+def test_oragentbench_dataset_digest_tracks_executable_mode(tmp_path, request):
+    source = Path(request.config.rootpath) / "tests/fixtures/upstream/oragentbench_min"
+    import shutil
+
+    copy = tmp_path / "copy"
+    shutil.copytree(source, copy)
+    verifier = copy / "harbor_tasks" / "single_task" / "tests" / "test.sh"
+    verifier.chmod(verifier.stat().st_mode ^ 0o100)
+    before = oragentbench.inspect(source).facts["dataset_digest"]
+    assert oragentbench.inspect(copy).facts["dataset_digest"] != before
+
+
 def test_oragentbench_flags_multi_step_regrade_limitation(oab_payload):
     check = _checks(oab_payload)["multi_step_tasks"]
     assert check["status"] == "warn"

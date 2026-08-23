@@ -66,10 +66,18 @@ jobs:
           python -m pip install -e ".[dev]"
 
       - name: Clone upstream at the pinned commit
+        env:
+          MATRIX_INTEGRATION: ${{ matrix.integration }}
+          SELECTED_INTEGRATION: ${{ inputs.integration }}
+          UPSTREAM_REF: ${{ inputs.upstream_ref }}
         run: |
           set -euo pipefail
+          requested_ref=""
+          if [ "$SELECTED_INTEGRATION" = "$MATRIX_INTEGRATION" ]; then
+            requested_ref="$UPSTREAM_REF"
+          fi
           bash .github/scripts/clone-upstream.sh \
-            "${{ matrix.integration }}" upstream "${{ inputs.integration == matrix.integration && inputs.upstream_ref || '' }}"
+            "$MATRIX_INTEGRATION" upstream "$requested_ref"
 
       - name: Inspect
         id: inspect

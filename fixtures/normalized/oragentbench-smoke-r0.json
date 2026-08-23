@@ -1,6 +1,6 @@
 {
   "_note": "Synthetic scores over real planner output. One rollout per configuration: asks for 'partial' but every measurement is R0, so the report renders as 'exploratory' and comparative wording is rejected.",
-  "campaign_id": "oragentbench-smoke-20260822-9f68d0e2",
+  "campaign_id": "oragentbench-smoke-20260822-796d74b1",
   "durability": {
     "min_replica_count": 2,
     "verified": true
@@ -42,7 +42,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 2,
-      "run_id": "4e2ee2ee250bc2c5",
+      "run_id": "11c929bf797b1b7b",
       "scaffold": "nop",
       "scores": {
         "feasibility": 0.0,
@@ -61,7 +61,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 2,
-      "run_id": "ec18641720640136",
+      "run_id": "682a8185ed895b81",
       "scaffold": "nop",
       "scores": {
         "feasibility": 0.0,
@@ -80,7 +80,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 2,
-      "run_id": "ebe09e9c83e8191c",
+      "run_id": "5df6090e177f99e2",
       "scaffold": "nop",
       "scores": {
         "feasibility": 0.0,
@@ -99,7 +99,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 2,
-      "run_id": "75b6ef8772c3489e",
+      "run_id": "bd16a567b3753e6f",
       "scaffold": "oracle",
       "scores": {
         "feasibility": 1.0,
@@ -118,7 +118,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 2,
-      "run_id": "cbd5979b1b45c3c2",
+      "run_id": "d94f3af72439f629",
       "scaffold": "oracle",
       "scores": {
         "feasibility": 1.0,
@@ -137,7 +137,7 @@
       "exclusion_basis": null,
       "infra_suspect": false,
       "replica_count": 2,
-      "run_id": "076ab0beb040ce16",
+      "run_id": "d60f5aaccf2cee58",
       "scaffold": "oracle",
       "scores": {
         "feasibility": 1.0,

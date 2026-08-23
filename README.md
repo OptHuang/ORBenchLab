@@ -5,8 +5,8 @@
 
 A control plane for running operations-research agent benchmarks and reporting
 what they actually showed. ORAgentBench now has one lifecycle command:
-**inspect → plan → preflight → execute → ingest → report** in one immutable
-workspace.
+**inspect → plan → preflight → execute → ingest → report** in one
+integrity-checked run workspace.
 
 ORBenchLab does not reimplement benchmark logic. It sits either side of an
 upstream benchmark's own machinery:
@@ -43,6 +43,22 @@ pip install -e ".[dev]"
 
 Python 3.11+. One runtime dependency (PyYAML).
 
+For an execution host, the bootstrap script creates the local environment and
+also discovers Harbor installed by `uv tool`. If a non-interactive shell cannot
+see Harbor at its usual `$HOME/.local/share/uv/tools/harbor/bin`, the script
+links the discovered executable into `.venv/bin` without overwriting an
+existing command:
+
+```bash
+ORBENCH_PYTHON="$HOME/.local/bin/python3.12" ./scripts/bootstrap-runner.sh
+source .venv/bin/activate
+orbench --version
+harbor --version
+```
+
+For a non-standard uv location, set `ORBENCH_HARBOR_BIN_DIR` to the directory
+containing `harbor`. The script never assumes a user name.
+
 ## Use
 
 ```bash
@@ -50,8 +66,8 @@ Python 3.11+. One runtime dependency (PyYAML).
 orbench integrations list
 
 # Inspect an upstream checkout. Static read: no model calls, no execution.
-git clone https://github.com/ORAgentBench/ORAgentBench /tmp/oragentbench
-orbench integration inspect oragentbench --source /tmp/oragentbench --json out/inspection.json
+git clone https://github.com/ORAgentBench/ORAgentBench /tmp/ORAgentBench
+orbench integration inspect oragentbench --source /tmp/ORAgentBench --json out/inspection.json
 
 # Validate and plan a campaign. Deterministic: same spec, byte-identical output.
 orbench campaign validate campaigns/oragentbench-controls.yaml
@@ -82,32 +98,87 @@ orbench run oragentbench \
 The checkout directory must be named exactly `ORAgentBench`, matching
 upstream's dataset-path contract. Repeating the same command verifies and
 resumes the same content-addressed workspace instead of scheduling a duplicate.
+Preparation copies the inspected checkout into a content-addressed, run-local
+source snapshot. The upstream command reads only that snapshot, whose digest is
+checked immediately before and after execution. The original Git commit remains
+provenance; later edits to the operator checkout do not change a prepared run.
 
-### Reuse a local Codex coding-plan login
+After an exit-zero upstream process, ORBenchLab records Docker's actual image ID
+and any RepoDigests for the built tag. If that identity cannot be inspected, the
+campaign fails before result ingest. Because the image ID exists only after a
+build, it is post-run evidence rather than a campaign-ID input: the campaign
+binds the source/build recipe and exact scaffold version, while the manifest
+and receipt bind the image Docker actually produced.
 
-Harbor 0.16+'s Codex adapter can inject the host's private
-`~/.codex/auth.json`. This keeps credentials out of campaign specs, job YAML,
-receipts and reports:
+After a completed run, cross the host boundary only through the tested exporter:
 
 ```bash
+orbench export \
+  --run-root ./orbench-runs/<campaign-id> \
+  --destination ./share/<campaign-id>
+```
+
+It re-verifies the complete local workspace, emits a fixed normalized/report
+allowlist, derives path-free public metadata, and writes a new
+`share-integrity.sha256`. The raw local manifest, receipt, integrity ledger,
+jobs and logs remain on the execution host.
+
+### Run a model agent with a scoped API credential
+
+Treat benchmark tasks as untrusted code. In particular, when a selected pinned
+ORAgentBench task enables Internet access, ORBenchLab **refuses**
+`codex-auth-json`: a long-lived `~/.codex/auth.json` must not be mounted into an
+Internet-enabled task container. Create a short-lived, revocable provider key,
+set a provider-side spend/rate limit, and expose it only for the duration of the
+run:
+
+```bash
+export MODEL_API_KEY='<ephemeral scoped key>'
+export MODEL_BASE_URL='https://provider.example/v1'
+export ORBENCH_MODEL_ID='provider/model-version-2026-08-01'
+export ORBENCH_SCAFFOLD_VERSION='1.2.3'  # exact release; never latest
+
 orbench doctor oragentbench \
   --source /tmp/ORAgentBench \
   --task additive_microfactory_order_planning \
-  --agent codex --model gpt-5.5 --auth-mode codex-auth-json
+  --agent codex --model "$ORBENCH_MODEL_ID" \
+  --scaffold-version "$ORBENCH_SCAFFOLD_VERSION" --auth-mode api-key
 
 orbench run oragentbench \
   --source /tmp/ORAgentBench \
   --task additive_microfactory_order_planning \
-  --agent codex --model gpt-5.5 --auth-mode codex-auth-json \
+  --agent codex --model "$ORBENCH_MODEL_ID" \
+  --scaffold-version "$ORBENCH_SCAFFOLD_VERSION" --auth-mode api-key \
   --date 2026-08-24 --wall-clock-sec 1200 --max-cost-usd 5 \
   --workspace ./orbench-runs --execute \
   --acknowledge-cost i-accept-model-costs
+
+unset MODEL_API_KEY MODEL_BASE_URL ORBENCH_MODEL_ID ORBENCH_SCAFFOLD_VERSION
 ```
 
-The provider base URL is discovered from `~/.codex/config.toml`; alternatively
-set the non-secret `ORBENCH_MODEL_BASE_URL` or pass `--model-base-url`. The auth
-file must exist with no group/world permissions. `doctor` reports only whether
-the URL is configured and never prints it or reads auth-file contents.
+`MODEL_API_KEY` is secret. `MODEL_BASE_URL` is non-secret configuration, but it
+is also the destination that receives that credential: `codex` and
+`claude-code` therefore require it before preparation. ORBenchLab canonicalizes
+the HTTPS route, stores only its `sha256:` digest in campaign identity and the
+local/public manifest, and requires the runtime `MODEL_BASE_URL` to canonicalize
+to the same route before Harbor starts. The URL itself belongs neither in a
+campaign file nor on the command line. Use a protected repository environment
+and an ephemeral secret when dispatching from GitHub Actions. The recorded
+`mini-swe-agent` profile has no provider-base-URL variable and does not require
+this route binding.
+
+`--wall-clock-sec` is an enforced local timeout. `--max-cost-usd` is recorded as
+an audit envelope but cannot stop an arbitrary provider after exactly that
+amount; configure the real hard spend/rate limit on the short-lived provider
+credential itself.
+
+`codex-auth-json` remains a narrowly supported local transport for tasks that
+are explicitly network-disabled. In that mode, `doctor` checks permissions and
+parses the auth file **locally** only to verify that it is valid JSON with a
+non-empty object root. It never prints, hashes, copies into the campaign
+workspace, or persists the contents. If the selected task permits Internet,
+both `doctor` and execution fail closed and direct the operator back to a scoped
+API credential.
 
 `orbench integration inspect` emits JSON with a `checks` array, a `facts` object
 and a `decisions` object — CI asserts on all three.
@@ -145,12 +216,40 @@ self-hosted runner with the required labels:
 
 | Integration | Repository configuration | Runner |
 | --- | --- | --- |
-| ORAgentBench | secret `MODEL_API_KEY`; variable `MODEL_BASE_URL` | `self-hosted`, `orbench-exec`; Docker + Harbor |
+| ORAgentBench | secret `MODEL_API_KEY`; variables `MODEL_BASE_URL`, `ORBENCH_RUNS_ROOT` | `self-hosted`, `orbench-exec`; Docker + Harbor |
 | FrontierOR | secret `OPENROUTER_API_KEY` | the above plus `perf-isolated`, Gurobi licence, pinned cores and upstream images |
 
-Then dispatch `benchmark-smoke` with `mode=agent`, a pinned model id, and the
-literal acknowledgement `i-accept-model-costs`. The protected
+Then dispatch `benchmark-smoke` with `mode=agent`, a pinned model id, an exact
+released `scaffold_version` (floating labels such as `latest` are rejected),
+and the literal acknowledgement `i-accept-model-costs`. The protected
 `benchmark-agent` environment adds a separate approval click before model spend.
+Use a revocable, provider-limited key for `MODEL_API_KEY`; never store a Codex
+login export or another long-lived personal credential in repository secrets.
+
+`ORBENCH_RUNS_ROOT` is an absolute, runner-owned persistent directory outside
+the checkout and `RUNNER_TEMP` (for example `/srv/orbench/runs`). The workflow
+fails before creating a campaign if it is temporary, a symlink, group/world
+writable, owned by another account, or has less than 20 GiB free. This durable
+root lets a later dispatch verify and resume an interrupted campaign; its raw
+jobs and logs remain on that host and are never uploaded.
+
+Pinned ORAgentBench currently launches task images through one fixed Docker
+base alias. ORBenchLab therefore holds a secure runner-account-wide,
+non-blocking alias lock for the complete upstream execution and verifies that
+the fixed alias and the campaign-specific image resolve to the same image ID.
+Two campaigns cannot safely run against the same Docker daemon at once: run all
+jobs for one daemon under the same Unix account, or use separate hosts/isolated
+daemons for parallel rollout capacity. Different Unix accounts must not share a
+daemon because their private lock directories cannot coordinate.
+`ORBENCH_HOST_LOCK_DIR` may point at a dedicated absolute lock directory; the
+default is below the runner account's private cache.
+
+The workflow may publish only the exporter output: the normalized slice,
+rendered report, path-free `public-manifest.json` / `public-receipt.json`, and
+`share-integrity.sha256`. It must not upload the local manifest/receipt,
+workspace integrity ledger, Harbor job bundle, agent trajectory, verifier
+workspace, upstream stdout/stderr logs, or any other raw evidence; those stay
+on the execution host.
 
 ## Evidence labels
 
@@ -177,7 +276,9 @@ absent one:
   meaningful.
 * Harbor ingestion is a local run-bundle transform, not a remote warehouse.
   Raw trajectories and verifier material stay on the execution host; only the
-  normalized slice, report and sanitized receipt are intended for sharing.
+  exporter-produced normalized slice, report, public metadata and share
+  integrity ledger are intended for sharing. Raw Harbor job directories, local
+  manifest/receipt and logs must not be uploaded as Actions artefacts.
 * No durability verification, so no `validated` reports.
 * A model run still requires an explicit cost acknowledgement. A successful
   prepare/doctor/control run is not evidence that a paid model rollout was
@@ -194,6 +295,7 @@ src/orbenchlab/
   ingest/         Harbor plan-ledger reconciliation and normalized slices
   execution.py    upstream command construction, validation, receipts
   workflow.py     one-command ORAgentBench lifecycle and immutable workspace
+  export.py       verified public evidence boundary and share integrity
   schemas/        published JSON schemas
 tools/            legacy checked command builder used by compatibility CI
 scripts/          runner bootstrap
