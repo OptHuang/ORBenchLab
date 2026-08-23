@@ -125,9 +125,17 @@ def budget_uid(budget: Mapping[str, Any]) -> str:
     return sha(canon(dict(budget)))
 
 
-def campaign_cfg_digest(spec: Mapping[str, Any]) -> str:
-    """Digest of a campaign spec with non-semantic fields removed."""
-    return sha(canon(_strip_excluded(spec)))
+def campaign_cfg_digest(
+    spec: Mapping[str, Any], *, job_config_contract_version: str | None = None
+) -> str:
+    """Digest a spec and, when supplied, the compiler-to-Harbor contract."""
+    payload: Any = _strip_excluded(spec)
+    if job_config_contract_version is not None:
+        payload = {
+            "job_config_contract_version": job_config_contract_version,
+            "spec": payload,
+        }
+    return sha(canon(payload))
 
 
 def _strip_excluded(obj: Any) -> Any:

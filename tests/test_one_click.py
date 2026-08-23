@@ -7,6 +7,7 @@ into a normalized slice plus a report without hand-written glue.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import signal
 import shutil
@@ -16,6 +17,7 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
+import yaml
 
 from orbenchlab.cli import main
 from orbenchlab.core.errors import EvidenceError, PreconditionError
@@ -1222,3 +1224,212 @@ def test_failed_control_workspace_uses_harbor_job_resume_when_config_exists(
     assert json.loads(attempt_receipt.read_text())["upstream_attempt"] == (
         failed_manifest["upstream_attempt"]
     )
+
+
+def _make_running_resume_workspace_with_retry_set(
+    *, workflow, source: Path, tmp_path: Path
+):
+    kwargs = dict(
+        source=source,
+        task="single_task",
+        agent="oracle",
+        model="",
+        date="2026-08-24",
+        workspace=tmp_path / "runs",
+        wall_clock_sec=20,
+    )
+    first = workflow.prepare_oragentbench_run(**kwargs)
+    plan = json.loads((first.run_root / "plan" / "plan.json").read_text())
+    job_name = plan["jobs"][0]["job_name"]
+    plan_path = first.run_root / "plan" / "jobs" / f"{job_name}.yaml"
+    config = yaml.safe_load(plan_path.read_text())
+    config["retry"]["include_exceptions"] = [
+        "ProviderError",
+        "AgentTimeoutError",
+    ]
+    plan_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    job_dir = first.run_root / "jobs" / job_name
+    job_dir.mkdir(parents=True)
+    config.pop("pre_build", None)
+    config_path = job_dir / "config.json"
+    config_path.write_text(json.dumps(config) + "\n")
+    manifest_path = first.run_root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["state"] = "failed"
+    workflow._atomic_json(manifest_path, manifest)
+    workflow._write_integrity(first.run_root)
+    workflow.prepare_oragentbench_run(**kwargs)
+    manifest["state"] = "running"
+    workflow._atomic_json(manifest_path, manifest)
+    workflow._write_integrity(first.run_root)
+    return kwargs, first, config_path, manifest_path
+
+
+def test_resume_accepts_retry_set_reordering_and_json_reformatting(
+    upstream_fixtures: Path, tmp_path: Path
+):
+    from orbenchlab import workflow
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    kwargs, first, config_path, _ = _make_running_resume_workspace_with_retry_set(
+        workflow=workflow, source=source, tmp_path=tmp_path
+    )
+    binding_path = first.run_root / "resume-binding.json"
+    binding_bytes = binding_path.read_bytes()
+    config = json.loads(config_path.read_text())
+    config["retry"]["include_exceptions"].reverse()
+    config_path.write_text(json.dumps(config, separators=(",", ":")) + "\n")
+
+    resumed = workflow.prepare_oragentbench_run(**kwargs)
+
+    assert "harbor job resume --job-path" in resumed.command.argv[2]
+    assert binding_path.read_bytes() == binding_bytes
+    workflow._verify_integrity(first.run_root)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["retry-member", "retry-duplicate", "retry-nonstring", "nonretry-field"]
+)
+def test_resume_rejects_semantic_config_change(
+    mutation: str, upstream_fixtures: Path, tmp_path: Path
+):
+    from orbenchlab import workflow
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    kwargs, first, config_path, _ = _make_running_resume_workspace_with_retry_set(
+        workflow=workflow, source=source, tmp_path=tmp_path
+    )
+    config = json.loads(config_path.read_text())
+    if mutation == "retry-member":
+        config["retry"]["include_exceptions"].pop()
+    elif mutation == "retry-duplicate":
+        config["retry"]["include_exceptions"].append("ProviderError")
+    elif mutation == "retry-nonstring":
+        config["retry"]["include_exceptions"].append(1)
+    else:
+        config["n_attempts"] = 2
+    config_path.write_text(json.dumps(config, separators=(",", ":")) + "\n")
+
+    with pytest.raises(EvidenceError):
+        workflow._verify_integrity(first.run_root)
+    with pytest.raises(EvidenceError):
+        workflow.prepare_oragentbench_run(**kwargs)
+
+
+def test_resume_binding_hashes_one_captured_config_version(
+    monkeypatch, upstream_fixtures: Path, tmp_path: Path
+):
+    from orbenchlab import workflow
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    kwargs, first, config_path, _ = _make_running_resume_workspace_with_retry_set(
+        workflow=workflow, source=source, tmp_path=tmp_path
+    )
+    plan = json.loads((first.run_root / "plan" / "plan.json").read_text())
+    job_name = plan["jobs"][0]["job_name"]
+    original_read_bytes = Path.read_bytes
+    original_sha256 = workflow._sha256
+    config_reads = 0
+
+    def counted_read_bytes(path):
+        nonlocal config_reads
+        if path == config_path:
+            config_reads += 1
+        return original_read_bytes(path)
+
+    def reject_second_config_read(path):
+        if Path(path) == config_path:
+            pytest.fail("config raw hash was computed by a second filesystem read")
+        return original_sha256(path)
+
+    monkeypatch.setattr(Path, "read_bytes", counted_read_bytes)
+    monkeypatch.setattr(workflow, "_sha256", reject_second_config_read)
+    binding = workflow._validated_resume_binding(
+        run_root=first.run_root,
+        source=first.source,
+        job_name=job_name,
+        agent="oracle",
+        model="",
+        scaffold_version=None,
+        task="single_task",
+    )
+
+    assert config_reads == 1
+    captured = original_read_bytes(config_path)
+    assert binding["config_sha256"] == (
+        f"sha256:{hashlib.sha256(captured).hexdigest()}"
+    )
+
+
+def test_legacy_v2_resume_binding_upgrades_only_with_raw_config_proof(
+    upstream_fixtures: Path, tmp_path: Path
+):
+    from orbenchlab import workflow
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    kwargs, first, _, manifest_path = _make_running_resume_workspace_with_retry_set(
+        workflow=workflow, source=source, tmp_path=tmp_path
+    )
+    manifest = json.loads(manifest_path.read_text())
+    manifest["state"] = "failed"
+    workflow._atomic_json(manifest_path, manifest)
+    binding_path = first.run_root / "resume-binding.json"
+    binding = json.loads(binding_path.read_text())
+    binding["resume_binding_schema_version"] = "2.0"
+    binding.pop("config_semantic_sha256")
+    workflow._atomic_json(binding_path, binding)
+    workflow._write_integrity(first.run_root)
+
+    workflow.prepare_oragentbench_run(**kwargs)
+
+    upgraded = json.loads(binding_path.read_text())
+    assert upgraded["resume_binding_schema_version"] == "3.0"
+    assert upgraded["config_semantic_sha256"].startswith("sha256:")
+
+
+def test_job_config_contract_change_leaves_old_workspace_byte_exact(
+    monkeypatch, upstream_fixtures: Path, tmp_path: Path
+):
+    from orbenchlab import workflow
+    from orbenchlab.campaign import compile as compile_mod
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    kwargs = dict(
+        source=source,
+        task="single_task",
+        agent="oracle",
+        model="",
+        date="2026-08-24",
+        workspace=tmp_path / "runs",
+        wall_clock_sec=20,
+    )
+    monkeypatch.setattr(compile_mod, "JOB_CONFIG_CONTRACT_VERSION", "legacy-test")
+    old = workflow.prepare_oragentbench_run(**kwargs)
+    old_plan = json.loads((old.run_root / "plan" / "plan.json").read_text())
+    old_job_name = old_plan["jobs"][0]["job_name"]
+    old_job_path = old.run_root / "plan" / "jobs" / f"{old_job_name}.yaml"
+    old_job = yaml.safe_load(old_job_path.read_text())
+    old_job["retry"]["exclude_exceptions"] = None
+    old_job_path.write_text(yaml.safe_dump(old_job, sort_keys=False))
+    workflow._write_integrity(old.run_root)
+    old_bytes = {
+        path.relative_to(old.run_root).as_posix(): path.read_bytes()
+        for path in old.run_root.rglob("*")
+        if path.is_file()
+    }
+
+    monkeypatch.setattr(compile_mod, "JOB_CONFIG_CONTRACT_VERSION", "2.0")
+    current = workflow.prepare_oragentbench_run(**kwargs)
+
+    assert old.campaign_id != current.campaign_id
+    assert old_bytes == {
+        path.relative_to(old.run_root).as_posix(): path.read_bytes()
+        for path in old.run_root.rglob("*")
+        if path.is_file()
+    }
+    assert json.loads((old.run_root / "manifest.json").read_text())[
+        "job_config_contract_version"
+    ] == "legacy-test"
+    assert json.loads((current.run_root / "manifest.json").read_text())[
+        "job_config_contract_version"
+    ] == "2.0"

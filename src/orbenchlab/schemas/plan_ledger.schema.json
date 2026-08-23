@@ -17,6 +17,7 @@
     "ledger_schema_version": { "type": "string", "const": "1.0" },
     "campaign_id": { "type": "string" },
     "campaign_cfg_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "job_config_contract_version": { "type": "string", "pattern": "^.+$" },
     "written_before_execution": { "type": "boolean", "const": true },
     "match_key_definition": { "type": "string" },
     "reconciliation_rules": {

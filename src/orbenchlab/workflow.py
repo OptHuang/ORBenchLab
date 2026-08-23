@@ -7,6 +7,7 @@ ingest, and report under one deterministic run directory.
 
 from __future__ import annotations
 
+import copy
 import fcntl
 import hashlib
 import json
@@ -262,6 +263,34 @@ def _verify_integrity(run_root: Path) -> None:
 
     job_name = manifest_data.get("job_name") if isinstance(manifest_data, dict) else None
     job_prefix = f"jobs/{job_name}/" if isinstance(job_name, str) and job_name else ""
+    if phase == "running" and job_prefix:
+        # config.json is byte-mutable because Harbor serializes set-valued retry
+        # fields in arbitrary order. Once a resume binding exists, keep the
+        # mutable byte layer tied to its canonical execution semantics here.
+        binding_path = run_root / "resume-binding.json"
+        config_path = run_root / job_prefix / "config.json"
+        if binding_path.is_file():
+            if binding_path.is_symlink() or config_path.is_symlink() or not config_path.is_file():
+                raise EvidenceError("running Harbor resume binding has no safe config")
+            try:
+                binding = json.loads(binding_path.read_bytes())
+                config_bytes = config_path.read_bytes()
+                config = json.loads(config_bytes)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                raise EvidenceError("running Harbor resume evidence is unreadable") from None
+            if not isinstance(binding, dict) or not isinstance(config, dict):
+                raise EvidenceError("running Harbor resume evidence is invalid")
+            version = binding.get("resume_binding_schema_version")
+            if version == "3.0":
+                bound = binding.get("config_semantic_sha256")
+                current = _resume_config_semantic_sha256(config)
+            elif version == "2.0":
+                bound = binding.get("config_sha256")
+                current = f"sha256:{hashlib.sha256(config_bytes).hexdigest()}"
+            else:
+                raise EvidenceError("running Harbor resume binding schema is unsupported")
+            if bound != current:
+                raise EvidenceError("running Harbor config changed after resume binding")
     upstream_attempt = manifest_data.get("upstream_attempt")
     mutable_log_files: set[str] | None = None
     if upstream_attempt is not None:
@@ -294,10 +323,11 @@ def _verify_integrity(run_root: Path) -> None:
             return mutable_log_files is None or relative in mutable_log_files
         if not job_prefix or not relative.startswith(job_prefix):
             return False
-        # The top-level Harbor config decides what --resume will execute. Once
-        # it has been hash-bound it is immutable; trial/result files remain
-        # upstream-owned runtime outputs.
-        return relative != f"{job_prefix}config.json"
+        # Harbor may rewrite config.json after resolving set-valued fields. Its
+        # bytes are therefore outside the ledger while running; the binding
+        # check above (when present) and prepare/execute _bind calls enforce its
+        # semantic contract. Trial/result files remain upstream-owned output.
+        return True
 
     for relative, expected in expected_files.items():
         if relative == manifest_relative:
@@ -587,23 +617,109 @@ def _same_resume_value(actual: Any, expected: Any) -> bool:
     return actual == expected
 
 
+def _canonical_resume_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize only Harbor fields whose JSON order is not semantic."""
+    canonical = copy.deepcopy(dict(config))
+    retry = canonical.get("retry")
+    if not isinstance(retry, dict):
+        raise EvidenceError("interrupted Harbor config has a conflicting retry policy")
+    for field in ("include_exceptions", "exclude_exceptions"):
+        value = retry.get(field)
+        if value is None:
+            continue
+        if (
+            not isinstance(value, list)
+            or not all(isinstance(item, str) for item in value)
+            or len(set(value)) != len(value)
+        ):
+            raise EvidenceError("interrupted Harbor config has a conflicting retry policy")
+        retry[field] = sorted(value)
+    return canonical
+
+
+def _resume_config_semantic_sha256(config: Mapping[str, Any]) -> str:
+    payload = json.dumps(
+        _canonical_resume_config(config),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    digest = hashlib.sha256(b"orbench-resume-config.v1\0" + payload).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _resume_bindings_match(
+    existing: Mapping[str, Any], current: Mapping[str, Any]
+) -> bool:
+    """Compare v3 bindings semantically and upgrade v2 only by raw proof."""
+    identity_keys = {
+        "dataset_content_digest",
+        "job_name",
+        "agent",
+        "model",
+        "scaffold_version",
+        "task",
+    }
+    if any(existing.get(key) != current.get(key) for key in identity_keys):
+        return False
+    raw = existing.get("config_sha256")
+    if not isinstance(raw, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", raw) is None:
+        return False
+    version = existing.get("resume_binding_schema_version")
+    if version == "2.0":
+        allowed = {"resume_binding_schema_version", "config_sha256", *identity_keys}
+        return set(existing) == allowed and raw == current.get("config_sha256")
+    if version != "3.0":
+        return False
+    allowed = {
+        "resume_binding_schema_version",
+        "config_sha256",
+        "config_semantic_sha256",
+        *identity_keys,
+    }
+    semantic = existing.get("config_semantic_sha256")
+    return (
+        set(existing) == allowed
+        and isinstance(semantic, str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", semantic) is not None
+        and semantic == current.get("config_semantic_sha256")
+    )
+
+
 def _validate_mapping_with_harbor_defaults(
     actual: Any,
     expected: Any,
     defaults: Mapping[str, Any],
     *,
     area: str,
+    unordered_string_lists: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     if not isinstance(actual, dict) or not isinstance(expected, dict):
         raise EvidenceError(f"interrupted Harbor config has a conflicting {area}")
     allowed = set(expected) | set(defaults)
     if set(actual) - allowed:
         raise EvidenceError(f"interrupted Harbor config has a conflicting {area}")
+
+    def same(key: str, actual_value: Any, expected_value: Any) -> bool:
+        if key not in unordered_string_lists:
+            return _same_resume_value(actual_value, expected_value)
+        if actual_value is None or expected_value is None:
+            return actual_value is None and expected_value is None
+        if not isinstance(actual_value, list) or not isinstance(expected_value, list):
+            return False
+        if not all(isinstance(value, str) for value in [*actual_value, *expected_value]):
+            return False
+        if len(set(actual_value)) != len(actual_value) or len(set(expected_value)) != len(
+            expected_value
+        ):
+            return False
+        return set(actual_value) == set(expected_value)
+
     for key, expected_value in expected.items():
-        if key not in actual or not _same_resume_value(actual[key], expected_value):
+        if key not in actual or not same(key, actual[key], expected_value):
             raise EvidenceError(f"interrupted Harbor config has a conflicting {area}")
     for key, default_value in defaults.items():
-        if key in actual and not _same_resume_value(actual[key], default_value):
+        if key in actual and not same(key, actual[key], default_value):
             raise EvidenceError(f"interrupted Harbor config has a conflicting {area}")
     return actual
 
@@ -820,7 +936,8 @@ def _validated_resume_binding(
     if config_path.is_symlink() or not config_path.is_file():
         raise EvidenceError("interrupted Harbor job has no safe resumable config")
     try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config_bytes = config_path.read_bytes()
+        config = json.loads(config_bytes)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         raise EvidenceError("interrupted Harbor config is not readable JSON") from None
     if not isinstance(config, dict):
@@ -874,6 +991,9 @@ def _validated_resume_binding(
         expected.get("retry"),
         _HARBOR_RETRY_DEFAULTS,
         area="retry policy",
+        unordered_string_lists=frozenset(
+            {"include_exceptions", "exclude_exceptions"}
+        ),
     )
     if config.get("metrics") != expected.get("metrics"):
         raise EvidenceError("interrupted Harbor config has a conflicting metric set")
@@ -971,8 +1091,9 @@ def _validated_resume_binding(
         raw_path=actual_dataset.get("path"),
     )
     return {
-        "resume_binding_schema_version": "2.0",
-        "config_sha256": f"sha256:{_sha256(config_path)}",
+        "resume_binding_schema_version": "3.0",
+        "config_sha256": f"sha256:{hashlib.sha256(config_bytes).hexdigest()}",
+        "config_semantic_sha256": _resume_config_semantic_sha256(config),
         "dataset_content_digest": dataset_content_digest,
         "job_name": job_name,
         "agent": agent,
@@ -991,8 +1112,10 @@ def _bind_resume_config(**kwargs: Any) -> dict[str, Any]:
             existing = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             raise EvidenceError("resume binding is unreadable") from None
-        if existing != binding:
+        if not isinstance(existing, dict) or not _resume_bindings_match(existing, binding):
             raise EvidenceError("interrupted Harbor config changed after resume binding")
+        if existing.get("resume_binding_schema_version") == "2.0":
+            _atomic_json(path, binding)
     else:
         _atomic_json(path, binding)
     return binding
@@ -1320,6 +1443,7 @@ def prepare_oragentbench_run(
             manifest = json.loads((run_root / "manifest.json").read_text(encoding="utf-8"))
             expected = {
                 "campaign_id": campaign_id,
+                "job_config_contract_version": compiled.job_config_contract_version,
                 "integration": "oragentbench",
                 "task": task,
                 "agent": agent,
@@ -1373,6 +1497,7 @@ def prepare_oragentbench_run(
                     "manifest_schema_version": "1.0",
                     "state": "prepared",
                     "campaign_id": campaign_id,
+                    "job_config_contract_version": compiled.job_config_contract_version,
                     "integration": "oragentbench",
                     "task": task,
                     "agent": agent,

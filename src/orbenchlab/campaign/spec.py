@@ -641,12 +641,25 @@ def _validate_budget(
 
 
 def _validate_retry(retry: Mapping[str, Any], problems: list[str]) -> None:
-    include = retry.get("include_exceptions") or []
-    if not isinstance(include, (list, tuple)):
-        problems.append("retry.include_exceptions must be a list")
-        return
-    disallowed = sorted(set(str(x) for x in include) - RETRYABLE_EXCEPTIONS)
-    if disallowed:
+    def exception_set(field: str) -> list[str]:
+        if field not in retry:
+            return []
+        value = retry[field]
+        if not isinstance(value, list):
+            problems.append(f"retry.{field} must be a list")
+            return []
+        if not all(isinstance(item, str) for item in value):
+            problems.append(f"retry.{field} must contain only strings")
+            return []
+        normalized = list(value)
+        if len(set(normalized)) != len(normalized):
+            problems.append(f"retry.{field} must not contain duplicates")
+        return normalized
+
+    include = exception_set("include_exceptions")
+    exception_set("exclude_exceptions")
+    disallowed = sorted(set(include) - RETRYABLE_EXCEPTIONS)
+    if disallowed and all(isinstance(value, str) for value in include):
         problems.append(
             f"retry.include_exceptions contains capability-class exceptions {disallowed}; "
             f"only infrastructure and provider failures may be retried "

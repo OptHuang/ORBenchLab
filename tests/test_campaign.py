@@ -11,6 +11,7 @@ import yaml
 
 from orbenchlab.campaign import compile as compile_mod
 from orbenchlab.campaign import spec as spec_mod
+from orbenchlab.core import ids as ids_mod
 from orbenchlab.core import schema as schema_mod
 from orbenchlab.core.errors import SpecError
 
@@ -84,6 +85,28 @@ def test_infra_exceptions_may_be_retried(controls_raw, sites_dir):
     raw = copy.deepcopy(controls_raw)
     raw["retry"] = {"max_retries": 2, "include_exceptions": ["DockerBuildError"]}
     assert _validate(raw, sites_dir).retry["max_retries"] == 2
+
+
+@pytest.mark.parametrize("field", ["include_exceptions", "exclude_exceptions"])
+@pytest.mark.parametrize("value", [None, ("AgentTimeoutError",)])
+def test_retry_exception_sets_must_be_explicit_lists(
+    controls_raw, sites_dir, field, value
+):
+    raw = copy.deepcopy(controls_raw)
+    raw["retry"][field] = value
+    _expect_rejection(raw, sites_dir, f"retry.{field} must be a list")
+
+
+@pytest.mark.parametrize("field", ["include_exceptions", "exclude_exceptions"])
+def test_retry_exception_sets_reject_duplicates_and_non_strings(
+    controls_raw, sites_dir, field
+):
+    duplicate = copy.deepcopy(controls_raw)
+    duplicate["retry"][field] = ["AgentTimeoutError", "AgentTimeoutError"]
+    _expect_rejection(duplicate, sites_dir, f"retry.{field} must not contain duplicates")
+    non_string = copy.deepcopy(controls_raw)
+    non_string["retry"][field] = ["AgentTimeoutError", 1]
+    _expect_rejection(non_string, sites_dir, f"retry.{field} must contain only strings")
 
 
 def test_attempts_must_be_one(controls_raw, sites_dir):
@@ -282,6 +305,54 @@ def test_one_job_carries_one_agent_seed_attempt(controls_raw, sites_dir):
         assert compiled.job_configs[job.job_name]["n_attempts"] == 1
 
 
+def test_compiled_retry_policy_survives_harbor_lock_round_trip(
+    controls_raw, sites_dir
+):
+    """Harbor 0.16 omits nulls from lock.json, then rehydrates its defaults."""
+    compiled = compile_mod.compile_campaign(_validate(controls_raw, sites_dir))
+    for config in compiled.job_configs.values():
+        retry = config["retry"]
+        assert retry["exclude_exceptions"] == []
+        assert compile_mod.harbor_016_retry_lock_roundtrip(retry) == retry
+
+
+def test_compiled_retry_policy_preserves_explicit_exclusions(
+    controls_raw, sites_dir
+):
+    raw = copy.deepcopy(controls_raw)
+    raw["retry"]["exclude_exceptions"] = [
+        "VerifierTimeoutError",
+        "AgentTimeoutError",
+    ]
+    compiled = compile_mod.compile_campaign(_validate(raw, sites_dir))
+    for config in compiled.job_configs.values():
+        assert config["retry"]["exclude_exceptions"] == [
+            "AgentTimeoutError",
+            "VerifierTimeoutError",
+        ]
+        assert compile_mod.harbor_016_retry_lock_roundtrip(config["retry"]) == config[
+            "retry"
+        ]
+
+
+def test_job_config_contract_version_changes_campaign_and_run_identity(
+    monkeypatch, controls_raw, sites_dir
+):
+    first = compile_mod.compile_campaign(_validate(controls_raw, sites_dir))
+    legacy_digest_without_contract = ids_mod.campaign_cfg_digest(first.spec.raw)
+    monkeypatch.setattr(compile_mod, "JOB_CONFIG_CONTRACT_VERSION", "next-test-version")
+    second = compile_mod.compile_campaign(_validate(controls_raw, sites_dir))
+
+    assert first.job_config_contract_version == "2.0"
+    assert first.cfg_digest != legacy_digest_without_contract
+    assert second.job_config_contract_version == "next-test-version"
+    assert first.cfg_digest != second.cfg_digest
+    assert first.campaign_id != second.campaign_id
+    assert [run.run_id for run in first.runs] != [run.run_id for run in second.runs]
+    assert first.plan_dict()["job_config_contract_version"] == "2.0"
+    assert first.ledger_dict()["job_config_contract_version"] == "2.0"
+
+
 def test_match_keys_are_unique_within_a_job(controls_raw, sites_dir):
     spec = _validate(controls_raw, sites_dir)
     compiled = compile_mod.compile_campaign(spec)
@@ -340,6 +411,10 @@ def test_ledger_matches_its_schema_and_precedes_execution(controls_raw, sites_di
     ledger = json.loads((tmp_path / "plan_ledger.json").read_text(encoding="utf-8"))
     schema = schema_mod.load_schema(schema_mod.schemas_dir() / "plan_ledger.schema.json")
     schema_mod.validate(ledger, schema, name="plan_ledger.json")
+    assert ledger["job_config_contract_version"] == "2.0"
+    legacy_v1_ledger = copy.deepcopy(ledger)
+    legacy_v1_ledger.pop("job_config_contract_version")
+    schema_mod.validate(legacy_v1_ledger, schema, name="legacy-plan_ledger.json")
     assert ledger["written_before_execution"] is True
     assert len(ledger["entries"]) == len(compiled.runs)
 

@@ -99,6 +99,10 @@ orbench run oragentbench \
 The checkout directory must be named exactly `ORAgentBench`, matching
 upstream's dataset-path contract. Repeating the same command verifies and
 resumes the same content-addressed workspace instead of scheduling a duplicate.
+Campaign identity also includes ORBenchLab's job-config contract version: when
+a release changes execution semantics, the same user spec receives a new
+campaign id and the older workspace remains byte-for-byte evidence rather than
+being rewritten in place.
 Preparation copies the inspected checkout into a content-addressed, run-local
 source snapshot. The upstream command reads only that snapshot, whose digest is
 checked immediately before and after execution. The original Git commit remains

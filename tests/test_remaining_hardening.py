@@ -374,7 +374,8 @@ def test_paid_resume_accepts_only_the_pinned_wrapper_task_copy(
     resumed = workflow.prepare_oragentbench_run(**kwargs)
 
     binding = json.loads((resumed.run_root / "resume-binding.json").read_text())
-    assert binding["resume_binding_schema_version"] == "2.0"
+    assert binding["resume_binding_schema_version"] == "3.0"
+    assert binding["config_semantic_sha256"].startswith("sha256:")
     assert binding["dataset_content_digest"].startswith("sha256:")
 
 
