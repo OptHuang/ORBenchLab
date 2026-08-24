@@ -206,6 +206,26 @@ def test_codex_auth_json_fails_closed_when_misconfigured(
     _expect_rejection(raw, sites_dir, needle)
 
 
+def test_codex_login_rejects_a_routed_endpoint(controls_raw, sites_dir):
+    raw = copy.deepcopy(controls_raw)
+    raw["agents"] = [
+        {
+            "id": "native-chatgpt",
+            "scaffold": "codex",
+            "scaffold_version": "fixture-cli-1.2.3",
+            "model": "gpt-5.6-sol",
+            "auth_mode": "codex-login",
+            "env_literals": {
+                "CODEX_FORCE_AUTH_JSON": "true",
+                "OPENAI_BASE_URL": "https://router.example.test/v1",
+            },
+        }
+    ]
+    raw["budget"]["max_cost_usd"] = 1
+
+    _expect_rejection(raw, sites_dir, "native ChatGPT route")
+
+
 def test_env_keys_may_not_carry_values(controls_raw, sites_dir):
     raw = copy.deepcopy(controls_raw)
     raw["agents"] = [

@@ -422,10 +422,10 @@ def _parse_agents(
         )
         raw_auth_mode = raw_agent.get("auth_mode")
         auth_mode = str(raw_auth_mode) if raw_auth_mode is not None else None
-        if auth_mode not in (None, "api-key", "codex-auth-json"):
+        if auth_mode not in (None, "api-key", "codex-auth-json", "codex-login"):
             problems.append(
-                f"agents[{index}].auth_mode {auth_mode!r} must be 'api-key' or "
-                "'codex-auth-json'"
+                f"agents[{index}].auth_mode {auth_mode!r} must be 'api-key', "
+                "'codex-auth-json', or 'codex-login'"
             )
         if scaffold not in ZERO_COST_SCAFFOLDS:
             if not model:
@@ -441,7 +441,7 @@ def _parse_agents(
             if not (
                 raw_agent.get("env_keys")
                 or raw_agent.get("env_from_secret")
-                or auth_mode == "codex-auth-json"
+                or auth_mode in {"codex-auth-json", "codex-login"}
             ):
                 problems.append(
                     f"agents[{index}] ({agent_id!r}) must declare env_keys or env_from_secret "
@@ -507,28 +507,37 @@ def _parse_agents(
                 f"agents[{index}].provider_route_digest must be 'sha256:<64 hex>'"
             )
 
-        if auth_mode == "codex-auth-json":
+        if auth_mode in {"codex-auth-json", "codex-login"}:
             if scaffold != "codex":
                 problems.append(
-                    f"agents[{index}].auth_mode 'codex-auth-json' is only valid for the "
+                    f"agents[{index}].auth_mode {auth_mode!r} is only valid for the "
                     "codex scaffold"
                 )
             if env_keys or env_from_secret:
                 problems.append(
-                    f"agents[{index}] uses codex-auth-json and must not also declare "
+                    f"agents[{index}] uses {auth_mode} and must not also declare "
                     "API-key secrets"
                 )
             if env_literals.get("CODEX_FORCE_AUTH_JSON") != "true":
                 problems.append(
-                    f"agents[{index}] uses codex-auth-json, so env_literals must set "
+                    f"agents[{index}] uses {auth_mode}, so env_literals must set "
                     "CODEX_FORCE_AUTH_JSON to the literal 'true'"
                 )
-            if not env_literals.get("OPENAI_BASE_URL"):
+            if auth_mode == "codex-auth-json" and not env_literals.get(
+                "OPENAI_BASE_URL"
+            ):
                 problems.append(
                     f"agents[{index}] uses codex-auth-json, so env_literals must pin "
                     "OPENAI_BASE_URL"
                 )
-            else:
+            elif auth_mode == "codex-login" and (
+                env_literals.get("OPENAI_BASE_URL") or route_digest is not None
+            ):
+                problems.append(
+                    f"agents[{index}] uses codex-login's native ChatGPT route and "
+                    "must not declare OPENAI_BASE_URL or provider_route_digest"
+                )
+            elif env_literals.get("OPENAI_BASE_URL"):
                 try:
                     validated_url = validate_https_base_url(env_literals["OPENAI_BASE_URL"])
                     derived_digest = provider_route_digest(validated_url)
@@ -549,6 +558,7 @@ def _parse_agents(
         if (
             integration_name == "oragentbench"
             and scaffold in _ORAGENTBENCH_ROUTE_BOUND_SCAFFOLDS
+            and auth_mode != "codex-login"
             and route_digest is None
         ):
             problems.append(

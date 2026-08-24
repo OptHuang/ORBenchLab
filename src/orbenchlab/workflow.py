@@ -1353,7 +1353,7 @@ def prepare_oragentbench_run(
     model_base_url: str = "",
 ) -> PreparedRun:
     route_digest: str | None = None
-    if agent in execution.ROUTE_PINNED_SCAFFOLDS:
+    if agent in execution.ROUTE_PINNED_SCAFFOLDS and auth_mode != "codex-login":
         if not model_base_url:
             raise SpecError(f"scaffold {agent!r} requires a pinned HTTPS provider route")
         model_base_url = validate_https_base_url(model_base_url)
@@ -1626,6 +1626,13 @@ def execute_prepared_run(
     environ: Mapping[str, str] | None = None,
 ) -> HarborIngestResult:
     environ = dict(os.environ if environ is None else environ)
+    if prepared.auth_mode in execution.CODEX_AUTH_FILE_MODES:
+        raise PreconditionError(
+            "direct auth-file benchmark execution is disabled until a host-side "
+            "credential broker keeps the personal login outside the task boundary; "
+            "codex-login and legacy codex-auth-json are prepare/doctor only, so use "
+            "the api-key route for rollout"
+        )
     paid = prepared.agent not in execution.CONTROL_SCAFFOLDS
     if paid and acknowledge_cost != "i-accept-model-costs":
         raise PreconditionError(

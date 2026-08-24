@@ -208,6 +208,25 @@ execs `harbor run -c <transformed config>`. A crash recovery adds upstream's
 and copied task/skills content back to the compiled campaign. ORBenchLab does
 not use `--skip-build` for evidence runs.
 
+**Authentication is two explicit routes, not an automatic fallback.**
+
+* `api-key` injects a short-lived provider key into the approved Harbor job.
+  It is the supported route for the pinned ORAgentBench dataset because all
+  107 tasks set `allow_internet = true`.
+* `codex-login` describes a ChatGPT Codex login held by an isolated
+  private-controller analysis runner, never by the Docker benchmark worker. It
+  stores no model credential in GitHub. Today it provides authentication and
+  safety diagnosis only.
+  Missing or public network policy fails closed, while a no-network task cannot
+  reach the model service. Consequently it **cannot run any of the 107 pinned
+  ORAgentBench tasks** today. Execution requires future host-side analysis or a
+  credential broker/model proxy that keeps the login outside the task.
+
+There is no automatic fallback from one route to the other. In particular, an
+API-key Codex login remains API billed; choosing `codex-login` does not convert
+it into ChatGPT-plan usage. For a ChatGPT-plan execution, Harbor's token-derived
+dollar value is an **API-equivalent estimate**, not an actual charge.
+
 **Driving it:**
 
 ```bash
@@ -217,12 +236,12 @@ orbench doctor oragentbench \
     --source upstream/ORAgentBench \
     --task additive_microfactory_order_planning \
     --agent claude-code --model <pinned-model-id> \
-    --scaffold-version <exact-cli-version>
+    --scaffold-version <exact-cli-version> --auth-mode api-key
 orbench run oragentbench \
     --source upstream/ORAgentBench \
     --task additive_microfactory_order_planning \
     --agent claude-code --model <pinned-model-id> \
-    --scaffold-version <exact-cli-version> \
+    --scaffold-version <exact-cli-version> --auth-mode api-key \
     --date 2026-08-24 --workspace ./orbench-runs --execute \
     --acknowledge-cost i-accept-model-costs
 unset MODEL_API_KEY MODEL_BASE_URL
@@ -246,7 +265,7 @@ python tools/run_benchmark_smoke.py oragentbench ... --upstream-dry-run --execut
 
 `benchmark-smoke.yml` runs this on every dispatch, before any paid job starts.
 
-**Agent profiles.** `--scaffold` selects a profile recorded from upstream's own
+**Agent profiles for `api-key`.** `--scaffold` selects a profile recorded from upstream's own
 experiment configs — which environment variables the scaffold reads and which
 kwargs upstream pins:
 
@@ -260,6 +279,13 @@ Only variable names appear in the plan. The compiled job config carries
 `${MODEL_API_KEY}`; the runner substitutes the value. The normalized provider
 route digest, not the route string, enters campaign identity, and execution
 requires the runtime route to match it.
+
+`codex-login` does not reuse the API-key environment mapping above. The Codex
+CLI must already report a ChatGPT login for the runner service user. The current
+path stops at authentication and fail-closed safety diagnosis; it does not make
+an isolated Harbor container capable of model calls. ORBenchLab does not copy a
+personal login export into a repository secret, workflow artifact or run
+workspace.
 
 ### FrontierOR
 
@@ -329,6 +355,7 @@ exploratory by construction, because the score contains a wall-clock term.
 | *(none)* | `ci.yml`, `integration-contract.yml`, `report.yml` | always | These reference no secrets; a test enforces it |
 | `MODEL_API_KEY` (secret) | `benchmark-smoke.yml`, `mode=agent`, ORAgentBench | agent campaigns only | Set a provider-side spend cap on the key. CI cannot interrupt spend |
 | `MODEL_BASE_URL` (variable) | `benchmark-smoke.yml`, `mode=agent`, ORAgentBench | agent campaigns only | The provider base URL. Required, but not itself a credential — a repository *variable*, not a secret |
+| *(runner-local ChatGPT login; not a GitHub secret)* | `codex-login` diagnostics and future broker-backed jobs | isolated private-controller runner only | Never place it on the Docker benchmark worker or export it into GitHub |
 | `ORBENCH_RUNS_ROOT` (variable) | `benchmark-smoke.yml`, self-hosted ORAgentBench jobs | controls and agent campaigns | Persistent runner-owned workspace used for deterministic recovery; never point it at `RUNNER_TEMP` or the checkout |
 | `OPENROUTER_API_KEY` (secret) | `benchmark-smoke.yml`, `mode=agent`, FrontierOR | agent campaigns only | FrontierOR routes model calls through OpenRouter and hands the agent container only an ephemeral proxy token |
 
@@ -337,7 +364,7 @@ exploratory by construction, because the score contains a wall-clock term.
 | Environment | Contains | Approval | Used by |
 | --- | --- | --- | --- |
 | `controls` | nothing paid; scopes runner access | no | `oracle-controls` job |
-| `benchmark-agent` | model API keys | **required reviewers** | `agent` job |
+| `benchmark-agent` | short-lived model API keys | **required reviewers** | current `agent` jobs |
 
 Required reviewers on `benchmark-agent` are what actually stop an unattended
 spend. The workflow only refuses to start without the preconditions.
@@ -346,7 +373,8 @@ spend. The workflow only refuses to start without the preconditions.
 
 | Labels | Capability | Required by |
 | --- | --- | --- |
-| `self-hosted, orbench-exec` | Docker, the `harbor` CLI, Python 3.11+, git | `oracle-controls` and `agent-oragentbench` |
+| `self-hosted, orbench-exec` | Docker, the `harbor` CLI, Python 3.12, git; no personal ChatGPT login | `oracle-controls` and `agent-oragentbench` |
+| future isolated analysis label | pinned Codex CLI and ChatGPT login; no benchmark Docker workload | future host-side `codex-login` analysis only |
 | `self-hosted, orbench-exec, perf-isolated` | the above, plus pinned cores, no co-tenancy, a Gurobi licence and the three FrontierOR images | `agent-frontieror` |
 
 Runner-side environment variables the smoke workflow checks:
@@ -363,6 +391,22 @@ Upstream checkouts are cloned by the workflow itself, at the pinned commit, via
 advance.
 
 Each is checked for real — a missing one fails the job rather than degrading it.
+
+The benchmark Actions runner, Harbor client commands and `ORBENCH_RUNS_ROOT`
+must use one dedicated Unix service user. That user must **not** hold a personal
+ChatGPT login: checkout/bootstrap/upstream code executed by the same account
+could read it. A future `codex-login` analysis worker therefore needs a separate
+private-controller runner identity (preferably a separate disposable VM).
+Installing Codex alone is not sufficient.
+
+Do not expose a model-capable self-hosted runner through this public repository.
+Its workflow enforces `validate-only`; self-hosted modes require a private
+mirror/controller containing the complete ORBenchLab tree at a reviewed pinned
+commit, then dispatching only through a protected environment. The current
+workflow runs code from its own checkout, so a workflow-only controller is not
+sufficient. An ephemeral model runner is safer still. See
+[`self-hosted-runner.md`](self-hosted-runner.md) for the deployment and
+zero-model acceptance contract.
 
 ## Local smoke runs
 

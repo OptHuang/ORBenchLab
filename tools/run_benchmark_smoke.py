@@ -33,6 +33,9 @@ Zero cost — let upstream's wrapper prove the config is consumable::
 
     ... --upstream-dry-run --execute
 
+This exception starts only the wrapper's print-only validation path. It does
+not start Harbor, a task container, or a model call.
+
 Real run, on a configured self-hosted runner::
 
     ... --execute --acknowledge-cost i-accept-model-costs
@@ -116,6 +119,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="exact released CLI version baked into the scaffold image",
     )
     oab.add_argument(
+        "--auth-mode",
+        choices=["api-key", "codex-login"],
+        default="api-key",
+        help=(
+            "credential route; codex-login is prepare/diagnostic only until a "
+            "host-side broker keeps the personal login outside the task boundary"
+        ),
+    )
+    oab.add_argument(
         "--model-base-url",
         default="",
         help="pinned HTTPS provider route; defaults to MODEL_BASE_URL without printing it",
@@ -142,7 +154,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "pass --dry-run to upstream's wrapper: it prints the transformed config and "
-            "the harbor command, then exits without running Harbor. Zero cost."
+            "the harbor command, then exits without starting Harbor, a task container, "
+            "or a model call. This is the only executable codex-login path. Zero cost."
         ),
     )
 
@@ -213,7 +226,9 @@ def _oragentbench(args: argparse.Namespace) -> int:
         digest = registry.inspect("oragentbench", source).facts["dataset_digest"]
 
     date = args.date or _require_date()
-    model_base_url = args.model_base_url or os.environ.get("MODEL_BASE_URL", "")
+    model_base_url = ""
+    if args.auth_mode == "api-key":
+        model_base_url = args.model_base_url or os.environ.get("MODEL_BASE_URL", "")
     raw_spec = execution.oragentbench_agent_campaign_spec(
         slug=args.campaign_slug,
         date=date,
@@ -226,6 +241,7 @@ def _oragentbench(args: argparse.Namespace) -> int:
         wall_clock_sec=args.wall_clock_sec,
         max_cost_usd=args.max_cost_usd,
         site=args.site,
+        auth_mode=args.auth_mode,
         model_base_url=model_base_url,
     )
 
@@ -262,6 +278,18 @@ def _oragentbench(args: argparse.Namespace) -> int:
         # carries their names rather than their values.
         required_env=campaign_spec.agents[0].secret_names,
     )
+    if (
+        args.auth_mode == "codex-login"
+        and args.execute
+        and command.makes_model_calls
+    ):
+        raise PreconditionError(
+            "codex-login is prepare/doctor only: direct benchmark execution is "
+            "disabled until a host-side credential broker keeps the personal login "
+            "outside the task boundary; use api-key for rollout, or combine "
+            "--upstream-dry-run with --execute only for print-only upstream config "
+            "validation (no Harbor, container, or model call)"
+        )
     preconditions = execution.oragentbench_preconditions(
         source=source,
         task_name=args.task,
@@ -272,6 +300,7 @@ def _oragentbench(args: argparse.Namespace) -> int:
         # dry run: it stops after printing the transformed config and command.
         require_harbor=not args.allow_missing_tooling and not args.upstream_dry_run,
         require_secrets=not args.upstream_dry_run,
+        auth_mode=args.auth_mode,
         model_base_url=model_base_url,
     )
 
@@ -288,6 +317,14 @@ def _oragentbench(args: argparse.Namespace) -> int:
             f"ledger written to {written['plan_ledger']}",
             f"harbor jobs_dir: {raw_spec['harbor']['jobs_dir']}",
             "raw Harbor job bundles stay on this host; only this receipt leaves it",
+            *(
+                [
+                    "upstream --dry-run executed only print-only config validation: "
+                    "no Harbor, container, or model call"
+                ]
+                if args.upstream_dry_run
+                else []
+            ),
         ],
     )
 

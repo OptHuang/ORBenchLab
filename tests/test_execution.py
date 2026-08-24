@@ -370,6 +370,44 @@ def test_codex_auth_json_profile_contains_no_api_key_placeholder(oab_source, sit
     assert "OPENAI_API_KEY" not in agent["env"]
 
 
+def test_codex_login_profile_uses_native_chatgpt_route_without_api_secrets(
+    oab_source, sites_dir
+):
+    raw = execution.oragentbench_agent_campaign_spec(
+        slug="native-codex-login",
+        date="2026-08-24",
+        dataset_digest="sha256:" + "a" * 64,
+        task_name="single_task",
+        scaffold="codex",
+        scaffold_version="fixture-cli-1.2.3",
+        model="gpt-5.6-sol",
+        auth_mode="codex-login",
+    )
+    compiled = compile_mod.compile_campaign(spec_mod.validate(raw, sites_dir=sites_dir))
+    agent = next(iter(compiled.job_configs.values()))["agents"][0]
+
+    assert agent["env"] == {"CODEX_FORCE_AUTH_JSON": "true"}
+    assert "OPENAI_API_KEY" not in json.dumps(agent)
+    assert "OPENAI_BASE_URL" not in json.dumps(agent)
+    assert raw["agents"][0]["auth_mode"] == "codex-login"
+    assert "provider_route_digest" not in raw["agents"][0]
+
+
+def test_codex_login_rejects_a_custom_provider_route():
+    with pytest.raises(SpecError, match="native ChatGPT route"):
+        execution.oragentbench_agent_campaign_spec(
+            slug="native-codex-login",
+            date="2026-08-24",
+            dataset_digest="sha256:" + "a" * 64,
+            task_name="single_task",
+            scaffold="codex",
+            scaffold_version="fixture-cli-1.2.3",
+            model="gpt-5.6-sol",
+            auth_mode="codex-login",
+            model_base_url="https://router.example.test/v1",
+        )
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -777,6 +815,258 @@ def test_codex_auth_json_is_blocked_for_an_internet_enabled_task(oab_source, tmp
     assert any("long-lived" in item and "internet" in item for item in report.missing)
 
 
+def test_codex_auth_json_fails_closed_when_task_network_policy_is_implicit(
+    oab_source, tmp_path
+):
+    task_toml = oab_source / "harbor_tasks" / "single_task" / "task.toml"
+    task_toml.write_text(
+        task_toml.read_text(encoding="utf-8").replace(
+            "[environment]\nallow_internet = false\n", "[environment]\n"
+        ),
+        encoding="utf-8",
+    )
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"auth_mode":"chatgpt"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+
+    report = execution.oragentbench_preconditions(
+        source=oab_source,
+        task_name="single_task",
+        scaffold="codex",
+        model="gpt-5.5",
+        auth_mode="codex-auth-json",
+        model_base_url="https://router.example.test/v1",
+        environ={"CODEX_AUTH_JSON_PATH": str(auth)},
+        require_docker=False,
+        require_harbor=False,
+    )
+
+    assert not report.ok
+    assert any("explicitly network-disabled" in item for item in report.missing)
+
+
+def test_codex_auth_json_accepts_harbor_no_network_declaration(oab_source, tmp_path):
+    task_toml = oab_source / "harbor_tasks" / "single_task" / "task.toml"
+    task_toml.write_text(
+        task_toml.read_text(encoding="utf-8").replace(
+            "allow_internet = false", 'network_mode = "no-network"'
+        ),
+        encoding="utf-8",
+    )
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"auth_mode":"chatgpt"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+
+    report = execution.oragentbench_preconditions(
+        source=oab_source,
+        task_name="single_task",
+        scaffold="codex",
+        model="gpt-5.5",
+        auth_mode="codex-auth-json",
+        model_base_url="https://router.example.test/v1",
+        environ={"CODEX_AUTH_JSON_PATH": str(auth)},
+        require_docker=False,
+        require_harbor=False,
+    )
+
+    assert report.ok, report.missing
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        '[agent]\nnetwork_mode = "public"\n',
+        '[[steps]]\nname = "unsafe-step"\n[steps.agent]\nnetwork_mode = "public"\n',
+        'network_mode = "public"\n',
+        '[[steps]]\nname = "unsafe-verify"\n[steps.verifier]\n'
+        'environment_mode = "shared"\nnetwork_mode = "public"\n',
+    ],
+)
+def test_auth_file_transport_rejects_any_phase_network_override(
+    oab_source, tmp_path, override
+):
+    task_toml = oab_source / "harbor_tasks" / "single_task" / "task.toml"
+    task_toml.write_text(
+        task_toml.read_text(encoding="utf-8") + "\n" + override,
+        encoding="utf-8",
+    )
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"auth_mode":"chatgpt"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+
+    report = execution.oragentbench_preconditions(
+        source=oab_source,
+        task_name="single_task",
+        scaffold="codex",
+        model="gpt-5.5",
+        auth_mode="codex-auth-json",
+        model_base_url="https://router.example.test/v1",
+        environ={"CODEX_AUTH_JSON_PATH": str(auth)},
+        require_docker=False,
+        require_harbor=False,
+    )
+
+    assert not report.ok
+    assert any("task phase" in item for item in report.missing)
+
+
+def test_codex_login_doctor_requires_chatgpt_not_api_key_authentication(
+    oab_source, tmp_path, monkeypatch
+):
+    auth = tmp_path / "codex-home" / "auth.json"
+    auth.parent.mkdir()
+    auth.parent.chmod(0o700)
+    auth.write_text('{"auth_mode":"chatgpt"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    monkeypatch.setattr(execution.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def logged_in_with_api_key(argv, **kwargs):
+        assert argv == ["/usr/bin/codex", "login", "status"]
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout="Logged in using an API key - masked", stderr=""
+        )
+
+    report = execution.oragentbench_preconditions(
+        source=oab_source,
+        task_name="single_task",
+        scaffold="codex",
+        model="gpt-5.6-sol",
+        auth_mode="codex-login",
+        environ={"CODEX_HOME": str(auth.parent)},
+        require_docker=False,
+        require_harbor=False,
+        command_runner=logged_in_with_api_key,
+    )
+
+    assert not report.ok
+    rendered = json.dumps(report.to_dict())
+    assert "ChatGPT subscription" in rendered
+    assert "masked" not in rendered
+
+
+def test_codex_login_status_does_not_accept_a_negative_chatgpt_message():
+    def negative_status(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv,
+            returncode=0,
+            stdout="Not logged in using ChatGPT; run codex login",
+            stderr="",
+        )
+
+    ok, description = execution._probe_codex_chatgpt_login(
+        "/usr/bin/codex", command_runner=negative_status
+    )
+
+    assert ok is False
+    assert "Not logged in" not in description
+
+
+def test_codex_login_doctor_accepts_private_chatgpt_login(
+    oab_source, tmp_path, monkeypatch
+):
+    auth = tmp_path / "codex-home" / "auth.json"
+    auth.parent.mkdir()
+    auth.parent.chmod(0o700)
+    auth.write_text('{"auth_mode":"chatgpt"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    monkeypatch.setattr(execution.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def logged_in_with_chatgpt(argv, **kwargs):
+        assert argv == ["/usr/bin/codex", "login", "status"]
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout="Logged in using ChatGPT", stderr=""
+        )
+
+    report = execution.oragentbench_preconditions(
+        source=oab_source,
+        task_name="single_task",
+        scaffold="codex",
+        model="gpt-5.6-sol",
+        auth_mode="codex-login",
+        environ={"CODEX_HOME": str(auth.parent)},
+        require_docker=False,
+        require_harbor=False,
+        command_runner=logged_in_with_chatgpt,
+    )
+
+    assert report.ok, report.missing
+
+
+def test_codex_login_doctor_rejects_a_symlinked_auth_file(
+    oab_source, tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir(mode=0o700)
+    target = tmp_path / "outside-auth.json"
+    target.write_text('{"auth_mode":"chatgpt"}\n', encoding="utf-8")
+    target.chmod(0o600)
+    (codex_home / "auth.json").symlink_to(target)
+    monkeypatch.setattr(execution.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    report = execution.oragentbench_preconditions(
+        source=oab_source,
+        task_name="single_task",
+        scaffold="codex",
+        model="gpt-5.6-sol",
+        auth_mode="codex-login",
+        environ={"CODEX_HOME": str(codex_home)},
+        require_docker=False,
+        require_harbor=False,
+        command_runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, returncode=0, stdout="Logged in using ChatGPT", stderr=""
+        ),
+    )
+
+    assert not report.ok
+    assert any("regular file" in item for item in report.missing)
+
+
+def test_codex_login_doctor_rejects_a_shared_codex_home(
+    oab_source, tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir(mode=0o755)
+    codex_home.chmod(0o755)
+    auth = codex_home / "auth.json"
+    auth.write_text('{"auth_mode":"chatgpt"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    monkeypatch.setattr(execution.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    report = execution.oragentbench_preconditions(
+        source=oab_source,
+        task_name="single_task",
+        scaffold="codex",
+        model="gpt-5.6-sol",
+        auth_mode="codex-login",
+        environ={"CODEX_HOME": str(codex_home)},
+        require_docker=False,
+        require_harbor=False,
+        command_runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, returncode=0, stdout="Logged in using ChatGPT", stderr=""
+        ),
+    )
+
+    assert not report.ok
+    assert any("CODEX_HOME is private" in item for item in report.missing)
+
+
+def test_codex_login_doctor_rejects_a_custom_provider_route(oab_source):
+    report = execution.oragentbench_preconditions(
+        source=oab_source,
+        task_name="single_task",
+        scaffold="codex",
+        model="gpt-5.6-sol",
+        auth_mode="codex-login",
+        model_base_url="https://router.example.test/v1",
+        require_docker=False,
+        require_harbor=False,
+        require_secrets=False,
+    )
+
+    assert not report.ok
+    assert any("native ChatGPT route" in item for item in report.missing)
+
+
 def test_codex_base_url_can_be_discovered_without_reading_a_secret(tmp_path):
     config = tmp_path / "config.toml"
     config.write_text(
@@ -1143,6 +1433,142 @@ def test_script_dry_run_builds_the_command_without_executing(oab_source, capsys,
     assert "--skip-build" not in receipt["upstream_command"]["argv"]
     assert receipt["evidence_label"] == "exploratory"
     assert any("dry run" in note for note in receipt["notes"])
+
+
+def test_script_codex_login_builds_a_native_auth_plan_without_a_provider_route(
+    oab_source, capsys, tmp_path
+):
+    module = _script_main()
+    code = module.main(
+        [
+            "oragentbench",
+            "--source", str(oab_source),
+            "--task", "single_task",
+            "--scaffold", "codex",
+            "--scaffold-version", "fixture-cli-1.2.3",
+            "--model", "gpt-5.6-sol",
+            "--auth-mode", "codex-login",
+            "--date", "2026-08-24",
+            "--campaign-slug", "script-codex-login",
+            "--dataset-digest", "sha256:" + "b" * 64,
+            "--output-root", str(tmp_path / "out"),
+            "--allow-missing-tooling",
+        ]
+    )
+    assert code == 0
+    receipt = json.loads(capsys.readouterr().out)
+    plan_root = Path(receipt["output_root"]) / "plan"
+    plan_blob = "\n".join(
+        path.read_text(encoding="utf-8") for path in sorted(plan_root.rglob("*")) if path.is_file()
+    )
+    assert "CODEX_FORCE_AUTH_JSON: 'true'" in plan_blob
+    assert "MODEL_API_KEY" not in plan_blob
+    assert "MODEL_BASE_URL" not in plan_blob
+    assert "OPENAI_BASE_URL" not in plan_blob
+
+
+def test_script_codex_login_fails_closed_for_an_internet_enabled_task(
+    oab_source, capsys, tmp_path
+):
+    module = _script_main()
+    code = module.main(
+        [
+            "oragentbench",
+            "--source", str(oab_source),
+            "--task", "multi_task",
+            "--scaffold", "codex",
+            "--scaffold-version", "fixture-cli-1.2.3",
+            "--model", "gpt-5.6-sol",
+            "--auth-mode", "codex-login",
+            "--date", "2026-08-24",
+            "--campaign-slug", "script-codex-login-network-guard",
+            "--dataset-digest", "sha256:" + "c" * 64,
+            "--output-root", str(tmp_path / "out"),
+            "--allow-missing-tooling",
+            "--upstream-dry-run",
+            "--require-preconditions",
+        ]
+    )
+    assert code == 5
+    captured = capsys.readouterr()
+    assert "internet-enabled or not explicitly network-disabled" in captured.err
+
+
+def test_script_never_executes_a_native_codex_login_benchmark(
+    oab_source, capsys, tmp_path, monkeypatch
+):
+    """A no-network task must not turn runner login into a container credential."""
+    module = _script_main()
+    monkeypatch.setattr(
+        module.execution,
+        "oragentbench_preconditions",
+        lambda **_kwargs: execution.PreconditionReport(satisfied=["fixture ready"]),
+    )
+
+    def forbidden_subprocess(*_args, **_kwargs):
+        pytest.fail("native codex-login reached the upstream subprocess boundary")
+
+    monkeypatch.setattr(module.subprocess, "run", forbidden_subprocess)
+    code = module.main(
+        [
+            "oragentbench",
+            "--source", str(oab_source),
+            "--task", "single_task",
+            "--scaffold", "codex",
+            "--scaffold-version", "fixture-cli-1.2.3",
+            "--model", "gpt-5.6-sol",
+            "--auth-mode", "codex-login",
+            "--date", "2026-08-24",
+            "--campaign-slug", "script-codex-login-execute-guard",
+            "--dataset-digest", "sha256:" + "d" * 64,
+            "--output-root", str(tmp_path / "out"),
+            "--execute",
+            "--acknowledge-cost", "i-accept-model-costs",
+        ]
+    )
+
+    assert code == 5
+    captured = capsys.readouterr()
+    assert "prepare/doctor only" in captured.err
+    assert "host-side credential broker" in captured.err
+
+
+def test_script_allows_only_print_only_upstream_validation_for_native_login(
+    oab_source, capsys, tmp_path, monkeypatch
+):
+    module = _script_main()
+    calls = []
+
+    def fake_upstream(argv, *, cwd, env):
+        calls.append((list(argv), cwd, env))
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(module.subprocess, "run", fake_upstream)
+    code = module.main(
+        [
+            "oragentbench",
+            "--source", str(oab_source),
+            "--task", "single_task",
+            "--scaffold", "codex",
+            "--scaffold-version", "fixture-cli-1.2.3",
+            "--model", "gpt-5.6-sol",
+            "--auth-mode", "codex-login",
+            "--date", "2026-08-24",
+            "--campaign-slug", "script-codex-login-print-only",
+            "--dataset-digest", "sha256:" + "e" * 64,
+            "--output-root", str(tmp_path / "out"),
+            "--upstream-dry-run",
+            "--execute",
+        ]
+    )
+
+    assert code == 0
+    assert len(calls) == 1
+    assert "--dry-run" in calls[0][0]
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["executed"] is True
+    assert receipt["upstream_command"]["makes_model_calls"] is False
+    assert any("no Harbor, container, or model call" in note for note in receipt["notes"])
 
 
 def test_script_output_root_is_named_after_the_campaign(oab_source, capsys, tmp_path):

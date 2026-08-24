@@ -8,6 +8,7 @@ an immutable commit, and that the secret-handling and fail-closed rules hold.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -179,6 +180,29 @@ def test_the_paid_path_requires_manual_dispatch_and_acknowledgement(workflows, r
     assert "i-accept-model-costs" in raw_workflows["benchmark-smoke.yml"]
 
 
+def test_oragentbench_dispatch_exposes_only_the_two_supported_auth_routes(workflows):
+    auth = workflows["benchmark-smoke.yml"]["on"]["workflow_dispatch"]["inputs"][
+        "auth_mode"
+    ]
+    assert auth["type"] == "choice"
+    assert auth["default"] == "api-key"
+    assert auth["options"] == ["api-key", "codex-login"]
+
+
+def test_oragentbench_paid_job_has_no_direct_runner_login_execution(workflows):
+    steps = workflows["benchmark-smoke.yml"]["jobs"]["agent-oragentbench"]["steps"]
+    api_step = next(step for step in steps if step.get("name") == "Run with API key")
+
+    assert api_step["if"] == "inputs.auth_mode == 'api-key'"
+    assert api_step["env"]["MODEL_API_KEY"] == "${{ secrets.MODEL_API_KEY }}"
+    assert api_step["env"]["MODEL_BASE_URL"] == "${{ vars.MODEL_BASE_URL }}"
+    assert "--auth-mode api-key" in api_step["run"]
+    assert "--model-base-url \"$MODEL_BASE_URL\"" in api_step["run"]
+    paid_blob = json.dumps(steps, sort_keys=True)
+    assert "Run with runner-local Codex login" not in paid_blob
+    assert "--auth-mode codex-login" not in paid_blob
+
+
 def test_the_paid_path_runs_in_an_approvable_environment(workflows):
     smoke = workflows["benchmark-smoke.yml"]
     for job in ("agent-oragentbench", "agent-frontieror"):
@@ -192,6 +216,49 @@ def test_fork_pull_requests_cannot_reach_the_self_hosted_runner(workflows, raw_w
     assert "pull_request" not in smoke["on"]
     assert "pull_request_target" not in smoke["on"]
     assert "github.event.repository.fork" in raw_workflows["benchmark-smoke.yml"]
+
+
+def test_self_hosted_paths_are_gated_to_the_repository_default_branch(workflows):
+    gate = next(
+        step
+        for step in workflows["benchmark-smoke.yml"]["jobs"]["preflight"]["steps"]
+        if step.get("name") == "Gate"
+    )
+    assert gate["env"]["REF_NAME"] == "${{ github.ref_name }}"
+    assert gate["env"]["DEFAULT_BRANCH"] == (
+        "${{ github.event.repository.default_branch }}"
+    )
+    assert 'if [ "$MODE" != "validate-only" ]' in gate["run"]
+    assert '"$REF_NAME" != "$DEFAULT_BRANCH"' in gate["run"]
+
+
+def test_self_hosted_paths_require_a_private_controller_repository(workflows):
+    gate = next(
+        step
+        for step in workflows["benchmark-smoke.yml"]["jobs"]["preflight"]["steps"]
+        if step.get("name") == "Gate"
+    )
+    assert gate["env"]["REPOSITORY_IS_PRIVATE"] == (
+        "${{ github.event.repository.private }}"
+    )
+    assert 'if [ "$MODE" != "validate-only" ]' in gate["run"]
+    assert '"$REPOSITORY_IS_PRIVATE" != "true"' in gate["run"]
+    assert "private controller repository" in gate["run"]
+
+
+def test_runner_login_route_is_gated_to_the_codex_scaffold(workflows):
+    gate = next(
+        step
+        for step in workflows["benchmark-smoke.yml"]["jobs"]["preflight"]["steps"]
+        if step.get("name") == "Gate"
+    )
+    assert gate["env"]["AUTH_MODE"] == "${{ inputs.auth_mode }}"
+    assert gate["env"]["SCAFFOLD"] == "${{ inputs.scaffold }}"
+    assert '"$AUTH_MODE" = "codex-login"' in gate["run"]
+    assert '"$SCAFFOLD" != "codex"' in gate["run"]
+    assert "direct subscription-login container rollout is intentionally disabled" in gate[
+        "run"
+    ]
 
 
 def test_no_workflow_uses_pull_request_target(raw_workflows):
@@ -351,6 +418,43 @@ def test_oragentbench_preflight_starts_with_the_one_click_prepare_path(workflows
     assert "orbench run oragentbench" in scripts
     assert "--prepare-only" in scripts
     assert "mode=agent requires an exact pinned model id" in scripts
+
+
+def test_oragentbench_preflight_builds_each_auth_route_without_cross_contamination(
+    workflows,
+):
+    steps = workflows["benchmark-smoke.yml"]["jobs"]["preflight"]["steps"]
+    api_prepare = next(
+        step for step in steps if step.get("name") == "Prepare ORAgentBench API-key plan"
+    )
+    login_prepare = next(
+        step
+        for step in steps
+        if step.get("name") == "Prepare ORAgentBench runner-login plan"
+    )
+    api_check = next(
+        step
+        for step in steps
+        if step.get("name") == "Check upstream ORAgentBench API-key plan"
+    )
+    login_check = next(
+        step
+        for step in steps
+        if step.get("name") == "Check upstream ORAgentBench runner-login plan"
+    )
+
+    assert "--auth-mode api-key" in api_prepare["run"]
+    assert api_prepare["env"]["MODEL_BASE_URL"] == "${{ vars.MODEL_BASE_URL }}"
+    assert "--auth-mode codex-login" in login_prepare["run"]
+    assert "MODEL_API_KEY" not in json.dumps(login_prepare)
+    assert "MODEL_BASE_URL" not in json.dumps(login_prepare)
+
+    assert "--auth-mode api-key" in api_check["run"]
+    assert "--model-base-url \"$MODEL_BASE_URL\"" in api_check["run"]
+    assert "--auth-mode codex-login" in login_check["run"]
+    assert "--require-preconditions" in login_check["run"]
+    assert "MODEL_API_KEY" not in json.dumps(login_check)
+    assert "MODEL_BASE_URL" not in json.dumps(login_check)
 
 
 def test_self_hosted_oragentbench_jobs_use_the_runner_bootstrap(workflows):

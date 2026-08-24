@@ -137,6 +137,9 @@ AGENT_PROFILES: dict[str, dict[str, Any]] = {
 #: Zero-model-cost controls. Harbor built-ins; they take no credentials at all.
 CONTROL_SCAFFOLDS = ("oracle", "nop")
 
+AUTH_MODES = frozenset({"api-key", "codex-auth-json", "codex-login"})
+CODEX_AUTH_FILE_MODES = frozenset({"codex-auth-json", "codex-login"})
+
 # These upstream adapters send their API credential to a configurable base
 # URL. The destination is therefore a required identity input, not merely an
 # optional runtime variable. mini-swe-agent's recorded profile has no base-URL
@@ -397,14 +400,54 @@ def validate_oragentbench_task(source: Path, task_name: str) -> str:
 
 
 def oragentbench_task_allows_internet(source: Path, task_name: str) -> bool:
-    """Read the selected task's declared agent-network policy."""
+    """Return whether auth material must be treated as exposed to a network.
+
+    Harbor's current baseline defaults to ``network_mode = "public"``.  A
+    missing or unknown declaration is therefore not evidence of isolation.
+    Only the current explicit no-network policy, or its legacy
+    ``allow_internet = false`` spelling, is safe enough to return ``False``.
+    """
     validate_oragentbench_task(source, task_name)
     path = Path(source) / "harbor_tasks" / task_name / "task.toml"
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise SpecError(f"cannot read the selected task policy from task.toml: {exc}") from None
-    return (data.get("environment") or {}).get("allow_internet") is True
+    environment = data.get("environment")
+    if not isinstance(environment, Mapping):
+        return True
+    network_mode = environment.get("network_mode")
+    if network_mode is not None:
+        baseline_isolated = network_mode == "no-network"
+    else:
+        baseline_isolated = environment.get("allow_internet") is False
+    if not baseline_isolated:
+        return True
+
+    # Harbor lets agent and verifier phases, including each multi-step phase,
+    # override the baseline. A verifier may share the agent container, and a
+    # separate verifier can consume task-authored artifacts, so any
+    # public/unknown phase override makes an auth-file transport unsafe.
+    phase_policies: list[Any] = [data.get("agent"), data.get("verifier")]
+    steps = data.get("steps")
+    if steps is not None:
+        if not isinstance(steps, list):
+            return True
+        for step in steps:
+            if not isinstance(step, Mapping):
+                phase_policies.append(object())
+                continue
+            phase_policies.extend((step.get("agent"), step.get("verifier")))
+    for policy in phase_policies:
+        if policy is None:
+            continue
+        if not isinstance(policy, Mapping):
+            return True
+        if "network_mode" in policy and policy.get("network_mode") != "no-network":
+            return True
+        if "allow_internet" in policy and policy.get("allow_internet") is not False:
+            return True
+    return False
 
 
 def validate_frontieror_source(source: Path) -> Path:
@@ -881,13 +924,21 @@ def oragentbench_agent_campaign_spec(
     validate_pinned_model(model)
     validate_pinned_scaffold_version(scaffold_version)
 
-    if auth_mode not in {"api-key", "codex-auth-json"}:
+    if auth_mode not in AUTH_MODES:
         raise SpecError(
-            f"auth_mode {auth_mode!r} must be 'api-key' or 'codex-auth-json'"
+            f"auth_mode {auth_mode!r} must be one of {sorted(AUTH_MODES)}"
         )
-    if auth_mode == "codex-auth-json" and scaffold != "codex":
-        raise SpecError("codex-auth-json is only valid for the codex scaffold")
-    if scaffold in ROUTE_PINNED_SCAFFOLDS:
+    if auth_mode in CODEX_AUTH_FILE_MODES and scaffold != "codex":
+        raise SpecError(f"{auth_mode} is only valid for the codex scaffold")
+    if auth_mode == "codex-login" and model_base_url:
+        raise SpecError(
+            "codex-login uses Codex's native ChatGPT route and must not set a custom "
+            "model_base_url; use api-key or codex-auth-json for a routed endpoint"
+        )
+    route_must_be_pinned = (
+        scaffold in ROUTE_PINNED_SCAFFOLDS and auth_mode != "codex-login"
+    )
+    if route_must_be_pinned:
         # Fail before a campaign workspace is created. The normalized URL is
         # retained only in process memory; its digest is the persisted identity
         # input for API-key campaigns.
@@ -901,13 +952,13 @@ def oragentbench_agent_campaign_spec(
 
     env_literals: dict[str, str] = {}
     env_from_secret = dict(profile["env_from_secret"])
-    if auth_mode == "codex-auth-json":
-        model_base_url = validate_https_base_url(model_base_url)
+    if auth_mode in CODEX_AUTH_FILE_MODES:
         env_from_secret = {}
-        env_literals = {
-            "CODEX_FORCE_AUTH_JSON": "true",
-            "OPENAI_BASE_URL": model_base_url.strip(),
-        }
+        env_literals = {"CODEX_FORCE_AUTH_JSON": "true"}
+        if model_base_url:
+            env_literals["OPENAI_BASE_URL"] = validate_https_base_url(
+                model_base_url
+            ).strip()
     else:
         literal_var = profile.get("env_literal_from_model")
         if literal_var:
@@ -1102,6 +1153,48 @@ def _codex_auth_json_has_basic_structure(path: Path) -> bool:
     )
 
 
+def _probe_codex_chatgpt_login(
+    executable: str,
+    *,
+    command_runner: CommandRunner | None = None,
+) -> tuple[bool, str]:
+    """Confirm native ChatGPT authentication without retaining command output."""
+    runner = subprocess.run if command_runner is None else command_runner
+    argv = [executable, "login", "status"]
+    try:
+        result = runner(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=RUNNER_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, (
+            f"codex login status timed out after {RUNNER_PROBE_TIMEOUT_SECONDS:g}s; "
+            "a ChatGPT subscription login is not confirmed"
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False, (
+            "codex login status could not run; a ChatGPT subscription login is not confirmed"
+        )
+    output = f"{result.stdout or ''}\n{result.stderr or ''}"
+    confirmed = any(
+        re.fullmatch(
+            r"logged in (?:using|with) chatgpt(?: account)?[.!]?",
+            line.strip(),
+            flags=re.IGNORECASE,
+        )
+        for line in output.splitlines()
+    )
+    if result.returncode != 0 or not confirmed:
+        return False, (
+            "Codex is not confirmed to use a ChatGPT subscription login "
+            "(status output is intentionally not retained)"
+        )
+    return True, "Codex is authenticated with ChatGPT (status output not retained)"
+
+
 def oragentbench_preconditions(
     *,
     source: Path,
@@ -1119,6 +1212,10 @@ def oragentbench_preconditions(
     """Everything that must hold before an ORAgentBench agent run may start."""
     environ = os.environ if environ is None else environ
     report = PreconditionReport()
+    report.require(
+        auth_mode in AUTH_MODES,
+        f"auth_mode must be one of {sorted(AUTH_MODES)}",
+    )
 
     try:
         resolved = validate_oragentbench_source(source)
@@ -1137,8 +1234,14 @@ def oragentbench_preconditions(
         report.require(True, f"scaffold {scaffold!r} is a Harbor built-in control (no cost)")
     elif scaffold in AGENT_PROFILES:
         report.require(True, f"scaffold {scaffold!r} has a recorded upstream agent profile")
+        if auth_mode == "codex-login" and model_base_url:
+            report.require(
+                False,
+                "codex-login uses Codex's native ChatGPT route and must not set a "
+                "custom model base URL",
+            )
         normalized_pinned_route = ""
-        if scaffold in ROUTE_PINNED_SCAFFOLDS:
+        if scaffold in ROUTE_PINNED_SCAFFOLDS and auth_mode != "codex-login":
             try:
                 normalized_pinned_route = validate_https_base_url(model_base_url)
                 report.require(True, "a credential-safe HTTPS provider route is pinned")
@@ -1149,46 +1252,101 @@ def oragentbench_preconditions(
             report.require(True, f"model {model!r} is pinned")
         except SpecError as exc:
             report.require(False, str(exc))
-        if auth_mode == "codex-auth-json":
+        if auth_mode in CODEX_AUTH_FILE_MODES:
             report.require(
                 scaffold == "codex",
-                "codex-auth-json is only valid for the codex scaffold",
+                f"{auth_mode} is only valid for the codex scaffold",
             )
             # The shared provider-route check above covers this transport too.
             try:
                 internet_enabled = oragentbench_task_allows_internet(resolved, task_name)
                 report.require(
                     not internet_enabled,
-                    "codex-auth-json refuses to expose a long-lived Codex login to an "
-                    "internet-enabled benchmark task; use an ephemeral scoped API credential",
+                    f"{auth_mode} refuses to expose a long-lived Codex login when the "
+                    "baseline or any task phase is internet-enabled or not explicitly "
+                    "network-disabled; "
+                    "use an ephemeral scoped API credential",
                 )
             except SpecError as exc:
                 report.require(False, str(exc))
             if require_secrets:
                 explicit = environ.get("CODEX_AUTH_JSON_PATH")
+                if auth_mode == "codex-login" and explicit:
+                    report.require(
+                        False,
+                        "codex-login uses the runner account's CODEX_HOME/auth.json; "
+                        "a custom CODEX_AUTH_JSON_PATH is not accepted",
+                    )
+                codex_home = Path(
+                    environ.get("CODEX_HOME") or (Path.home() / ".codex")
+                ).expanduser()
+                if auth_mode == "codex-login":
+                    try:
+                        home_stat = codex_home.lstat()
+                    except OSError:
+                        home_stat = None
+                    report.require(
+                        codex_home.is_absolute()
+                        and home_stat is not None
+                        and stat.S_ISDIR(home_stat.st_mode)
+                        and not stat.S_ISLNK(home_stat.st_mode),
+                        "runner CODEX_HOME is an absolute, real directory",
+                    )
+                    if home_stat is not None:
+                        report.require(
+                            home_stat.st_uid == os.geteuid(),
+                            "runner CODEX_HOME is owned by the Actions service user",
+                        )
+                        home_mode = stat.S_IMODE(home_stat.st_mode)
+                        report.require(
+                            home_mode & 0o077 == 0,
+                            "runner CODEX_HOME is private (require no group/world access)",
+                        )
                 auth_path = (
                     Path(explicit).expanduser()
-                    if explicit
-                    else Path.home() / ".codex" / "auth.json"
+                    if explicit and auth_mode != "codex-login"
+                    else codex_home / "auth.json"
+                )
+                try:
+                    auth_stat = auth_path.lstat()
+                except OSError:
+                    auth_stat = None
+                regular_auth_file = (
+                    auth_stat is not None
+                    and stat.S_ISREG(auth_stat.st_mode)
+                    and not stat.S_ISLNK(auth_stat.st_mode)
                 )
                 report.require(
-                    auth_path.is_file(),
-                    f"Codex auth file exists at {auth_path}",
+                    regular_auth_file,
+                    "Codex auth store is a regular file, not a symlink",
                 )
-                if auth_path.is_file():
+                if regular_auth_file and auth_stat is not None:
+                    report.require(
+                        auth_stat.st_uid == os.geteuid(),
+                        "Codex auth store is owned by the Actions service user",
+                    )
                     report.require(
                         _codex_auth_json_has_basic_structure(auth_path),
                         "Codex auth file is valid JSON with a non-empty object root "
                         "(parsed locally; contents never logged)",
                     )
-                    try:
-                        mode = stat.S_IMODE(auth_path.stat().st_mode)
-                    except OSError:
-                        mode = 0o777
+                    mode = stat.S_IMODE(auth_stat.st_mode)
                     report.require(
                         mode & 0o077 == 0,
                         f"Codex auth file is private (mode {mode:04o}; require no group/world access)",
                     )
+                if auth_mode == "codex-login":
+                    codex = shutil.which("codex")
+                    if codex is None:
+                        report.require(
+                            False,
+                            "the Codex CLI is on PATH for ChatGPT login verification",
+                        )
+                    else:
+                        ok, description = _probe_codex_chatgpt_login(
+                            codex, command_runner=command_runner
+                        )
+                        report.require(ok, description)
             else:
                 report.require(
                     True,
@@ -1198,7 +1356,7 @@ def oragentbench_preconditions(
         else:
             non_secret = set(AGENT_PROFILES[scaffold].get("non_secret_env") or ())
             names = sorted(set(AGENT_PROFILES[scaffold]["env_from_secret"].values()))
-        if not require_secrets and auth_mode != "codex-auth-json":
+        if not require_secrets and auth_mode not in CODEX_AUTH_FILE_MODES:
             report.require(
                 True,
                 "credentials not required: upstream's wrapper dry run transforms the "

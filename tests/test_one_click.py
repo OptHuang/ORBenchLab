@@ -449,6 +449,69 @@ def test_one_command_prepares_a_codex_plan_without_serializing_a_secret(
     assert "MODEL_API_KEY" not in blob
 
 
+def test_native_codex_login_is_prepare_only_until_a_broker_exists(
+    upstream_fixtures: Path, tmp_path: Path
+):
+    from orbenchlab import workflow
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    prepared = workflow.prepare_oragentbench_run(
+        source=source,
+        task="single_task",
+        agent="codex",
+        scaffold_version="fixture-cli-1.2.3",
+        model="gpt-5.6-sol",
+        auth_mode="codex-login",
+        date="2026-08-24",
+        workspace=tmp_path / "runs",
+        wall_clock_sec=20,
+    )
+
+    with pytest.raises(PreconditionError, match="broker"):
+        workflow.execute_prepared_run(
+            prepared,
+            acknowledge_cost="i-accept-model-costs",
+            environ={},
+        )
+
+    manifest = json.loads(
+        (prepared.run_root / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["state"] == "prepared"
+
+
+def test_legacy_codex_auth_file_is_also_prepare_only_until_a_broker_exists(
+    upstream_fixtures: Path, tmp_path: Path
+):
+    from orbenchlab import workflow
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    prepared = workflow.prepare_oragentbench_run(
+        source=source,
+        task="single_task",
+        agent="codex",
+        scaffold_version="fixture-cli-1.2.3",
+        model="gpt-5.6-sol",
+        auth_mode="codex-auth-json",
+        model_base_url="https://router.example.test/v1",
+        date="2026-08-24",
+        workspace=tmp_path / "runs",
+        wall_clock_sec=20,
+    )
+
+    with pytest.raises(PreconditionError, match="auth-file.*broker"):
+        workflow.execute_prepared_run(
+            prepared,
+            acknowledge_cost="i-accept-model-costs",
+            environ={},
+        )
+
+    manifest = json.loads(
+        (prepared.run_root / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["state"] == "prepared"
+
+
 def test_doctor_checks_the_actual_codex_plan_runtime(
     capsys, monkeypatch, upstream_fixtures: Path, tmp_path: Path
 ):
@@ -486,6 +549,56 @@ def test_doctor_checks_the_actual_codex_plan_runtime(
     assert payload["ok"] is True
     assert payload["model_base_url_configured"] is True
     assert "router.example.test" not in json.dumps(payload)
+
+
+def test_native_codex_login_ignores_an_unrelated_provider_route_environment(
+    capsys, monkeypatch, upstream_fixtures: Path, tmp_path: Path
+):
+    from orbenchlab import execution
+
+    source = _copy_named_checkout(upstream_fixtures, tmp_path)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir(mode=0o700)
+    auth = codex_home / "auth.json"
+    auth.write_text('{"auth_mode":"chatgpt"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("MODEL_BASE_URL", "https://unrelated-router.example.test/v1")
+    monkeypatch.setattr(execution.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def probe(argv, **kwargs):
+        if argv[-2:] == ["login", "status"]:
+            stdout = "Logged in using ChatGPT\n"
+        elif argv[-1] == "--version":
+            stdout = "harbor, version 0.16.2\n"
+        else:
+            stdout = ""
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(execution.subprocess, "run", probe)
+    code = main(
+        [
+            "doctor",
+            "oragentbench",
+            "--source",
+            str(source),
+            "--task",
+            "single_task",
+            "--agent",
+            "codex",
+            "--scaffold-version",
+            "fixture-cli-1.2.3",
+            "--model",
+            "gpt-5.6-sol",
+            "--auth-mode",
+            "codex-login",
+        ]
+    )
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["model_base_url_configured"] is False
 
 
 def test_doctor_fails_when_docker_is_installed_but_the_daemon_is_unreachable(

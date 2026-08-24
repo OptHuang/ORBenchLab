@@ -87,7 +87,7 @@ def _add_doctor(sub: argparse._SubParsersAction) -> None:
     parser.add_argument("--scaffold-version", default="")
     parser.add_argument(
         "--auth-mode",
-        choices=["api-key", "codex-auth-json"],
+        choices=["api-key", "codex-auth-json", "codex-login"],
         default="api-key",
     )
     parser.add_argument("--model-base-url", default="")
@@ -100,7 +100,11 @@ def _resolved_model_base_url(args: argparse.Namespace) -> str:
     candidate = str(args.model_base_url).strip() if args.model_base_url else ""
     if not candidate and args.auth_mode == "codex-auth-json":
         candidate = execution_mod.discover_codex_base_url()
-    if not candidate and args.agent in execution_mod.ROUTE_PINNED_SCAFFOLDS:
+    if (
+        not candidate
+        and args.auth_mode != "codex-login"
+        and args.agent in execution_mod.ROUTE_PINNED_SCAFFOLDS
+    ):
         # MODEL_BASE_URL is configuration, not a secret. Resolve it without
         # placing it on argv or stdout; validation errors never echo the value.
         candidate = os.environ.get("MODEL_BASE_URL", "")
@@ -160,11 +164,11 @@ def _add_run(sub: argparse._SubParsersAction) -> None:
     )
     parser.add_argument(
         "--auth-mode",
-        choices=["api-key", "codex-auth-json"],
+        choices=["api-key", "codex-auth-json", "codex-login"],
         default="api-key",
         help=(
-            "credential transport; api-key is the safe default. codex-auth-json is "
-            "allowed only for explicitly network-disabled tasks"
+            "credential transport; api-key is executable. codex-login and "
+            "codex-auth-json are prepare/doctor only until a broker exists"
         ),
     )
     parser.add_argument(

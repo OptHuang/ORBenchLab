@@ -130,12 +130,10 @@ jobs and logs remain on the execution host.
 
 ### Run a model agent with a scoped API credential
 
-Treat benchmark tasks as untrusted code. In particular, when a selected pinned
-ORAgentBench task enables Internet access, ORBenchLab **refuses**
-`codex-auth-json`: a long-lived `~/.codex/auth.json` must not be mounted into an
-Internet-enabled task container. Create a short-lived, revocable provider key,
-set a provider-side spend/rate limit, and expose it only for the duration of the
-run:
+Treat benchmark tasks as untrusted code. ORBenchLab refuses direct execution
+with `codex-auth-json`: a long-lived `~/.codex/auth.json` must not be mounted
+into task containers. Create a short-lived, revocable provider key, set a
+provider-side spend/rate limit, and expose it only for the duration of the run:
 
 ```bash
 export MODEL_API_KEY='<ephemeral scoped key>'
@@ -177,13 +175,42 @@ an audit envelope but cannot stop an arbitrary provider after exactly that
 amount; configure the real hard spend/rate limit on the short-lived provider
 credential itself.
 
-`codex-auth-json` remains a narrowly supported local transport for tasks that
-are explicitly network-disabled. In that mode, `doctor` checks permissions and
-parses the auth file **locally** only to verify that it is valid JSON with a
-non-empty object root. It never prints, hashes, copies into the campaign
-workspace, or persists the contents. If the selected task permits Internet,
-both `doctor` and execution fail closed and direct the operator back to a scoped
-API credential.
+### Two Codex authentication routes (not interchangeable)
+
+| Route | Credential boundary | Safe use in this repository | Current pinned ORAgentBench |
+| --- | --- | --- | --- |
+| `api-key` | A short-lived, revocable provider key injected only into the approved job | Paid benchmark rollout, including Internet-enabled tasks | **Supported.** This is the route for the current 107 public-network tasks |
+| `codex-login` | A separate private-controller analysis runner is signed in to Codex with ChatGPT; no login export is stored in GitHub | Authentication/safety diagnosis now; future host-side analysis or broker-backed rollout | **Refused.** Direct benchmark execution is disabled and all 107 pinned tasks enable public Internet |
+
+Installing the Codex CLI is not a login. For `codex-login`, the Unix user that
+owns the isolated private-controller analysis runner must complete `codex
+login` once, and `codex login status` must report a ChatGPT login rather than
+an API-key login. The
+route consumes the ChatGPT plan's Codex allowance and remains subject to plan
+limits; it does not turn an API-key login into subscription usage. See the
+[Codex authentication](https://learn.chatgpt.com/docs/auth) and
+[non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode)
+documentation.
+
+The subscription route is deliberately not a shortcut around task isolation.
+ORBenchLab never asks an operator to put a personal Codex login export in a
+repository secret or Actions artifact. A task must opt into an audited safe
+policy; an absent, unknown or public-network declaration is unsafe. An isolated
+container also cannot call the model service merely because login exists on the
+host. The current route is therefore an authentication and safety-diagnosis
+entry point, not a working subscription-backed container rollout. Actual use
+requires future host-side `/analyze` execution or a broker/model proxy that
+keeps the personal login outside the task boundary. The pinned ORAgentBench
+official agent rollout remains `api-key` only.
+
+When a ChatGPT-plan run is ingested through Harbor, any dollar figure derived
+from tokens is an **API-equivalent estimate** for comparison. It is not an
+invoice, balance deduction or measurement of the actual ChatGPT-plan charge.
+
+`codex-auth-json` remains a legacy plan/doctor transport for diagnosing an
+existing local setup. Like `codex-login`, it is not executable until a broker
+keeps the auth file outside every task and verifier boundary. Rollout must use a
+scoped API credential.
 
 `orbench integration inspect` emits JSON with a `checks` array, a `facts` object
 and a `decisions` object — CI asserts on all three.
@@ -216,12 +243,17 @@ matrix, both pinned-upstream contract inspections, ORAgentBench and FrontierOR
 successfully. See [Actions](https://github.com/OptHuang/ORBenchLab/actions).
 
 Actual agent execution is intentionally not run on a shared GitHub-hosted
-machine. Configure the repository secret/variable listed below and attach a
-self-hosted runner with the required labels:
+machine. A self-hosted runner needs more than Codex: Python 3.12, Docker,
+Harbor, a private durable `ORBENCH_RUNS_ROOT`, a protected GitHub Environment,
+and a dedicated Unix service user that owns the benchmark runner and run root.
+Do **not** add a personal Codex login to that Docker-capable account. A future
+host-side analysis worker must use a separate private-controller runner identity
+(preferably a separate disposable VM). Configure the route-specific settings:
 
 | Integration | Repository configuration | Runner |
 | --- | --- | --- |
-| ORAgentBench | secret `MODEL_API_KEY`; variables `MODEL_BASE_URL`, `ORBENCH_RUNS_ROOT` | `self-hosted`, `orbench-exec`; Docker + Harbor |
+| ORAgentBench (`api-key`) | secret `MODEL_API_KEY`; variables `MODEL_BASE_URL`, `ORBENCH_RUNS_ROOT` | `self-hosted`, `orbench-exec`; Python 3.12 + Docker + Harbor |
+| Authentication/safety diagnosis; future broker-backed analysis (`codex-login`) | no model secret in GitHub; isolated analysis user pre-logged into ChatGPT Codex | separate private-controller runner label/account; never the benchmark Docker worker |
 | FrontierOR | secret `OPENROUTER_API_KEY` | the above plus `perf-isolated`, Gurobi licence, pinned cores and upstream images |
 
 Then dispatch `benchmark-smoke` with `mode=agent`, a pinned model id, an exact
@@ -230,6 +262,18 @@ and the literal acknowledgement `i-accept-model-costs`. The protected
 `benchmark-agent` environment adds a separate approval click before model spend.
 Use a revocable, provider-limited key for `MODEL_API_KEY`; never store a Codex
 login export or another long-lived personal credential in repository secrets.
+
+A long-lived runner attached directly to a public repository increases the
+blast radius of a workflow or dependency compromise. Self-hosted modes are
+therefore **disabled in this public repository**; it supports `validate-only`
+dispatches. Execute from a **private mirror/controller repository** containing
+the complete ORBenchLab tree at a reviewed commit, with protected environments
+and reviewed workflows. Do not run an untrusted branch or pull-request ref.
+Prefer an ephemeral runner for model jobs; if the runner is persistent, do not
+let public pull requests or arbitrary refs schedule it. A runner containing a
+ChatGPT login is supported only behind that private controller boundary. The detailed contract and
+zero-model acceptance commands are in
+[`docs/self-hosted-runner.md`](docs/self-hosted-runner.md).
 
 `ORBENCH_RUNS_ROOT` is an absolute, runner-owned persistent directory outside
 the checkout and `RUNNER_TEMP` (for example `/srv/orbench/runs`). The workflow

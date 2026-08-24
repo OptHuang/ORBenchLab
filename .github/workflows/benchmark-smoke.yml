@@ -47,6 +47,14 @@ on:
         default: claude-code
         type: choice
         options: [claude-code, codex, mini-swe-agent]
+      auth_mode:
+        description: >-
+          ORAgentBench credential route. api-key is executable; codex-login is
+          a fail-closed authentication/safety preflight until a broker exists.
+        required: true
+        default: api-key
+        type: choice
+        options: [api-key, codex-login]
       scaffold_version:
         description: "ORAgentBench: exact released scaffold CLI version"
         required: false
@@ -85,7 +93,8 @@ on:
         default: orbench-agent-smoke
       acknowledge_cost:
         description: >-
-          Type "i-accept-model-costs" to run mode=agent. Ignored otherwise.
+          Type "i-accept-model-costs" to acknowledge API spend or ChatGPT-plan
+          quota consumption for mode=agent. Ignored otherwise.
         required: false
         default: ""
 
@@ -117,6 +126,8 @@ jobs:
       test_set: ${{ steps.frontieror-instances.outputs.test_set }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
           python-version: "3.12"
@@ -181,15 +192,8 @@ jobs:
           bash .github/scripts/clone-upstream.sh "$INTEGRATION" upstream
 
       - name: Validate inputs and build the upstream command (nothing executed)
+        if: inputs.integration == 'frontieror'
         env:
-          INTEGRATION: ${{ inputs.integration }}
-          MODE: ${{ inputs.mode }}
-          TASK: ${{ inputs.task }}
-          SCAFFOLD: ${{ inputs.scaffold }}
-          SCAFFOLD_VERSION: ${{ inputs.scaffold_version }}
-          MODEL: ${{ inputs.model }}
-          MODEL_BASE_URL: ${{ vars.MODEL_BASE_URL }}
-          CAMPAIGN_DATE: ${{ inputs.campaign_date }}
           PAPER_ID: ${{ inputs.paper_id }}
           PRIMARY_MODEL: ${{ inputs.primary_model }}
           STAGE1_INSTANCES: ${{ steps.frontieror-instances.outputs.stage1_instances }}
@@ -199,50 +203,92 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          if [ "$INTEGRATION" = "oragentbench" ]; then
-            prepare_agent=oracle
-            prepare_model=""
-            if [ "$MODE" != "oracle-controls" ] && [ -n "$MODEL" ]; then
-              prepare_agent="$SCAFFOLD"
-              prepare_model="$MODEL"
-            elif [ "$MODE" = "agent" ]; then
-              echo "::error::mode=agent requires an exact pinned model id"
-              exit 1
-            fi
-            if [ "$prepare_agent" != "oracle" ] && [ -z "$SCAFFOLD_VERSION" ]; then
-              echo "::error::a paid ORAgentBench run requires scaffold_version"
-              exit 1
-            fi
-            scaffold_version_args=()
-            if [ -n "$SCAFFOLD_VERSION" ]; then
-              scaffold_version_args=(--scaffold-version "$SCAFFOLD_VERSION")
-            fi
-            orbench run oragentbench \
-              --source upstream/ORAgentBench \
-              --task "$TASK" \
-              --agent "$prepare_agent" \
-              --model "$prepare_model" \
-              "${scaffold_version_args[@]}" \
-              --date "$CAMPAIGN_DATE" \
-              --workspace out/benchmark-smoke \
-              --prepare-only > out/preflight-run.json
-          else
-            read -r -a stage1_array <<< "$STAGE1_INSTANCES"
-            read -r -a dev_array <<< "$DEV_SET"
-            read -r -a test_array <<< "$TEST_SET"
-            python tools/run_benchmark_smoke.py frontieror \
-              --source upstream/FrontierOR \
-              --paper-id "$PAPER_ID" \
-              --primary-model "$PRIMARY_MODEL" \
-              --stage1-instances "${stage1_array[@]}" \
-              --dev-set "${dev_array[@]}" \
-              --test-set "${test_array[@]}" \
-              --run-id "$RUN_ID" \
-              --receipt out/preflight-receipt.json \
-              --allow-missing-tooling
-          fi
+          read -r -a stage1_array <<< "$STAGE1_INSTANCES"
+          read -r -a dev_array <<< "$DEV_SET"
+          read -r -a test_array <<< "$TEST_SET"
+          python tools/run_benchmark_smoke.py frontieror \
+            --source upstream/FrontierOR \
+            --paper-id "$PAPER_ID" \
+            --primary-model "$PRIMARY_MODEL" \
+            --stage1-instances "${stage1_array[@]}" \
+            --dev-set "${dev_array[@]}" \
+            --test-set "${test_array[@]}" \
+            --run-id "$RUN_ID" \
+            --receipt out/preflight-receipt.json \
+            --allow-missing-tooling
 
-      - name: Let upstream's own wrapper prove the compiled config is consumable
+      - name: Prepare ORAgentBench API-key plan
+        if: >-
+          inputs.integration == 'oragentbench' &&
+          (inputs.mode == 'oracle-controls' || inputs.auth_mode == 'api-key')
+        env:
+          MODE: ${{ inputs.mode }}
+          TASK: ${{ inputs.task }}
+          SCAFFOLD: ${{ inputs.scaffold }}
+          SCAFFOLD_VERSION: ${{ inputs.scaffold_version }}
+          MODEL: ${{ inputs.model }}
+          MODEL_BASE_URL: ${{ vars.MODEL_BASE_URL }}
+          CAMPAIGN_DATE: ${{ inputs.campaign_date }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          prepare_agent=oracle
+          prepare_model=""
+          if [ "$MODE" != "oracle-controls" ] && [ -n "$MODEL" ]; then
+            prepare_agent="$SCAFFOLD"
+            prepare_model="$MODEL"
+          elif [ "$MODE" = "agent" ]; then
+            echo "::error::mode=agent requires an exact pinned model id"
+            exit 1
+          fi
+          scaffold_version_args=()
+          route_args=()
+          if [ "$prepare_agent" != "oracle" ]; then
+            [ -n "$SCAFFOLD_VERSION" ] || { echo "::error::a paid ORAgentBench run requires scaffold_version"; exit 1; }
+            scaffold_version_args=(--scaffold-version "$SCAFFOLD_VERSION")
+            route_args=(--model-base-url "$MODEL_BASE_URL")
+          fi
+          orbench run oragentbench \
+            --source upstream/ORAgentBench \
+            --task "$TASK" \
+            --agent "$prepare_agent" \
+            --model "$prepare_model" \
+            "${scaffold_version_args[@]}" \
+            --auth-mode api-key \
+            "${route_args[@]}" \
+            --date "$CAMPAIGN_DATE" \
+            --workspace out/benchmark-smoke \
+            --prepare-only > out/preflight-run.json
+
+      - name: Prepare ORAgentBench runner-login plan
+        if: >-
+          inputs.integration == 'oragentbench' &&
+          inputs.mode != 'oracle-controls' &&
+          inputs.auth_mode == 'codex-login'
+        env:
+          MODE: ${{ inputs.mode }}
+          TASK: ${{ inputs.task }}
+          SCAFFOLD: ${{ inputs.scaffold }}
+          SCAFFOLD_VERSION: ${{ inputs.scaffold_version }}
+          MODEL: ${{ inputs.model }}
+          CAMPAIGN_DATE: ${{ inputs.campaign_date }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          [ -n "$MODEL" ] || { echo "::error::mode=agent requires an exact pinned model id"; exit 1; }
+          [ -n "$SCAFFOLD_VERSION" ] || { echo "::error::a paid ORAgentBench run requires scaffold_version"; exit 1; }
+          orbench run oragentbench \
+            --source upstream/ORAgentBench \
+            --task "$TASK" \
+            --agent "$SCAFFOLD" \
+            --model "$MODEL" \
+            --scaffold-version "$SCAFFOLD_VERSION" \
+            --auth-mode codex-login \
+            --date "$CAMPAIGN_DATE" \
+            --workspace out/benchmark-smoke \
+            --prepare-only > out/preflight-run.json
+
+      - name: Check upstream ORAgentBench API-key plan
         # ORAgentBench only, and still zero cost: `--dry-run` makes upstream's
         # wrapper transform the config, apply dynamic skills and print the
         # `harbor run` command it would execute, then stop. It needs neither
@@ -251,6 +297,7 @@ jobs:
         if: >-
           inputs.integration == 'oragentbench' &&
           inputs.mode != 'oracle-controls' &&
+          inputs.auth_mode == 'api-key' &&
           inputs.model != ''
         env:
           TASK: ${{ inputs.task }}
@@ -267,10 +314,43 @@ jobs:
             --scaffold "$SCAFFOLD" \
             --model "$MODEL" \
             --scaffold-version "$SCAFFOLD_VERSION" \
+            --auth-mode api-key \
+            --model-base-url "$MODEL_BASE_URL" \
             --date "$CAMPAIGN_DATE" \
             --campaign-slug "oab-${SCAFFOLD}-smoke" \
             --output-root out/benchmark-smoke \
             --upstream-dry-run --execute \
+            --receipt out/upstream-dry-run-receipt.json
+
+      - name: Check upstream ORAgentBench runner-login plan
+        # No provider variables or auth files enter this GitHub-hosted step.
+        # The tool still checks the task policy and therefore rejects any task
+        # that is internet-enabled or is not explicitly network-disabled.
+        if: >-
+          inputs.integration == 'oragentbench' &&
+          inputs.mode != 'oracle-controls' &&
+          inputs.auth_mode == 'codex-login' &&
+          inputs.model != ''
+        env:
+          TASK: ${{ inputs.task }}
+          SCAFFOLD: ${{ inputs.scaffold }}
+          SCAFFOLD_VERSION: ${{ inputs.scaffold_version }}
+          MODEL: ${{ inputs.model }}
+          CAMPAIGN_DATE: ${{ inputs.campaign_date }}
+        run: |
+          set -euo pipefail
+          python tools/run_benchmark_smoke.py oragentbench \
+            --source upstream/ORAgentBench \
+            --task "$TASK" \
+            --scaffold "$SCAFFOLD" \
+            --model "$MODEL" \
+            --scaffold-version "$SCAFFOLD_VERSION" \
+            --auth-mode codex-login \
+            --date "$CAMPAIGN_DATE" \
+            --campaign-slug "oab-${SCAFFOLD}-smoke" \
+            --output-root out/benchmark-smoke \
+            --upstream-dry-run --execute \
+            --require-preconditions \
             --receipt out/upstream-dry-run-receipt.json
 
       - name: Gate
@@ -278,7 +358,12 @@ jobs:
         env:
           MODE: ${{ inputs.mode }}
           INTEGRATION: ${{ inputs.integration }}
+          AUTH_MODE: ${{ inputs.auth_mode }}
+          SCAFFOLD: ${{ inputs.scaffold }}
           ACK: ${{ inputs.acknowledge_cost }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REPOSITORY_IS_PRIVATE: ${{ github.event.repository.private }}
         run: |
           set -euo pipefail
           run_controls=false
@@ -288,6 +373,23 @@ jobs:
           # on a pinned core. Nothing produced on a GitHub-hosted runner is
           # comparable to that, so such a run is exploratory by construction.
           evidence_label=exploratory
+
+          if [ "$MODE" != "validate-only" ] && [ "$REF_NAME" != "$DEFAULT_BRANCH" ]; then
+            echo "::error::self-hosted benchmark paths may run only from the repository default branch"
+            exit 1
+          fi
+          if [ "$MODE" != "validate-only" ] && [ "$REPOSITORY_IS_PRIVATE" != "true" ]; then
+            echo "::error::self-hosted benchmark paths require a private controller repository; the public ORBenchLab repository supports validate-only dispatches"
+            exit 1
+          fi
+          if [ "$MODE" = "agent" ] && [ "$INTEGRATION" = "oragentbench" ] && [ "$AUTH_MODE" = "codex-login" ] && [ "$SCAFFOLD" != "codex" ]; then
+            echo "::error::auth_mode=codex-login requires the codex scaffold"
+            exit 1
+          fi
+          if [ "$MODE" = "agent" ] && [ "$INTEGRATION" = "oragentbench" ] && [ "$AUTH_MODE" = "codex-login" ]; then
+            echo "::error::direct subscription-login container rollout is intentionally disabled; use api-key until a host-side broker keeps the personal login outside the task boundary"
+            exit 1
+          fi
 
           case "$MODE" in
             validate-only)
@@ -302,7 +404,7 @@ jobs:
               ;;
             agent)
               if [ "$ACK" != "i-accept-model-costs" ]; then
-                echo "::error::mode=agent spends money; re-dispatch with acknowledge_cost set to i-accept-model-costs"
+                echo "::error::mode=agent consumes paid API capacity or ChatGPT-plan quota; re-dispatch with acknowledge_cost set to i-accept-model-costs"
                 exit 1
               fi
               if [ "$INTEGRATION" = "oragentbench" ]; then
@@ -342,6 +444,8 @@ jobs:
     environment: controls
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
 
       - name: Fail closed on missing execution prerequisites
         run: |
@@ -448,8 +552,11 @@ jobs:
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
 
-      - name: Fail closed on missing secrets or tooling
+      - name: Fail closed on missing API-key route prerequisites
+        if: inputs.auth_mode == 'api-key'
         env:
           # Referenced only to test for emptiness; never echoed.
           MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
@@ -471,7 +578,8 @@ jobs:
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
           bash .github/scripts/clone-upstream.sh oragentbench upstream
 
-      - name: Doctor, run, ingest and export the shareable evidence
+      - name: Run with API key
+        if: inputs.auth_mode == 'api-key'
         env:
           MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
           MODEL_BASE_URL: ${{ vars.MODEL_BASE_URL }}
@@ -486,9 +594,6 @@ jobs:
           set -euo pipefail
           export PATH="$PWD/.venv/bin:$PATH"
           RUN_WORKSPACE="$(./scripts/validate-run-workspace.sh "$ORBENCH_RUNS_ROOT" agent)"
-          # The exporter creates its destination atomically and deliberately
-          # rejects a pre-existing directory with different contents.
-          mkdir -p out/share
           orbench doctor oragentbench \
             --source upstream/ORAgentBench \
             --task "$TASK" \
@@ -510,6 +615,17 @@ jobs:
             --workspace "$RUN_WORKSPACE" \
             --execute \
             --acknowledge-cost "$ACKNOWLEDGE_COST" > out/agent-run.json
+
+      - name: Ingest and export the shareable evidence
+        env:
+          ORBENCH_RUNS_ROOT: ${{ vars.ORBENCH_RUNS_ROOT }}
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/.venv/bin:$PATH"
+          RUN_WORKSPACE="$(./scripts/validate-run-workspace.sh "$ORBENCH_RUNS_ROOT" agent)"
+          # The exporter creates its destination atomically and deliberately
+          # rejects a pre-existing directory with different contents.
+          mkdir -p out/share
 
           run_root=$(.venv/bin/python -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["run_root"])' out/agent-run.json)
           workspace_real=$(realpath "$RUN_WORKSPACE")
@@ -566,6 +682,8 @@ jobs:
     timeout-minutes: 480
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
 
       - name: Fail closed on missing secrets, licence, images or isolation
         env:
