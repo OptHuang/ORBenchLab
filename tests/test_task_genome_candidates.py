@@ -20,11 +20,19 @@ def test_candidate_genomes_are_source_bound_and_not_packable():
     )
     by_uid = {item["intake_item_uid"]: item for item in shortlist["items"]}
     paths = sorted((root / "docs/task-genomes").glob("*.yaml"))
-    assert {path.stem for path in paths} == {
+    # The directory also contains explicitly labelled local control examples;
+    # only source-bound candidate genomes are subject to this contract.
+    candidate_paths = [
+        path
+        for path in paths
+        if yaml.safe_load(path.read_text(encoding="utf-8")).get("status")
+        == "candidate-not-packable"
+    ]
+    assert {path.stem for path in candidate_paths} == {
         "cir-constraint-audit",
         "multi-agent-vrp-recovery",
     }
-    for path in paths:
+    for path in candidate_paths:
         genome = yaml.safe_load(path.read_text(encoding="utf-8"))
         assert genome["status"] == "candidate-not-packable"
         assert "hooks" not in genome

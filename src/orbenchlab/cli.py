@@ -28,6 +28,7 @@ from . import workflow as workflow_mod
 from . import execution as execution_mod
 from . import export as export_mod
 from . import source_intake as intake_mod
+from . import pipeline as pipeline_mod
 
 PROG = "orbench"
 
@@ -68,6 +69,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_run(sub)
     _add_export(sub)
     _add_intake(sub)
+    _add_pipeline(sub)
     return parser
 
 
@@ -351,6 +353,87 @@ def _cmd_intake_collect(args: argparse.Namespace) -> int:
     # A partial snapshot is useful and is left on disk, but CI/automation must
     # notice that at least one configured source failed.
     return 8 if result.has_errors else 0
+
+
+# --------------------------------------------------------------------------- #
+# unattended final task cards
+# --------------------------------------------------------------------------- #
+
+
+def _add_pipeline(sub: argparse._SubParsersAction) -> None:
+    parser = sub.add_parser(
+        "pipeline",
+        help="build unattended per-task cards from existing evidence",
+        description=(
+            "Join task genomes, screening reports and optional intake metadata into "
+            "deterministic task cards. This is a post-run summarizer: it never calls "
+            "a model, reads raw trajectories, or invents a task."
+        ),
+    )
+    inner = parser.add_subparsers(dest="subcommand")
+    run_parser = inner.add_parser(
+        "run", help="write task-cards.json, task-cards.md and pipeline manifest"
+    )
+    run_parser.add_argument("--tasks", action="append", default=[], help="task genome file or directory")
+    run_parser.add_argument("--screenings", action="append", default=[], help="screening/report file or directory")
+    run_parser.add_argument(
+        "--evidence-root", default="artifacts",
+        help="fallback root searched for *screening*.json when --screenings is omitted",
+    )
+    run_parser.add_argument("--intake", default="", help="optional intake.json provenance bundle")
+    run_parser.add_argument(
+        "--intake-config", default="",
+        help="optional feed config; collect metadata automatically before writing cards",
+    )
+    run_parser.add_argument("--previous", default="", help="prior intake bundle for cross-day deduplication")
+    run_parser.add_argument("--intake-out", default="", help="intake bundle directory (default: OUT/intake)")
+    run_parser.add_argument("--created-at", default="", help="optional deterministic intake timestamp")
+    run_parser.add_argument("--out", required=True, help="output directory")
+    run_parser.set_defaults(handler=_cmd_pipeline_run)
+
+
+def _cmd_pipeline_run(args: argparse.Namespace) -> int:
+    out = Path(args.out)
+    task_inputs = list(args.tasks)
+    if not task_inputs and Path("docs/task-genomes").is_dir():
+        task_inputs = ["docs/task-genomes"]
+    screening_inputs = list(args.screenings)
+    if not screening_inputs and Path(args.evidence_root).is_dir():
+        screening_inputs = [
+            str(path)
+            for path in sorted(Path(args.evidence_root).rglob("*screening*.json"))
+            if path.is_file() and not path.is_symlink()
+        ]
+    intake_path = args.intake or None
+    intake_error = False
+    intake_result: dict[str, Any] | None = None
+    if args.intake_config:
+        feeds = intake_mod.load_feed_config(args.intake_config)
+        collected = intake_mod.collect(
+            feeds,
+            previous=args.previous or None,
+            created_at=args.created_at or None,
+        )
+        intake_paths = intake_mod.write_bundle(collected, args.intake_out or (out / "intake"))
+        intake_path = str(intake_paths["intake"])
+        intake_error = collected.has_errors
+        intake_result = {
+            "intake_id": collected.intake_id,
+            "feeds": len(collected.feeds),
+            "items": len(collected.items),
+            "feed_errors": collected.feed_errors,
+            "written": {key: str(path) for key, path in intake_paths.items()},
+        }
+    result = pipeline_mod.run(
+        out=out,
+        task_inputs=task_inputs,
+        screening_inputs=screening_inputs,
+        intake_path=intake_path,
+    )
+    if intake_result is not None:
+        result["intake"] = intake_result
+    _print_json(result)
+    return 8 if intake_error else 0
 
 
 # --------------------------------------------------------------------------- #

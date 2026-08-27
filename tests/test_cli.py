@@ -220,6 +220,55 @@ def test_report_build_accepts_a_label_the_evidence_supports(capsys, fixtures_dir
     assert code == 0
 
 
+def test_pipeline_run_writes_final_task_cards(capsys, tmp_path):
+    task = tmp_path / "tasks" / "demo.yaml"
+    task.parent.mkdir()
+    task.write_text(
+        "family: demo\n"
+        "title: Demo task\n"
+        "design_goal: Test a coupled rule\n"
+        "difficulty_axes:\n"
+        "  scale:\n"
+        "    levels: [tiny, small]\n",
+        encoding="utf-8",
+    )
+    screening = tmp_path / "screening.json"
+    screening.write_text(
+        json.dumps(
+            {
+                "schema_version": "orbenchlab.screening-report.v1",
+                "tasks": [
+                    {
+                        "task": "demo",
+                        "arms": {
+                            "route-a": {
+                                "n": 1,
+                                "complete": 1,
+                                "metric_n": 1,
+                                "solve_rate": 1.0,
+                                "quality_pass_rate": 1.0,
+                                "mean_feasibility": 1.0,
+                                "infra_exceptions": [],
+                            }
+                        },
+                        "decision": "collect-more-evidence",
+                        "evidence_level": "E3",
+                        "limitations": [],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "out"
+    assert main(["pipeline", "run", "--tasks", str(task), "--screenings", str(screening), "--out", str(out)]) == 0
+    capsys.readouterr()
+    cards = json.loads((out / "task-cards.json").read_text())
+    assert cards["cards"][0]["task_id"] == "demo"
+    assert cards["cards"][0]["performance"]["models"][0]["solve_rate"] == 1.0
+    assert "难度如何调控" in (out / "task-cards.md").read_text()
+
+
 # --------------------------------------------------------------------------- #
 # schema
 # --------------------------------------------------------------------------- #

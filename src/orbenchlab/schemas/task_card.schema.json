@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://orbenchlab.local/schemas/task_card.schema.json",
+  "title": "ORBenchLab task card",
+  "description": "Deterministic per-task summary joining task provenance, difficulty controls, screening metrics, and evidence boundaries.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_card_schema_version", "task_id", "family", "title", "purpose",
+    "source", "difficulty", "performance", "decision", "evidence",
+    "limitations", "intake", "summary_markdown"
+  ],
+  "properties": {
+    "task_card_schema_version": {"const": "orbenchlab.task-card.v1"},
+    "task_id": {"type": "string"},
+    "family": {"type": "string"},
+    "title": {"type": "string"},
+    "purpose": {"type": "string"},
+    "source": {"type": "object", "additionalProperties": true},
+    "difficulty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["axes", "interventions", "declared"],
+      "properties": {
+        "declared": {"type": "boolean"},
+        "axes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["name", "levels"],
+            "properties": {
+              "name": {"type": "string"},
+              "levels": {"type": "array"}
+            }
+          }
+        },
+        "interventions": {"type": ["object", "array"]}
+      }
+    },
+    "performance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["models", "control_screenings", "observed_gaps"],
+      "properties": {
+        "models": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "model", "n_observed", "n_complete", "metric_n", "solve_rate",
+              "quality_pass_rate", "mean_feasibility", "infra_exceptions",
+              "evidence_levels", "source_reports"
+            ],
+            "properties": {
+              "model": {"type": "string"},
+              "n_observed": {"type": "integer", "minimum": 0},
+              "n_complete": {"type": "integer", "minimum": 0},
+              "metric_n": {"type": "integer", "minimum": 0},
+              "solve_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+              "quality_pass_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+              "mean_feasibility": {"type": ["number", "null"], "minimum": 0},
+              "infra_exceptions": {"type": "array", "items": {"type": "string"}},
+              "evidence_levels": {"type": "array", "items": {"type": "string"}},
+              "source_reports": {"type": "array", "items": {"type": "string"}}
+            }
+          }
+        },
+        "control_screenings": {"type": "array"},
+        "observed_gaps": {"type": "array", "items": {"type": "number"}}
+      }
+    },
+    "decision": {
+      "type": "string",
+      "enum": ["keep", "review-promising", "collect-more-evidence", "revise-or-drop", "quarantine"]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "source_reports", "report_digests"],
+      "properties": {
+        "level": {"type": "string"},
+        "source_reports": {"type": "array", "items": {"type": "string"}},
+        "report_digests": {"type": "array", "items": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}}
+      }
+    },
+    "limitations": {"type": "array", "items": {"type": "string"}},
+    "intake": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "present"],
+      "properties": {
+        "path": {"type": ["string", "null"]},
+        "present": {"type": "boolean"}
+      }
+    },
+    "summary_markdown": {"type": "string"}
+  }
+}

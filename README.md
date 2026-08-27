@@ -29,6 +29,33 @@ digests, de-duplicates entries, and writes a human-review queue. It makes no
 model calls, reads no credentials, touches no `raw/` files, and cannot author or
 publish a task. See [`docs/source-intake.md`](docs/source-intake.md).
 
+## Unattended final task cards
+
+Once a daily intake and one or more Harbor screening reports exist, one command
+builds the final view that an operator needs to read:
+
+```bash
+orbench pipeline run \
+  --intake-config intake/or-feeds.example.yaml \
+  --out artifacts/pipeline/$(date -u +%F)
+```
+
+With no `--tasks` or `--screenings`, the command discovers
+`docs/task-genomes/` and `artifacts/**/*screening*.json`. It de-duplicates
+identical report copies by content digest, then writes `task-cards.md`,
+`task-cards.json`, `pipeline-summary.json` and `pipeline-manifest.json`.
+Each card contains the task purpose, declared difficulty axes and levels,
+model/route solve and quality rates, completion and infrastructure exceptions,
+the automatic decision (`keep`, `review-promising`, `collect-more-evidence`,
+`revise-or-drop` or `quarantine`), and an evidence-bound limitations section.
+
+This is an unattended *summarization and gating* stage. It does not silently
+turn a paper into executable code, call a model, or promote a task whose source,
+verifier or difficulty contract is missing. Such candidates are emitted as
+`quarantine` cards with their observed evidence still visible. Harbor/Volc
+execution remains the preceding campaign stage, and live same-checkpoint hint
+injection is not inferred from this report.
+
 ## Why this exists
 
 Benchmark tooling tends to fail in three ways, and each has a countermeasure

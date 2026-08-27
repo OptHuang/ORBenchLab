@@ -1,0 +1,55 @@
+# Offline control example only. This is metadata for the independently
+# verified ORWorkbench fixture; it is not a model-capability result and is not
+# a source-paper reproduction.
+candidate_schema: orbenchlab.task-genome-candidate.v0
+status: example-control-only
+family: jobshop_replan
+title: Job-shop replan control fixture
+design_goal: >-
+  Verify that a task family exposes a feasible baseline, an oracle that passes
+  all hard checks, and a no-op submission that is rejected before any model
+  comparison is attempted.
+source:
+  status: generated-offline-fixture
+  fixture: fixtures/screening/jobshop_replan_offline.json
+  evidence_resolution: caller-asserted
+task_contract:
+  slice: control-screening
+  network_policy: control-local
+  verifier:
+    independent: true
+    checks:
+      - schedule feasibility
+      - oracle pass gate
+      - no-op rejection gate
+      - seed-stability accounting
+  controls:
+    oracle: passes hard checks
+    nop: rejected for missing submission
+acceptance:
+  hard:
+    - oracle and no-op gates pass
+    - every level has the declared seed set
+  evidence:
+    minimum_seeds_per_cell: 2
+    minimum_difficulty_levels: 2
+    required_evidence_level: E3
+difficulty_axes:
+  n_jobs:
+    levels: [2, 4]
+    meaning: number of jobs in the replay fixture
+    expected_direction: harder_with_larger_value
+  seed:
+    levels: [1, 2]
+    meaning: independent deterministic fixture repetitions
+    expected_direction: measure_stability
+interventions:
+  adapter_shape: none
+  hint_ladder:
+    - level: 0
+      text_policy: null-intervention
+screening_decision_rule:
+  keep_if:
+    - oracle_and_nop_gates_pass
+    - seed_stability_is_1.0
+  otherwise: collect-more-evidence

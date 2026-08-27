@@ -10,6 +10,7 @@ from orbenchlab.core import schema as schema_mod
 from orbenchlab.core.schema import SchemaError, SchemaFeatureError
 
 EXPECTED_SCHEMAS = {
+    "task_card.schema.json",
     "normalized_rollout.schema.json",
     "inspection_report.schema.json",
     "plan_ledger.schema.json",
