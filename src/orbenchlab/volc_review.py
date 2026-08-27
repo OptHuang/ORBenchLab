@@ -118,12 +118,18 @@ def _json_object(text: str) -> dict[str, Any]:
     try:
         value = json.loads(candidate)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", candidate, flags=re.S)
-        if not match:
-            raise VolcReviewError("Volc reviewer did not return a JSON object") from None
-        try:
-            value = json.loads(match.group(0))
-        except json.JSONDecodeError:
+        # Models sometimes add a short preamble or trailing prose.  Decode the
+        # first complete object instead of greedily matching through unrelated
+        # braces in that prose; a truncated object still fails closed.
+        decoder = json.JSONDecoder()
+        value = None
+        for match in re.finditer(r"\{", candidate):
+            try:
+                value, _ = decoder.raw_decode(candidate[match.start() :])
+                break
+            except json.JSONDecodeError:
+                continue
+        if value is None:
             raise VolcReviewError("Volc reviewer returned malformed JSON") from None
     if not isinstance(value, dict):
         raise VolcReviewError("Volc reviewer response must be a JSON object")
