@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import stat
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,31 @@ from orbenchlab.cli import main
 
 
 ROOT = Path(__file__).parents[1]
+_REAL_EXTRACT_PAPER_TEXT = factory_blueprints._extract_paper_text
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_paper_text_fixture(monkeypatch: pytest.MonkeyPatch):
+    def fake_extract(paper: Path, **_: object):
+        rendered = b"=== PDF PAGE 1 ===\nFixture paper text\n\n"
+        receipt = {
+            "schema_version": "orbenchlab.paper-text-extraction.v1",
+            "source_content_digest": factory_blueprints._digest_bytes(paper.read_bytes()),
+            "extractor": "test-fixture",
+            "extractor_version": "test-fixture 1",
+            "executable_digest": "sha256:" + "e" * 64,
+            "argv_template": ["<TEST>"],
+            "timeout_sec": 120.0,
+            "max_output_bytes": 64 * 1024 * 1024,
+            "page_count": 1,
+            "text_content_digest": factory_blueprints._digest_bytes(rendered),
+        }
+        receipt["receipt_digest"] = factory_blueprints._digest_bytes(
+            factory_blueprints._canonical(receipt)
+        )
+        return rendered, receipt
+
+    monkeypatch.setattr(factory_blueprints, "_extract_paper_text", fake_extract)
 
 
 def _bound_paper(tmp_path: Path) -> tuple[Path, Path, dict]:
@@ -56,8 +82,10 @@ def test_prepare_workspace_is_bound_idempotent_and_tamper_evident(tmp_path: Path
     )
     assert second == first
     assert first["source_binding_digest"] == provenance["binding_digest"]
+    assert first["paper_text_extraction"]["page_count"] == 1
     assert (workdir / "factory-input/seed-task/task.toml").is_file()
     assert not (workdir / "factory-input/paper.pdf").stat().st_mode & stat.S_IWUSR
+    assert not (workdir / "factory-input/paper.txt").stat().st_mode & stat.S_IWUSR
     assert not (workdir / "factory-input/seed-task").stat().st_mode & stat.S_IWUSR
 
     (workdir / "factory-input/paper-provenance.json").chmod(0o644)
@@ -69,6 +97,51 @@ def test_prepare_workspace_is_bound_idempotent_and_tamper_evident(tmp_path: Path
             seed_task=seed,
             workdir=workdir,
         )
+
+
+def test_bounded_pdf_extraction_adds_page_markers_and_receipt(tmp_path: Path):
+    paper = tmp_path / "paper.pdf"
+    paper.write_bytes(b"bound paper")
+    executable = tmp_path / "fake-pdftotext"
+    executable.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import sys
+            if "-v" in sys.argv:
+                print("pdftotext version fixture")
+            else:
+                sys.stdout.write("first page\\fsecond page\\f")
+            """
+        ),
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    text, receipt = _REAL_EXTRACT_PAPER_TEXT(paper, executable=executable)
+    assert text == (
+        b"=== PDF PAGE 1 ===\nfirst page\n\n"
+        b"=== PDF PAGE 2 ===\nsecond page\n\n"
+    )
+    assert receipt["page_count"] == 2
+    assert receipt["text_content_digest"] == factory_blueprints._digest_bytes(text)
+    unsigned = {key: value for key, value in receipt.items() if key != "receipt_digest"}
+    assert receipt["receipt_digest"] == factory_blueprints._digest_bytes(
+        factory_blueprints._canonical(unsigned)
+    )
+
+
+def test_bounded_pdf_extraction_fails_closed_on_output_limit(tmp_path: Path):
+    paper = tmp_path / "paper.pdf"
+    paper.write_bytes(b"bound paper")
+    executable = tmp_path / "fake-pdftotext"
+    executable.write_text(
+        "#!/usr/bin/env python3\nimport sys\n"
+        "print('fixture') if '-v' in sys.argv else sys.stdout.write('too much text')\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    with pytest.raises(agentic_factory.AgenticFactoryError, match="output_limit_exceeded"):
+        _REAL_EXTRACT_PAPER_TEXT(paper, executable=executable, max_output_bytes=4)
 
 
 def test_default_plan_assigns_all_semantic_stages_to_agent_sessions():

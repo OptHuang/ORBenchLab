@@ -12,7 +12,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
+import subprocess
+import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -22,6 +26,7 @@ from .agentic_factory import AgenticFactoryError, compile_plan
 
 WORKSPACE_SCHEMA_VERSION = "orbenchlab.paper-factory-workspace.v1"
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_MAX_PAPER_TEXT_BYTES = 64 * 1024 * 1024
 
 
 def _digest_bytes(value: bytes) -> str:
@@ -89,12 +94,123 @@ def _make_inputs_read_only(root: Path) -> None:
     root.chmod(0o555)
 
 
+def _extract_paper_text(
+    paper: Path,
+    *,
+    executable: str | Path = "pdftotext",
+    timeout_sec: float = 120.0,
+    max_output_bytes: int = _MAX_PAPER_TEXT_BYTES,
+) -> tuple[bytes, dict[str, Any]]:
+    """Extract a bounded, page-addressable snapshot before any model session.
+
+    Agent sessions should reason over this one immutable extraction instead of
+    repeatedly spending model budget invoking PDF tools. The original PDF is
+    retained so an auditor can still check difficult anchors.
+    """
+
+    if timeout_sec <= 0 or not 1 <= max_output_bytes <= _MAX_PAPER_TEXT_BYTES:
+        raise AgenticFactoryError("paper text extraction bounds are invalid")
+    requested = str(executable)
+    resolved = shutil.which(requested) if not Path(requested).is_absolute() else requested
+    if not resolved or not Path(resolved).is_file():
+        raise AgenticFactoryError("pdftotext executable is unavailable")
+    resolved_path = Path(resolved).resolve()
+    safe_env = {
+        name: os.environ[name]
+        for name in ("PATH", "LANG", "LC_ALL")
+        if name in os.environ
+    }
+    try:
+        version_run = subprocess.run(
+            [str(resolved_path), "-v"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=safe_env,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise AgenticFactoryError("pdftotext version probe failed") from None
+    version_lines = version_run.stdout.decode("utf-8", errors="replace").splitlines()
+    version = version_lines[0][:256] if version_lines else "unknown"
+    command = [str(resolved_path), "-layout", "-enc", "UTF-8", str(paper.resolve()), "-"]
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                env=safe_env,
+                start_new_session=True,
+            )
+        except OSError:
+            raise AgenticFactoryError("pdftotext launch failed") from None
+        deadline = time.monotonic() + timeout_sec
+        failure: str | None = None
+        while process.poll() is None:
+            if time.monotonic() >= deadline:
+                failure = "wall_clock_timeout"
+                break
+            if os.fstat(stdout_file.fileno()).st_size > max_output_bytes:
+                failure = "output_limit_exceeded"
+                break
+            time.sleep(0.05)
+        if failure is not None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            raise AgenticFactoryError(f"pdftotext failed closed: {failure}")
+        if process.returncode != 0:
+            raise AgenticFactoryError("pdftotext rejected the bound paper")
+        output_size = os.fstat(stdout_file.fileno()).st_size
+        if output_size > max_output_bytes:
+            raise AgenticFactoryError("pdftotext failed closed: output_limit_exceeded")
+        stdout_file.seek(0)
+        raw = stdout_file.read(max_output_bytes + 1)
+    try:
+        decoded = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise AgenticFactoryError("pdftotext output is not valid UTF-8") from None
+    pages = decoded.replace("\r\n", "\n").replace("\r", "\n").split("\f")
+    if pages and not pages[-1].strip():
+        pages.pop()
+    if not pages or not any(page.strip() for page in pages):
+        raise AgenticFactoryError("pdftotext produced no paper text")
+    rendered = "".join(
+        f"=== PDF PAGE {index} ===\n{page.strip()}\n\n"
+        for index, page in enumerate(pages, start=1)
+    ).encode("utf-8")
+    receipt = {
+        "schema_version": "orbenchlab.paper-text-extraction.v1",
+        "source_content_digest": _digest_bytes(paper.read_bytes()),
+        "extractor": "pdftotext",
+        "extractor_version": version,
+        "executable_digest": _digest_bytes(resolved_path.read_bytes()),
+        "argv_template": ["-layout", "-enc", "UTF-8", "<BOUND_PAPER>", "-"],
+        "timeout_sec": timeout_sec,
+        "max_output_bytes": max_output_bytes,
+        "page_count": len(pages),
+        "text_content_digest": _digest_bytes(rendered),
+    }
+    receipt["receipt_digest"] = _digest_bytes(_canonical(receipt))
+    return rendered, receipt
+
+
 def prepare_workspace(
     *,
     paper_file: str | Path,
     paper_provenance: str | Path,
     seed_task: str | Path,
     workdir: str | Path,
+    pdftotext_executable: str | Path = "pdftotext",
+    paper_text_timeout_sec: float = 120.0,
 ) -> dict[str, Any]:
     """Create an idempotent, checksummed input workspace for autonomous agents."""
 
@@ -114,14 +230,23 @@ def prepare_workspace(
     if paper_digest != provenance["source_content_digest"]:
         raise AgenticFactoryError("paper bytes do not match bound provenance")
     seed_digest = _tree_digest(seed)
+    paper_text, extraction_receipt = _extract_paper_text(
+        paper,
+        executable=pdftotext_executable,
+        timeout_sec=paper_text_timeout_sec,
+    )
+    paper_text_digest = _digest_bytes(paper_text)
     unsigned_manifest = {
         "schema_version": WORKSPACE_SCHEMA_VERSION,
         "source_binding_digest": provenance["binding_digest"],
         "paper_content_digest": paper_digest,
         "paper_provenance_digest": provenance_digest,
+        "paper_text_digest": paper_text_digest,
+        "paper_text_extraction": extraction_receipt,
         "seed_task_tree_digest": seed_digest,
         "inputs": {
             "paper": "factory-input/paper.pdf",
+            "paper_text": "factory-input/paper.txt",
             "paper_provenance": "factory-input/paper-provenance.json",
             "seed_task": "factory-input/seed-task",
         },
@@ -141,6 +266,7 @@ def prepare_workspace(
             raise AgenticFactoryError("refusing to replace a factory workspace with different inputs")
         if (
             _digest_bytes((input_root / "paper.pdf").read_bytes()) != paper_digest
+            or _digest_bytes((input_root / "paper.txt").read_bytes()) != paper_text_digest
             or _digest_bytes((input_root / "paper-provenance.json").read_bytes())
             != provenance_digest
             or _tree_digest(input_root / "seed-task") != seed_digest
@@ -153,6 +279,7 @@ def prepare_workspace(
     root.mkdir(parents=True, exist_ok=True)
     input_root.mkdir()
     shutil.copy2(paper, input_root / "paper.pdf")
+    (input_root / "paper.txt").write_bytes(paper_text)
     shutil.copy2(provenance_path, input_root / "paper-provenance.json")
     shutil.copytree(seed, input_root / "seed-task", symlinks=False)
     _atomic_json(manifest_path, manifest)
@@ -211,7 +338,9 @@ def paper_to_benchmark_plan(
         raise AgenticFactoryError("paper factory requires at least two distinct reviewer models")
     common = (
         "Use only files inside this workspace. The bound inputs are listed in "
-        "factory-input/workspace-manifest.json. Work autonomously; do not ask a human to choose "
+        "factory-input/workspace-manifest.json. paper.txt is the deterministic, page-marked text "
+        "snapshot; use it before opening paper.pdf, which is retained only for difficult anchor checks. "
+        "Work autonomously; do not ask a human to choose "
         "a task, rubric, hint or model. Cite source pages/sections for paper-derived claims. "
         "Unknown evidence must remain explicitly unknown."
     )
@@ -223,9 +352,9 @@ def paper_to_benchmark_plan(
             + " Read the complete paper. Extract its executable scientific core, assumptions, "
             "available code/data, candidate terminal interactions and non-derivable claims. Write "
             "a structured evidence map with page/section anchors and no task design yet. For this "
-            "stage, inspect only paper.pdf and paper-provenance.json: do not inspect seed-task, run "
-            "solvers/tests, or evaluate an existing task. Extract the PDF text once, write the required "
-            "JSON promptly, validate that JSON locally, and stop.",
+            "stage, inspect only paper.txt, paper.pdf and paper-provenance.json: do not inspect seed-task, "
+            "run solvers/tests, or evaluate an existing task. Do not re-extract the complete PDF: use "
+            "the page markers in paper.txt, write the required JSON promptly, validate it locally, and stop.",
             "factory/evidence/paper-derivation-primary.json",
             model=author_model,
             profile=profile,

@@ -161,6 +161,8 @@ def _add_agent_factory(sub: argparse._SubParsersAction) -> None:
     prepare_parser.add_argument("--reviewer-model", action="append", required=True)
     prepare_parser.add_argument("--frontier-model", required=True)
     prepare_parser.add_argument("--weak-model", required=True)
+    prepare_parser.add_argument("--pdftotext-executable", default="pdftotext")
+    prepare_parser.add_argument("--paper-text-timeout-sec", type=float, default=120.0)
     prepare_parser.add_argument(
         "--profile", choices=["codex", "claude-code"], default="claude-code"
     )
@@ -215,6 +217,8 @@ def _cmd_agent_factory_prepare_paper(args: argparse.Namespace) -> int:
         paper_provenance=args.paper_provenance,
         seed_task=args.seed_task,
         workdir=args.workdir,
+        pdftotext_executable=args.pdftotext_executable,
+        paper_text_timeout_sec=args.paper_text_timeout_sec,
     )
     plan = factory_blueprints_mod.paper_to_benchmark_plan(
         source_binding_digest=manifest["workspace_binding_digest"],

@@ -692,15 +692,18 @@ def _validate_workspace_binding(workdir: Path, plan: Mapping[str, Any]) -> None:
     inputs = manifest.get("inputs")
     if not isinstance(inputs, Mapping):
         raise AgenticFactoryError("factory workspace manifest has no input map")
-    required = {"paper", "paper_provenance", "seed_task"}
+    required = {"paper", "paper_text", "paper_provenance", "seed_task"}
     if set(inputs) != required:
         raise AgenticFactoryError("factory workspace manifest input map is unsupported")
     paper = _artifact_path(workdir, str(inputs["paper"]))
+    paper_text = _artifact_path(workdir, str(inputs["paper_text"]))
     provenance = _artifact_path(workdir, str(inputs["paper_provenance"]))
     seed = _artifact_path(workdir, str(inputs["seed_task"]))
     if (
         not paper.is_file()
         or paper.is_symlink()
+        or not paper_text.is_file()
+        or paper_text.is_symlink()
         or not provenance.is_file()
         or provenance.is_symlink()
         or not seed.is_dir()
@@ -710,6 +713,7 @@ def _validate_workspace_binding(workdir: Path, plan: Mapping[str, Any]) -> None:
     seed_digest, _ = _directory_digest(seed)
     if (
         manifest.get("paper_content_digest") != _file_digest(paper)
+        or manifest.get("paper_text_digest") != _file_digest(paper_text)
         or manifest.get("paper_provenance_digest") != _file_digest(provenance)
         or manifest.get("seed_task_tree_digest") != seed_digest
     ):
