@@ -159,6 +159,16 @@ def test_feed_config_rejects_unknown_keys():
         )
 
 
+def test_feed_tag_order_is_nonsemantic():
+    first = intake.validate_config_mapping(
+        {"version": 1, "feeds": [{"id": "x", "kind": "rss", "url": "https://example.org", "tags": ["z", "a"]}]}
+    )
+    second = intake.validate_config_mapping(
+        {"version": 1, "feeds": [{"id": "x", "kind": "rss", "url": "https://example.org", "tags": ["a", "z"]}]}
+    )
+    assert first[0].to_dict() == second[0].to_dict()
+
+
 def test_partial_feed_failure_is_recorded_without_erasing_success(repo_root):
     good = _fixture_fetcher(repo_root)
 

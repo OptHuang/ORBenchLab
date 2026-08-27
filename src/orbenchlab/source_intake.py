@@ -196,7 +196,7 @@ class FeedSpec:
         enabled = value.get("enabled", True)
         if not isinstance(enabled, bool):
             raise SourceIntakeError(f"feeds[{index}].enabled must be boolean")
-        return cls(feed_id, kind, url, tuple(tags), enabled)
+        return cls(feed_id, kind, url, tuple(sorted(tags)), enabled)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -638,9 +638,9 @@ def _item_from_group(identity_key: str, entries: Sequence[_ParsedEntry]) -> Inta
     )
 
 
-def _load_previous(previous: str | Path | Mapping[str, Any] | None) -> tuple[dict[str, Any], dict[str, str]]:
+def _load_previous(previous: str | Path | Mapping[str, Any] | None) -> dict[str, Any]:
     if previous is None:
-        return {}, {}
+        return {}
     if isinstance(previous, Mapping):
         payload = dict(previous)
     else:
@@ -659,22 +659,13 @@ def _load_previous(previous: str | Path | Mapping[str, Any] | None) -> tuple[dic
     if not isinstance(previous_items, list):
         raise SourceIntakeError("previous intake items must be a list")
     by_identity: dict[str, Any] = {}
-    by_uid_state: dict[str, str] = {}
     for item in previous_items:
         if not isinstance(item, Mapping):
             continue
         identity = str(item.get("identity_key", ""))
-        uid = str(item.get("item_uid", ""))
         if identity:
             by_identity[identity] = item
-        if uid:
-            by_uid_state[uid] = str(item.get("review_state", "pending"))
-    queue = payload.get("review_queue", [])
-    if isinstance(queue, list):
-        for row in queue:
-            if isinstance(row, Mapping) and row.get("item_uid"):
-                by_uid_state[str(row["item_uid"])] = str(row.get("state", "pending"))
-    return by_identity, by_uid_state
+    return by_identity
 
 
 def collect(
@@ -722,7 +713,7 @@ def collect(
         raise SourceIntakeError("created_at must include a timezone")
     config_payload = {"version": 1, "feeds": [feed.to_dict() for feed in validated]}
     config_digest = _digest(_canonical_json(config_payload))
-    previous_by_identity, previous_states = _load_previous(previous)
+    previous_by_identity = _load_previous(previous)
 
     feed_records: list[dict[str, Any]] = []
     occurrences: list[_ParsedEntry] = []
