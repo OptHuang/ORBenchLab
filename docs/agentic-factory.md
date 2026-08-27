@@ -9,6 +9,7 @@ sessions and enforces the parts that should not depend on model judgment:
 - a paper, deterministic page-marked text extraction, provenance and seed-task workspace binding;
 - fixed agent profiles, provider route, model and prompt identity;
 - whole-process time and output limits;
+- bounded `stdout.live` / `stderr.live` traces while each session is running;
 - one atomic receipt per attempt and safe successful-session reuse;
 - required output paths and content digests;
 - crash recovery, factory-level locking and fail-closed quarantine;
@@ -56,6 +57,12 @@ agent output (E1)
 Restarting a model with a hint is not a same-checkpoint intervention. If the
 runtime cannot resume exact state, the intervention stage must record E4 as
 unavailable.
+
+The session runner exposes live trace bytes for monitoring and seals them as
+digest-bound logs on completion. It deliberately reports
+`hint_injection_supported: false`: true E4 injection still requires a runtime
+that can pause and continue the same checkpoint. A monitor that merely starts
+a fresh CLI process with a hint must remain E3.
 
 ## Commands
 

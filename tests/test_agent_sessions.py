@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -182,6 +183,43 @@ def test_same_session_is_serialised_across_processes_and_reused(tmp_path: Path):
         assert process.exitcode == 0
     assert marker.read_text(encoding="utf-8") == "x"
     assert sorted(result["reused"] for result in results) == [False, True]
+
+
+def test_running_session_exposes_bounded_live_trace_then_seals_it(tmp_path: Path):
+    executable = _fixture_cli(tmp_path, "printf first; sleep 0.4; printf second")
+    out = tmp_path / "sessions"
+    kwargs = {
+        "profile": "codex",
+        "stage": "monitored",
+        "model": "fixture-model",
+        "prompt": "monitor",
+        "workdir": tmp_path,
+        "out": out,
+        "timeout_sec": 3,
+        "max_budget_usd": 0.25,
+        "environ": _env("codex"),
+        "executable": executable,
+    }
+    context = multiprocessing.get_context("fork")
+    queue = context.Queue()
+    process = context.Process(target=_concurrent_session, args=(kwargs, queue))
+    process.start()
+    deadline = time.monotonic() + 2
+    observed = None
+    while time.monotonic() < deadline:
+        paths = list(out.glob("*/stdout.live"))
+        if paths and paths[0].read_bytes().startswith(b"first"):
+            observed = paths[0]
+            break
+        time.sleep(0.01)
+    assert observed is not None
+    result = queue.get(timeout=5)
+    process.join(timeout=5)
+    assert process.exitcode == 0
+    session = Path(result["receipt_path"]).parent
+    assert not (session / "stdout.live").exists()
+    assert (session / "stdout.bin").read_bytes() == b"firstsecond"
+    assert result["live_monitoring"]["hint_injection_supported"] is False
 
 
 def test_route_and_environment_fail_closed(tmp_path: Path):

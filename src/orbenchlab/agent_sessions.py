@@ -18,7 +18,7 @@ import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import urlsplit
 
 from .core.errors import ORBenchError
@@ -189,6 +189,7 @@ def _bounded_process(
     stdin: bytes,
     timeout_sec: float,
     max_output_bytes: int,
+    on_chunk: Callable[[str, bytes], None] | None = None,
 ) -> tuple[bytes, bytes, int | None, str | None]:
     """Drain both pipes incrementally and kill the group at either hard bound."""
 
@@ -246,11 +247,16 @@ def _bounded_process(
                 room = max_output_bytes - captured
                 if len(chunk) > room:
                     if room:
-                        chunks[key.data].append(chunk[:room])
+                        bounded = chunk[:room]
+                        chunks[key.data].append(bounded)
+                        if on_chunk is not None:
+                            on_chunk(str(key.data), bounded)
                         captured += room
                     failure = "output_limit_exceeded"
                     break
                 chunks[key.data].append(chunk)
+                if on_chunk is not None:
+                    on_chunk(str(key.data), chunk)
                 captured += len(chunk)
             if failure is not None:
                 break
@@ -434,18 +440,38 @@ def run_session(
             return {**reused, "receipt_path": str(receipt_path), "reused": True}
 
         started = time.monotonic()
-        stdout, stderr, exit_code, failure_class = _bounded_process(
-            command,
-            cwd=cwd,
-            env=child_env,
-            stdin=_stdin(profile, prompt),
-            timeout_sec=timeout_sec,
-            max_output_bytes=max_output_bytes,
-        )
+        live_paths = {
+            "stdout": session_dir / "stdout.live",
+            "stderr": session_dir / "stderr.live",
+        }
+        with live_paths["stdout"].open("wb") as live_stdout, live_paths["stderr"].open(
+            "wb"
+        ) as live_stderr:
+            live_streams = {"stdout": live_stdout, "stderr": live_stderr}
+
+            def write_live(name: str, chunk: bytes) -> None:
+                stream = live_streams[name]
+                stream.write(chunk)
+                stream.flush()
+
+            stdout, stderr, exit_code, failure_class = _bounded_process(
+                command,
+                cwd=cwd,
+                env=child_env,
+                stdin=_stdin(profile, prompt),
+                timeout_sec=timeout_sec,
+                max_output_bytes=max_output_bytes,
+                on_chunk=write_live,
+            )
         usage, usage_parser = _parse_usage(profile, stdout)
 
         _atomic_bytes(session_dir / "stdout.bin", stdout)
         _atomic_bytes(session_dir / "stderr.bin", stderr)
+        for path in live_paths.values():
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
         receipt: dict[str, Any] = {
             "schema_version": "orbenchlab.agent-session.receipt.v1",
             "session_id": session_id,
@@ -478,6 +504,11 @@ def run_session(
                     "failure_class": failure_class,
                 }
             ),
+            "live_monitoring": {
+                "during_execution": ["stdout.live", "stderr.live"],
+                "completed": ["stdout.bin", "stderr.bin"],
+                "hint_injection_supported": False,
+            },
             "usage": usage,
             "usage_parser": usage_parser,
             "evidence_level": "E1-agent-session-process",
@@ -489,6 +520,7 @@ def run_session(
                     "filesystem permissions. Run untrusted stages in an external container/worktree sandbox."
                 ),
                 "This process harness does not provide network isolation.",
+                "Live trace files support monitoring, but this runner does not inject hints into an active checkpoint.",
             ],
         }
         receipt["receipt_digest"] = _digest(receipt)
