@@ -29,6 +29,7 @@ from . import execution as execution_mod
 from . import export as export_mod
 from . import source_intake as intake_mod
 from . import pipeline as pipeline_mod
+from . import task_authoring as authoring_mod
 
 PROG = "orbench"
 
@@ -70,6 +71,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_export(sub)
     _add_intake(sub)
     _add_pipeline(sub)
+    _add_task_author(sub)
     return parser
 
 
@@ -434,6 +436,52 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
         result["intake"] = intake_result
     _print_json(result)
     return 8 if intake_error else 0
+
+
+# --------------------------------------------------------------------------- #
+# paper -> Terminal-Bench Science task authoring gate
+# --------------------------------------------------------------------------- #
+
+
+def _add_task_author(sub: argparse._SubParsersAction) -> None:
+    parser = sub.add_parser(
+        "task-author",
+        help="validate a paper-backed task against the TB-Science authoring gate",
+        description=(
+            "Run deterministic local checks over a candidate Terminal-Bench Science task. "
+            "Semantic rubric criteria remain review items; this command never calls a model."
+        ),
+    )
+    inner = parser.add_subparsers(dest="subcommand")
+    validate_parser = inner.add_parser("validate", help="write an authoring round receipt")
+    validate_parser.add_argument("--task-dir", required=True, help="candidate task directory")
+    validate_parser.add_argument(
+        "--paper-provenance", default="", help="JSON/YAML with title, URL, digest and license status"
+    )
+    validate_parser.add_argument("--round", type=int, default=1, help="authoring iteration number")
+    validate_parser.add_argument("--previous", default="", help="previous authoring receipt for round linkage")
+    validate_parser.add_argument("--out", required=True, help="receipt output directory")
+    validate_parser.set_defaults(handler=_cmd_task_author_validate)
+
+
+def _cmd_task_author_validate(args: argparse.Namespace) -> int:
+    receipt = authoring_mod.validate_task(
+        args.task_dir,
+        paper_provenance=args.paper_provenance or None,
+        round_number=args.round,
+        previous_receipt=args.previous or None,
+    )
+    paths = authoring_mod.write_receipt(receipt, args.out)
+    _print_json(
+        {
+            "decision": receipt["decision"],
+            "round": receipt["round"],
+            "counts": receipt["counts"],
+            "receipt_digest": receipt["receipt_digest"],
+            "written": {key: str(path) for key, path in paths.items()},
+        }
+    )
+    return 8 if receipt["decision"] == "blocked" else 0
 
 
 # --------------------------------------------------------------------------- #

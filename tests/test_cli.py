@@ -269,6 +269,27 @@ def test_pipeline_run_writes_final_task_cards(capsys, tmp_path):
     assert "难度如何调控" in (out / "task-cards.md").read_text()
 
 
+def test_task_author_validate_writes_blocked_receipt(capsys, tmp_path):
+    out = tmp_path / "authoring"
+    task_dir = tmp_path / "missing-task"
+    task_dir.mkdir()
+    code = main(
+        [
+            "task-author",
+            "validate",
+            "--task-dir",
+            str(task_dir),
+            "--out",
+            str(out),
+        ]
+    )
+    assert code == 8
+    payload = _json_out(capsys)
+    assert payload["decision"] == "blocked"
+    assert (out / "authoring-receipt.json").is_file()
+    assert (out / "authoring-receipt.md").is_file()
+
+
 # --------------------------------------------------------------------------- #
 # schema
 # --------------------------------------------------------------------------- #

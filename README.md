@@ -56,6 +56,31 @@ verifier or difficulty contract is missing. Such candidates are emitted as
 execution remains the preceding campaign stage, and live same-checkpoint hint
 injection is not inferred from this report.
 
+## Paper to Terminal-Bench Science task
+
+For a paper-backed candidate, run the authoring gate before packaging anything
+for Harbor:
+
+```bash
+orbench task-author validate \
+  --task-dir path/to/task \
+  --paper-provenance path/to/paper-provenance.json \
+  --round 1 \
+  --out artifacts/task-authoring/round-1
+```
+
+The receipt covers the current TB-Science task-template fields and the 39
+implementation-rubric names. Deterministic checks cover task.toml shape,
+instruction/README/solution/tests presence, executable verification, CTRF
+output, separate no-network verifier configuration, artifact allowlists,
+resource bounds, task metadata, paper digest/license fields, and known security
+hazards. Semantic criteria such as scientific grounding, genuine difficulty,
+novelty, agentic scope, anti-cheat robustness, and test/instruction alignment
+remain explicit `review` items. A receipt is therefore `blocked`,
+`ready-for-human-review`, or `ready-for-harbor-validation`; it is never a
+TB-Science acceptance or PR approval. Later rounds link the previous receipt
+digest so an agent-tuning loop remains auditable.
+
 ## Why this exists
 
 Benchmark tooling tends to fail in three ways, and each has a countermeasure
