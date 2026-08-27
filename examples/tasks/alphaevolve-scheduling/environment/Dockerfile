@@ -1,3 +1,3 @@
-FROM python:3.12-slim
+FROM docker.m.daocloud.io/library/python:3.12-slim
 WORKDIR /root
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
