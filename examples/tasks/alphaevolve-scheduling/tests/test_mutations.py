@@ -39,3 +39,15 @@ def test_fabricated_makespan_is_rejected():
     mutated["makespan"] = 0
     with pytest.raises(AssertionError):
         _check_level(level, mutated, seed)
+
+
+def test_precedence_violation_is_rejected():
+    instance, output = _load()
+    level, schedule, seed = _tiny(instance, output)
+    mutated = deepcopy(schedule)
+    first = next(row for row in mutated["operations"] if row["job_id"] == "J1" and row["operation_index"] == 0)
+    second = next(row for row in mutated["operations"] if row["job_id"] == "J1" and row["operation_index"] == 1)
+    second["start"] = first["start"]
+    second["end"] = second["start"] + (second["end"] - second["start"])
+    with pytest.raises(AssertionError):
+        _check_level(level, mutated, seed)

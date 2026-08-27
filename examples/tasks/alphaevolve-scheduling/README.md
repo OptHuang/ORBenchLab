@@ -8,31 +8,28 @@ paper-to-task mapping and the non-redistribution boundary are recorded in
 
 ## Difficulty
 
-The primary axis is `instance_scale`: `tiny`, `small`, and `medium` increase the
-number of jobs, operations, machine contention, and the size of the search
-space. Each level has three explicit deterministic seeds, so a result can be
-replicated without pretending that one fixture is a seed study. Secondary axes
-are precedence depth and machine coupling. A future hint
-ladder can expose no scaffold, an invariant checklist, or a generic scheduling
-template; it must never reveal a schedule or objective. Difficulty is a
-measured property only after repeated seeds and independent model systems, not
-an assumption from the level names.
+The executable axis is `instance_scale`: `tiny`, `small`, and `medium` increase
+the number of jobs, operations, machine contention, and the search space. Each
+level has three explicit deterministic seeds for replication. Precedence depth
+and machine coupling are properties of these frozen fixtures, not independently
+measured arms. Difficulty is measured only after repeated seeds and independent
+model systems, not assumed from level names.
 
 ## Reference solution
 
-`solution/solve.py` is a deterministic earliest-feasible-start heuristic. It
-constructs a schedule without external packages, recomputes the makespan, and
-writes the exact artifact schema consumed by the verifier. It is a solvability
-control and not a claim that the heuristic is optimal. The task accepts the
-published per-level bounds so agents can improve ordering and local search while
-remaining objectively verifiable.
+`solution/solve.py` and `solution/solver.py` are deterministic earliest-feasible-start
+heuristics. They construct a schedule without external packages, recompute the
+makespan, and write the exact artifact schema consumed by the verifier. The
+verifier reruns `submission/solver.py`, so a hand-written `solution.json` is not
+sufficient. Bounds are recorded in `data/reference-bounds.json` as a transparent
+oracle-control contract, not an optimality claim.
 
 ## Verification
 
-The verifier runs in a separate no-network environment. It checks the output
-schema, operation coverage, job precedence, machine non-overlap, makespan
-recomputation, and the bound for every difficulty level. Tests inspect final
-artifacts rather than the commands used to create them and emit a CTRF report
-at `/logs/verifier/ctrf.json`. Mutation controls should change one invariant at
-a time (duplicate operation, precedence violation, overlap, or fabricated
-makespan) and must be rejected before any model comparison.
+The verifier runs in a separate no-network environment. It reruns the declared
+solver, then checks the output schema, operation coverage, job precedence,
+machine non-overlap, makespan recomputation, and the bound for every difficulty
+level. Tests inspect final artifacts rather than the commands used to create
+them and emit a CTRF report at `/logs/verifier/ctrf.json`. Mutation controls
+change one invariant at a time (duplicate operation, precedence violation,
+overlap, or fabricated makespan) and must be rejected before model comparison.

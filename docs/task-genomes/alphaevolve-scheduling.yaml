@@ -30,21 +30,13 @@ difficulty_axes:
     levels: [tiny, small, medium]
     meaning: jobs, operations and machine contention
     expected_direction: harder_with_larger_value
-  precedence_depth:
-    levels: [shallow, medium, deep]
-    meaning: length of job operation chains
-    expected_direction: measure_not_assume
-  machine_coupling:
-    levels: [low, medium, high]
-    meaning: number of operations competing for one machine
-    expected_direction: measure_not_assume
-  hint_level:
-    levels: [0, 1, 2]
-    meaning: no scaffold, invariant checklist, generic scheduling template
-    expected_direction: easier_with_larger_value
+  seed:
+    levels: [1, 2, 3]
+    meaning: deterministic replication seed, not a difficulty claim
+    expected_direction: measure_stability
 interventions:
   adapter_shape: restart-with-hint
-  hint_ladder: [null-intervention, invariant-checklist, generic-scheduling-template]
+  hint_ladder: [null-intervention]
 screening_decision_rule:
   keep_if: [oracle smoke passes, mutation rejection rate is 1.0, model gap is replicated]
   otherwise: revise-or-collect-more-evidence

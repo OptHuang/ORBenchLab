@@ -2,16 +2,23 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 
 ROOT = Path(os.environ.get("ORBENCH_TASK_ROOT", "/root"))
 INSTANCE = ROOT / "instance.json"
 SUBMISSION = ROOT / "submission" / "solution.json"
+SOLVER = ROOT / "submission" / "solver.py"
 
 
 def _load() -> tuple[dict, dict]:
     assert INSTANCE.is_file(), "frozen instance.json is missing"
+    assert SOLVER.is_file(), "submission/solver.py is missing"
+    env = dict(os.environ)
+    env["ORBENCH_TASK_ROOT"] = str(ROOT)
+    subprocess.run([sys.executable, str(SOLVER)], cwd=ROOT, env=env, check=True, timeout=60)
     assert SUBMISSION.is_file(), "submission/solution.json is missing"
     instance = json.loads(INSTANCE.read_text(encoding="utf-8"))
     output = json.loads(SUBMISSION.read_text(encoding="utf-8"))

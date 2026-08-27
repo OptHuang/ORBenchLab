@@ -2,9 +2,7 @@
   "schema_version": "alphaevolve-scheduling.difficulty.v1",
   "axes": [
     {"name": "instance_scale", "levels": ["tiny", "small", "medium"], "direction": "harder_with_larger_value", "measurement": "verifier_pass_rate_and_makespan_gap"},
-    {"name": "precedence_depth", "levels": [2, 2, 3], "direction": "harder_with_larger_value", "measurement": "critical_path_length"},
-    {"name": "machine_coupling", "levels": ["low", "medium", "high"], "direction": "measure_not_assume", "measurement": "shared_machine_contention"},
-    {"name": "hint_level", "levels": [0, 1, 2], "direction": "easier_with_larger_value", "measurement": "paired_continuation_delta"}
+    {"name": "seed", "levels": [1, 2, 3], "direction": "measure_stability", "measurement": "repeated-seed variance"}
   ],
-  "required_experiment_design": {"seeds_per_cell": 3, "agent_systems": 2, "null_arm": "hint_level=0"}
+  "required_experiment_design": {"seeds_per_cell": 3, "agent_systems": 2, "hint_arm": "not-implemented"}
 }
