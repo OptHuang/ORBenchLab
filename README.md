@@ -81,7 +81,9 @@ remain explicit `review` items. A receipt is therefore `blocked`,
 TB-Science acceptance or PR approval. Later rounds link the previous receipt
 digest so an agent-tuning loop remains auditable. A paper digest without a
 local `source_path` byte match and registry resolution remains a review item;
-the gate does not trust a caller-provided hash as independent evidence.
+the gate does not trust a caller-provided hash as independent evidence. Each
+receipt also records a path-independent `task_tree_digest`, so changes to any
+task file are visible between rounds.
 
 ## Why this exists
 

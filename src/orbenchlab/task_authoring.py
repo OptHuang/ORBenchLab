@@ -189,6 +189,20 @@ def _files_under(root: Path) -> list[Path]:
     )
 
 
+def _task_tree_digest(root: Path) -> str:
+    """Hash task contents using relative paths, never checkout-specific paths."""
+
+    entries: list[dict[str, Any]] = []
+    for path in _files_under(root):
+        entries.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "content_digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+        )
+    return _digest(entries)
+
+
 def _paper_provenance(path: Path | None) -> tuple[dict[str, Any], list[Criterion]]:
     if path is None:
         return {}, [_criterion("paper_provenance", "fail", "paper provenance input is missing")]
@@ -443,6 +457,7 @@ def validate_task(
         "authoring_schema_version": AUTHORING_SCHEMA_VERSION,
         # Keep the receipt digest independent of the checkout's absolute path.
         "task_dir": root.name,
+        "task_tree_digest": _task_tree_digest(root),
         "round": int(round_number),
         "rubric": {
             "commit": RUBRIC_COMMIT,

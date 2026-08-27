@@ -137,6 +137,15 @@ def test_receipt_digest_is_independent_of_checkout_path(tmp_path: Path):
     first = task_authoring.validate_task(first_root, paper_provenance=first_paper)
     second = task_authoring.validate_task(second_root, paper_provenance=second_paper)
     assert first["receipt_digest"] == second["receipt_digest"]
+    assert first["task_tree_digest"] == second["task_tree_digest"]
+
+
+def test_task_tree_digest_changes_when_a_task_file_changes(tmp_path: Path):
+    task = _make_candidate(tmp_path / "jobshop-replan")
+    first = task_authoring.validate_task(task)
+    (task / "instruction.md").write_text("changed\n", encoding="utf-8")
+    second = task_authoring.validate_task(task)
+    assert first["task_tree_digest"] != second["task_tree_digest"]
 
 
 def test_paper_source_digest_mismatch_is_blocked(tmp_path: Path):
