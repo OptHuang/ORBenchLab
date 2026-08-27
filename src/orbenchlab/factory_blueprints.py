@@ -278,6 +278,7 @@ def prepare_workspace(
         raise AgenticFactoryError("new factory workdir must be empty")
     root.mkdir(parents=True, exist_ok=True)
     input_root.mkdir()
+    (input_root / "trusted").mkdir()
     shutil.copy2(paper, input_root / "paper.pdf")
     (input_root / "paper.txt").write_bytes(paper_text)
     shutil.copy2(provenance_path, input_root / "paper-provenance.json")
@@ -303,6 +304,9 @@ def _stage(
     max_output_bytes: int = 8 * 1024 * 1024,
     artifact_max_bytes: int = 256 * 1024 * 1024,
     json_required_keys: Sequence[str] = (),
+    json_key_types: Mapping[str, str] | None = None,
+    json_nonempty_keys: Sequence[str] = (),
+    json_digest_bindings: Mapping[str, str] | None = None,
     additional_outputs: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     required_outputs = [
@@ -311,6 +315,9 @@ def _stage(
             "kind": kind,
             "max_bytes": artifact_max_bytes,
             "json_required_keys": list(json_required_keys),
+            "json_key_types": dict(json_key_types or {}),
+            "json_nonempty_keys": list(json_nonempty_keys),
+            "json_digest_bindings": dict(json_digest_bindings or {}),
         }
     ]
     required_outputs.extend(dict(value) for value in additional_outputs)
@@ -365,7 +372,9 @@ def paper_to_benchmark_plan(
             "available code/data, candidate terminal interactions and non-derivable claims. Write "
             "a structured evidence map with page/section anchors and no task design yet. For this "
             "stage, inspect only paper.txt, paper.pdf and paper-provenance.json: do not inspect seed-task, "
-            "run solvers/tests, or evaluate an existing task. Do not re-extract the complete PDF: use "
+            "run solvers/tests, execute numerical probes, search for counterexamples, derive new results, or "
+            "evaluate an existing task. This is source extraction, not claim verification; preserve uncertainty "
+            "for the independent critic. Do not re-extract the complete PDF: use "
             "the page markers in paper.txt. Produce a complete raw evidence map under 64000 UTF-8 bytes. "
             "Prioritize executable claims and source anchors; do not spend time compressing into the release "
             "schema because the next independent stage owns normalization. Write the raw JSON, validate it, "
@@ -380,12 +389,16 @@ def paper_to_benchmark_plan(
             "paper-derive-normalize",
             "paper evidence contract normalizer",
             common
-            + " Read only factory/evidence/paper-derivation-raw.json and paper-provenance.json; do not reopen "
+            + " Read only factory/evidence/paper-derivation-raw.json and factory-input/paper-provenance.json; do not reopen "
             "paper.txt or paper.pdf. Normalize the raw evidence into a concise JSON object under 32000 UTF-8 "
             "bytes using exactly these semantic sections (metadata keys are allowed): paper, "
             "executable_scientific_core, assumptions, available_artifacts, candidate_terminal_interactions, "
-            "non_derivable_claims, blockers, explicit_unknowns. Preserve source anchors, include no more than "
-            "six task-relevant interactions, validate the JSON and stop immediately.",
+            "non_derivable_claims, blockers, explicit_unknowns. paper and executable_scientific_core must be "
+            "non-empty objects; the remaining semantic sections must be arrays, with assumptions and "
+            "candidate_terminal_interactions non-empty. Also include raw_evidence_digest and "
+            "paper_provenance_digest as lowercase sha256:<64 hex> digests of the exact two input files. "
+            "Preserve source anchors, include no more than six task-relevant interactions, validate the JSON "
+            "and stop immediately.",
             "factory/evidence/paper-derivation-primary.json",
             model=author_model,
             profile=profile,
@@ -401,7 +414,33 @@ def paper_to_benchmark_plan(
                 "non_derivable_claims",
                 "blockers",
                 "explicit_unknowns",
+                "raw_evidence_digest",
+                "paper_provenance_digest",
             ),
+            json_key_types={
+                "paper": "object",
+                "executable_scientific_core": "object",
+                "assumptions": "array",
+                "available_artifacts": "array",
+                "candidate_terminal_interactions": "array",
+                "non_derivable_claims": "array",
+                "blockers": "array",
+                "explicit_unknowns": "array",
+                "raw_evidence_digest": "string",
+                "paper_provenance_digest": "string",
+            },
+            json_nonempty_keys=(
+                "paper",
+                "executable_scientific_core",
+                "assumptions",
+                "candidate_terminal_interactions",
+                "raw_evidence_digest",
+                "paper_provenance_digest",
+            ),
+            json_digest_bindings={
+                "raw_evidence_digest": "factory/evidence/paper-derivation-raw.json",
+                "paper_provenance_digest": "factory-input/paper-provenance.json",
+            },
         ),
         _stage(
             "paper-derive-critic",
@@ -507,9 +546,10 @@ def paper_to_benchmark_plan(
             "runtime-controls",
             "Harbor runtime evidence engineer",
             common
-            + " Use the existing ORBenchLab and Harbor commands to run real Oracle and NOP controls on "
-            "task-v2. Preserve raw job directories and write a runtime index with exact commands, task "
-            "digest, job paths and the generated harbor-control receipt. Never fabricate a passing gate.",
+            + " Do not launch Harbor from this semantic session. The trusted harness must first place "
+            "factory-input/trusted/baseline/harbor-control-screening.json. Validate that receipt with the "
+            "existing ORBenchLab code, bind its exact digest and task digest, and write a runtime index. "
+            "If the trusted receipt is absent, malformed or binds another task, fail instead of fabricating it.",
             "factory/runtime/control-index.json",
             model=author_model,
             profile=profile,
@@ -521,8 +561,10 @@ def paper_to_benchmark_plan(
             "pilot-frontier",
             "frontier-model rollout operator",
             common
-            + f" Run repeated Harbor rollouts of model {frontier_model!r} at the declared no-hint baseline. "
-            "Preserve raw trajectories, verifier outcomes, budgets and run identities in a pilot index.",
+            + f" Do not call a model or launch Harbor. Read the trusted harness output at "
+            "factory-input/trusted/baseline/harbor-model-matrix.json and its sanitized ATIF trace bundle. "
+            f"Extract only model {frontier_model!r}'s repeated no-hint trials, verifier outcomes, budgets and "
+            "trace digests into a pilot index. Fail if the matrix is non-rectangular or incomplete.",
             "factory/runtime/pilot-frontier.json",
             model=frontier_model,
             profile=profile,
@@ -533,8 +575,10 @@ def paper_to_benchmark_plan(
             "pilot-weak",
             "weak-model rollout operator",
             common
-            + f" Run repeated Harbor rollouts of model {weak_model!r} under the exact same baseline budget. "
-            "Preserve raw trajectories, verifier outcomes, budgets and run identities in a pilot index.",
+            + f" Do not call a model or launch Harbor. Read the trusted harness output at "
+            "factory-input/trusted/baseline/harbor-model-matrix.json and its sanitized ATIF trace bundle. "
+            f"Extract only model {weak_model!r}'s trials under the exact same baseline budget into a pilot "
+            "index. Fail if the matrix is non-rectangular or incomplete.",
             "factory/runtime/pilot-weak.json",
             model=weak_model,
             profile=profile,
@@ -558,9 +602,10 @@ def paper_to_benchmark_plan(
             "intervention-study",
             "controlled intervention experimenter",
             common
-            + " For each proposed bottleneck, inspect whether the runtime exposes a real resumable "
-            "checkpoint. If yes, run repeated same-checkpoint continuations with a fixed hint ladder and "
-            "budgets. If not, record E4 as unavailable and run no restart-with-hint masquerading as causal.",
+            + " For each proposed bottleneck, inspect the trusted runtime capability receipt. This factory "
+            "currently exposes no resumable same-checkpoint injection, so record checkpoint_capability=false, "
+            "E4 as unavailable, and a concrete future paired-continuation design. Do not call a model and do "
+            "not run restart-with-hint while masquerading it as causal evidence.",
             "factory/analysis/intervention-study.json",
             model=author_model,
             profile=profile,
@@ -597,9 +642,11 @@ def paper_to_benchmark_plan(
             "calibration",
             "multi-model calibration operator",
             common
-            + " Run repeated Harbor calibration over all variants with frontier and weak models under equal "
-            "budgets. Produce pass counts, uncertainty, infra exclusions, monotonicity checks and model-gap "
-            "metrics. Quarantine variants lacking repeatability or clean Oracle/NOP controls.",
+            + " Do not call a model or launch Harbor. Read the trusted harness receipt at "
+            "factory-input/trusted/difficulty/difficulty-matrix.json, recompute its raw-trial pass counts, "
+            "uncertainty, infra exclusions, monotonicity checks and model-gap metrics, and write a bounded "
+            "calibration index. Quarantine variants lacking a complete equal-budget rectangle or clean "
+            "Oracle/NOP controls.",
             "factory/calibration/calibration-index.json",
             model=author_model,
             profile=profile,

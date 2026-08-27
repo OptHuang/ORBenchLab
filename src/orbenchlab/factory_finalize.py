@@ -336,6 +336,7 @@ def build_receipt(
     factory_error: str | None = None
     try:
         plan = agentic_factory.load_plan(plan_file)
+        agentic_factory._require_hard_budget_profiles(plan)
         run = agentic_factory._load_run(run_file, plan)
         agentic_factory._validate_workspace_binding(workspace.resolve(), plan)
         agentic_factory._validate_run_chain(run_file.parent, plan, run, workspace=workspace.resolve())

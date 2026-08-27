@@ -17,24 +17,31 @@ sessions and enforces the parts that should not depend on model judgment:
 
 ## Default DAG
 
-`orbench agent-factory prepare-paper` compiles an 18-session plan:
+`orbench agent-factory prepare-paper` compiles a 19-session plan:
 
-1. primary paper derivation and independent evidence criticism;
+1. raw paper derivation, schema normalization and independent evidence criticism;
 2. two independent task designs and autonomous selection;
 3. strict task implementation;
 4. independent scientific and verifier reviews;
 5. task repair;
-6. Harbor Oracle/NOP controls;
-7. equal-budget frontier and weak-model pilots;
+6. semantic indexing of trusted Harbor Oracle/NOP controls;
+7. semantic indexing of a trusted equal-budget frontier/weak Harbor model matrix;
 8. verifier-grounded trajectory diagnosis;
 9. same-checkpoint intervention study when real checkpoints exist;
 10. difficulty-lattice design and variant authoring;
-11. repeated multi-model calibration;
+11. semantic recomputation of a trusted repeated multi-model calibration receipt;
 12. final human review summary.
 
-Each semantic node is a real Codex or Claude Code CLI session. Independent
-nodes may use different models. A stage may retry under a new attempt identity,
-but it may not overwrite a historical attempt receipt.
+Each semantic node is a real Claude Code CLI session. Independent nodes may use
+different models. Codex plans can be compiled for inspection, but unattended
+factory execution and promotion fail closed because the current Codex CLI does
+not expose a hard provider-spend flag. A stage may retry under a new attempt
+identity, but it may not overwrite a historical attempt receipt.
+
+Runtime nodes do not ask a semantic agent to assert that it ran Harbor. The
+trusted harness must first write control/model/difficulty receipts under the
+read-only `factory-input/trusted/` boundary; the following agent session may
+analyze them, but cannot create the evidence that unlocks a gate.
 
 ## Evidence boundary
 
@@ -127,6 +134,28 @@ acceptance.
 The finalizer consumes independent receipts; it does not itself launch Docker,
 Harbor or the repeated model campaign. A higher-level unattended controller
 must still execute those commands and pass their exact output paths here.
+
+For a real repeated Harbor coding-agent matrix with verifier outcomes and ATIF
+trajectories, use the bounded launcher. The Claude executable is mounted
+read-only into each task container, avoiding an untrusted runtime download:
+
+```bash
+orbench harbor-model-matrix \
+  --task-dir out/factory-workspace/factory/tasks/task-v2 \
+  --harbor-executable /absolute/path/to/harbor \
+  --claude-executable /absolute/path/to/claude \
+  --model doubao-seed-2.0-pro \
+  --model doubao-seed-2.0-lite \
+  --repetitions 5 \
+  --max-budget-usd 1 \
+  --max-turns 40 \
+  --out out/harbor-model-matrix
+```
+
+The receipt requires every trial to have a complete verifier result and a
+non-empty ATIF trace. Agent budget exhaustion is recorded as a model outcome
+when the verifier still completed; setup/network failures without verifier
+evidence are rejected. This remains E3 because every arm is a fresh restart.
 
 ## Current security boundary
 

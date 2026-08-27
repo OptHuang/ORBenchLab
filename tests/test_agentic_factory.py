@@ -21,7 +21,7 @@ def _factory_process(queue, plan, workdir, out, executable):
             workdir=workdir,
             out=out,
             environments=_environments(),
-            executables={"codex": executable},
+            executables={"claude-code": executable},
         )
         queue.put(("ok", result["status"]))
     except Exception as exc:  # pragma: no cover - delivered to the parent assertion
@@ -32,7 +32,7 @@ def _stage(
     stage_id: str,
     *,
     depends_on: list[str] | None = None,
-    profile: str = "codex",
+    profile: str = "claude-code",
     output: str | None = None,
     max_attempts: int = 1,
 ) -> dict:
@@ -111,7 +111,7 @@ def test_factory_runs_agent_dag_and_resumes_completed_state(tmp_path: Path):
         source_binding_digest=DIGEST,
         stages=[
             _stage("paper-derive"),
-            _stage("paper-critic", depends_on=["paper-derive"], profile="codex"),
+            _stage("paper-critic", depends_on=["paper-derive"]),
         ],
     )
     workdir = tmp_path / "work"
@@ -123,7 +123,7 @@ def test_factory_runs_agent_dag_and_resumes_completed_state(tmp_path: Path):
         workdir=workdir,
         out=out,
         environments=_environments(),
-        executables={"codex": executable, "claude-code": executable},
+        executables={"claude-code": executable},
     )
     assert first["status"] == "semantic-complete-e1"
     assert first["new_stage_attempts"] == 2
@@ -138,7 +138,7 @@ def test_factory_runs_agent_dag_and_resumes_completed_state(tmp_path: Path):
         workdir=workdir,
         out=out,
         environments=_environments(),
-        executables={"codex": executable, "claude-code": executable},
+        executables={"claude-code": executable},
     )
     assert second["status"] == "semantic-complete-e1"
     assert second["resumed"] is True
@@ -161,7 +161,7 @@ def test_factory_quarantines_missing_required_output(tmp_path: Path):
         workdir=workdir,
         out=tmp_path / "run",
         environments=_environments(),
-        executables={"codex": executable},
+        executables={"claude-code": executable},
     )
     assert result["status"] == "quarantined"
     assert result["quarantine"]["stage_id"] == "paper-derive"
@@ -190,7 +190,7 @@ def test_factory_quarantines_output_over_stage_byte_contract(tmp_path: Path):
         workdir=workdir,
         out=tmp_path / "run",
         environments=_environments(),
-        executables={"codex": executable},
+        executables={"claude-code": executable},
     )
     assert result["status"] == "quarantined"
     attempt = json.loads((tmp_path / "run/stages/paper-derive/attempt-001.json").read_text())
@@ -225,11 +225,73 @@ def test_json_output_required_keys_are_enforced(tmp_path: Path):
         workdir=workdir,
         out=tmp_path / "run",
         environments=_environments(),
-        executables={"codex": executable},
+        executables={"claude-code": executable},
     )
     assert result["status"] == "quarantined"
     attempt = json.loads((tmp_path / "run/stages/paper-derive/attempt-001.json").read_text())
     assert "object schema keys" in attempt["failure_detail"]
+
+
+def test_json_output_type_nonempty_and_digest_bindings_are_enforced(tmp_path: Path):
+    source = tmp_path / "source.json"
+    source.write_text('{"bound":true}\n', encoding="utf-8")
+    executable = tmp_path / "bad-contract-agent"
+    executable.write_text(
+        "#!/bin/sh\ncat >/dev/null\nmkdir -p factory\n"
+        "printf '{\"claims\":[],\"source_digest\":\"sha256:wrong\"}\\n' > factory/paper-derive.json\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    stage = _stage("paper-derive")
+    stage["required_outputs"][0].update(
+        {
+            "json_required_keys": ["claims", "source_digest"],
+            "json_key_types": {"claims": "array", "source_digest": "string"},
+            "json_nonempty_keys": ["claims", "source_digest"],
+            "json_digest_bindings": {"source_digest": "source.json"},
+        }
+    )
+    plan = agentic_factory.compile_plan(
+        name="trusted JSON contract",
+        source_binding_digest=DIGEST,
+        stages=[stage],
+    )
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    (workdir / "source.json").write_bytes(source.read_bytes())
+    result = agentic_factory.run_factory(
+        plan,
+        workdir=workdir,
+        out=tmp_path / "run",
+        environments=_environments(),
+        executables={"claude-code": executable},
+    )
+    assert result["status"] == "quarantined"
+    attempt = json.loads((tmp_path / "run/stages/paper-derive/attempt-001.json").read_text())
+    assert "non-empty key contract" in attempt["failure_detail"]
+
+
+def test_json_digest_binding_rejects_wrong_source_digest(tmp_path: Path):
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    source = workdir / "source.json"
+    source.write_text('{"bound":true}\n', encoding="utf-8")
+    output = workdir / "output.json"
+    output.write_text(
+        '{"claims":["bounded"],"source_digest":"sha256:wrong"}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(agentic_factory.AgenticFactoryError, match="digest binding"):
+        agentic_factory._artifact(
+            output,
+            "json",
+            4096,
+            ["claims", "source_digest"],
+            {"claims": "array", "source_digest": "string"},
+            ["claims", "source_digest"],
+            {"source_digest": "source.json"},
+            workdir=workdir,
+        )
 
 
 def test_failed_output_is_archived_and_cannot_contaminate_retry(tmp_path: Path):
@@ -256,7 +318,7 @@ def test_failed_output_is_archived_and_cannot_contaminate_retry(tmp_path: Path):
         workdir=workdir,
         out=out,
         environments=_environments(),
-        executables={"codex": executable},
+        executables={"claude-code": executable},
     )
     assert result["status"] == "semantic-complete-e1"
     first = json.loads((out / "stages/paper-derive/attempt-001.json").read_text())
@@ -294,7 +356,7 @@ def test_oversized_failed_output_is_removed_before_retry(tmp_path: Path):
         workdir=workdir,
         out=out,
         environments=_environments(),
-        executables={"codex": executable},
+        executables={"claude-code": executable},
     )
     assert result["status"] == "semantic-complete-e1"
     first = json.loads((out / "stages/paper-derive/attempt-001.json").read_text())
@@ -333,7 +395,7 @@ def test_failed_directory_output_is_not_merged_into_retry(tmp_path: Path):
         workdir=workdir,
         out=out,
         environments=_environments(),
-        executables={"codex": executable},
+        executables={"claude-code": executable},
     )
     assert result["status"] == "semantic-complete-e1"
     assert not (workdir / "factory/task/stale.txt").exists()
@@ -346,7 +408,7 @@ def test_factory_checkpoint_runs_only_one_ready_stage(tmp_path: Path):
         source_binding_digest=DIGEST,
         stages=[
             _stage("paper-derive"),
-            _stage("paper-critic", depends_on=["paper-derive"], profile="codex"),
+            _stage("paper-critic", depends_on=["paper-derive"]),
         ],
     )
     workdir = tmp_path / "work"
@@ -357,7 +419,7 @@ def test_factory_checkpoint_runs_only_one_ready_stage(tmp_path: Path):
         workdir=workdir,
         out=tmp_path / "run",
         environments=_environments(),
-        executables={"codex": executable, "claude-code": executable},
+        executables={"claude-code": executable},
         max_new_stages=1,
     )
     assert first["status"] == "active"
@@ -369,7 +431,7 @@ def test_factory_checkpoint_runs_only_one_ready_stage(tmp_path: Path):
         workdir=workdir,
         out=tmp_path / "run",
         environments=_environments(),
-        executables={"codex": executable, "claude-code": executable},
+        executables={"claude-code": executable},
     )
     assert final["status"] == "semantic-complete-e1"
     assert final["new_stage_attempts"] == 1
@@ -390,7 +452,7 @@ def test_factory_resume_rejects_tampered_run_and_artifact(tmp_path: Path):
         workdir=workdir,
         out=out,
         environments=_environments(),
-        executables={"codex": executable},
+        executables={"claude-code": executable},
     )
     assert result["status"] == "semantic-complete-e1"
     (workdir / "factory/paper-derive.json").write_text('{"claims":["forged"]}\n')
@@ -400,7 +462,7 @@ def test_factory_resume_rejects_tampered_run_and_artifact(tmp_path: Path):
             workdir=workdir,
             out=out,
             environments=_environments(),
-            executables={"codex": executable},
+            executables={"claude-code": executable},
         )
 
     run_path = out / "factory-run.json"
@@ -413,7 +475,7 @@ def test_factory_resume_rejects_tampered_run_and_artifact(tmp_path: Path):
             workdir=workdir,
             out=out,
             environments=_environments(),
-            executables={"codex": executable},
+            executables={"claude-code": executable},
         )
 
 
@@ -436,7 +498,7 @@ def test_factory_rejects_required_output_through_parent_symlink(tmp_path: Path):
             workdir=workdir,
             out=tmp_path / "run",
             environments=_environments(),
-            executables={"codex": executable},
+            executables={"claude-code": executable},
         )
 
 
@@ -455,6 +517,31 @@ def test_agent_factory_cli_compiles_blueprint(capsys, tmp_path: Path):
     output = json.loads(capsys.readouterr().out)
     assert output["stage_count"] == 1
     assert agentic_factory.load_plan(plan)["factory_id"] == output["factory_id"]
+
+
+def test_factory_rejects_codex_profile_without_hard_provider_budget(tmp_path: Path):
+    stage = _stage("paper-derive", profile="codex")
+    plan = agentic_factory.compile_plan(
+        name="hard budget required",
+        source_binding_digest=DIGEST,
+        stages=[stage],
+    )
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    marker = tmp_path / "launched"
+    executable = tmp_path / "codex-fixture"
+    executable.write_text(f"#!/bin/sh\nprintf launched > '{marker}'\n", encoding="utf-8")
+    executable.chmod(0o755)
+
+    with pytest.raises(agentic_factory.AgenticFactoryError, match="hard provider budget"):
+        agentic_factory.run_factory(
+            plan,
+            workdir=workdir,
+            out=tmp_path / "run",
+            environments=_environments(),
+            executables={"codex": executable},
+        )
+    assert not marker.exists()
 
 
 def test_factory_rejects_rehashed_terminal_status_with_pending_stage(tmp_path: Path):
@@ -506,7 +593,7 @@ def test_completed_attempt_requires_exact_agent_session_binding(tmp_path: Path):
         workdir=workdir,
         out=out,
         environments=_environments(),
-        executables={"codex": executable},
+        executables={"claude-code": executable},
     )
     assert result["status"] == "semantic-complete-e1"
 
@@ -597,7 +684,7 @@ def test_factory_recovers_receipt_written_before_run_state_commit(tmp_path: Path
         workdir=workdir,
         out=out,
         environments=_environments(),
-        executables={"codex": executable},
+        executables={"claude-code": executable},
     )
     assert completed["status"] == "semantic-complete-e1"
 
@@ -619,7 +706,7 @@ def test_factory_recovers_receipt_written_before_run_state_commit(tmp_path: Path
         workdir=workdir,
         out=out,
         environments=_environments(),
-        executables={"codex": executable},
+        executables={"claude-code": executable},
     )
     assert recovered["status"] == "semantic-complete-e1"
     assert len(recovered["stages"]["paper-derive"]["attempts"]) == 1
@@ -644,7 +731,7 @@ def test_factory_quarantines_workspace_secret_leak(tmp_path: Path):
         workdir=workdir,
         out=tmp_path / "run",
         environments=_environments(),
-        executables={"codex": executable},
+        executables={"claude-code": executable},
     )
     assert result["status"] == "quarantined"
     attempt = json.loads((tmp_path / "run/stages/paper-derive/attempt-001.json").read_text())

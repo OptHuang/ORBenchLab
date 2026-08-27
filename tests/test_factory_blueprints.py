@@ -189,6 +189,14 @@ def test_default_plan_assigns_all_semantic_stages_to_agent_sessions():
         "non_derivable_claims",
         "blockers",
         "explicit_unknowns",
+        "raw_evidence_digest",
+        "paper_provenance_digest",
+    }
+    assert normalizer["required_outputs"][0]["json_key_types"]["paper"] == "object"
+    assert normalizer["required_outputs"][0]["json_key_types"]["assumptions"] == "array"
+    assert normalizer["required_outputs"][0]["json_digest_bindings"] == {
+        "paper_provenance_digest": "factory-input/paper-provenance.json",
+        "raw_evidence_digest": "factory/evidence/paper-derivation-raw.json",
     }
     final = next(stage for stage in plan["stages"] if stage["id"] == "final-synthesis")
     assert [output["path"] for output in final["required_outputs"]] == [

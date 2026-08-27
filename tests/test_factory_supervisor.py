@@ -48,13 +48,13 @@ def _fixture(tmp_path: Path):
     plan = agentic_factory.compile_plan(
         name="supervisor", source_binding_digest="sha256:" + "a" * 64,
         stages=[
-            {"id": "task-repair-v2", "role": "author", "profile": "codex", "model": "fixture", "prompt": "write task-repair-v2", "depends_on": [], "timeout_sec": 5, "max_attempts": 1, "max_budget_usd": .1, "required_outputs": [{"path": "factory/tasks/task-v2", "kind": "directory"}]},
-            {"id": "final-synthesis", "role": "summarizer", "profile": "codex", "model": "fixture", "prompt": "write final-synthesis", "depends_on": ["task-repair-v2"], "timeout_sec": 5, "max_attempts": 1, "max_budget_usd": .1, "required_outputs": [{"path": "factory/final/task-review-summary.json", "kind": "json"}, {"path": "factory/final/task-genome.json", "kind": "json"}]},
+            {"id": "task-repair-v2", "role": "author", "profile": "claude-code", "model": "fixture", "prompt": "write task-repair-v2", "depends_on": [], "timeout_sec": 5, "max_attempts": 1, "max_budget_usd": .1, "required_outputs": [{"path": "factory/tasks/task-v2", "kind": "directory"}]},
+            {"id": "final-synthesis", "role": "summarizer", "profile": "claude-code", "model": "fixture", "prompt": "write final-synthesis", "depends_on": ["task-repair-v2"], "timeout_sec": 5, "max_attempts": 1, "max_budget_usd": .1, "required_outputs": [{"path": "factory/final/task-review-summary.json", "kind": "json"}, {"path": "factory/final/task-genome.json", "kind": "json"}]},
         ],
     )
     out = tmp_path / "factory"
     plan_path = agentic_factory.write_plan(plan, out / "plan.json")
-    result = agentic_factory.run_factory(plan, workdir=work, out=out, environments={"codex": {"OPENAI_BASE_URL": "https://ark.cn-beijing.volces.com/api/coding", "OPENAI_API_KEY": "fixture"}}, executables={"codex": agent})
+    result = agentic_factory.run_factory(plan, workdir=work, out=out, environments={"claude-code": PROVIDER}, executables={"claude-code": agent})
     assert result["status"] == "semantic-complete-e1"
     genome = work / "factory/final/task-genome.json"
     return plan_path, out / "factory-run.json", work, work / "factory/tasks/task-v2", provenance, genome
@@ -211,6 +211,40 @@ def test_builtin_provider_workload_has_whole_stage_deadline():
     assert failure == "whole_stage_timeout"
 
 
+def test_builtin_provider_budget_covers_all_reserved_retries():
+    contract = factory_supervisor._provider_budget_contract(
+        semantic_models=["review-a", "review-b"],
+        calibration_models=["frontier", "weak"],
+        repetitions=5,
+        max_external_attempts=3,
+        max_review_tokens=100,
+        max_calibration_tokens=200,
+        timeout_sec=30,
+        builtin_volc=True,
+    )
+    assert contract["per_attempt"]["semantic_review"] == {
+        "requests": 2,
+        "max_output_tokens": 200,
+        "whole_stage_timeout_sec": 30,
+    }
+    assert contract["per_attempt"]["calibration"] == {
+        "requests": 10,
+        "max_output_tokens": 2000,
+        "whole_stage_timeout_sec": 30,
+    }
+    assert contract["total_liability"] == {
+        "requests": 36,
+        "max_output_tokens": 6600,
+        "provider_stage_attempts": 6,
+        "whole_stage_timeout_sec": 180,
+    }
+    assert contract["hard_request_token_enforcement"] is True
+    assert contract["usd_budget"] == {
+        "hard_enforced": False,
+        "status": "unsupported-provider-pricing",
+    }
+
+
 def test_failed_external_stage_stops_after_attempt_cap(tmp_path: Path, monkeypatch):
     plan, run, work, task, paper, genome = _fixture(tmp_path)
     monkeypatch.setattr(
@@ -305,6 +339,14 @@ def test_crashed_paid_stage_consumes_reserved_attempt(tmp_path: Path, monkeypatc
     attempt = reserved["stages"]["semantic_review"]["attempts"][0]
     assert attempt["status"] == "running"
     assert attempt["attempt_id"].startswith("sha256:")
+    assert reserved["provider_budget_status"] == {
+        "reserved_attempts": {"semantic_review": 1, "calibration": 0},
+        "debited_requests": 2,
+        "debited_max_output_tokens": 4800,
+        "remaining_requests": 10,
+        "remaining_max_output_tokens": 24000,
+        "accounting": "full per-attempt liability debited when reservation is persisted",
+    }
 
     def should_not_run(*args, **kwargs):
         raise AssertionError("crashed paid stage was invoked beyond its cap")

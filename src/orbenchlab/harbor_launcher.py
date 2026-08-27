@@ -47,6 +47,8 @@ def _bounded_command(
     log_root: Path,
     timeout_sec: float,
     max_output_bytes: int,
+    extra_env: Mapping[str, str] | None = None,
+    secret_values: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     log_root.mkdir(parents=True, exist_ok=True)
     stdout_path = log_root / "stdout.bin"
@@ -57,6 +59,7 @@ def _bounded_command(
         for name in ("PATH", "DOCKER_HOST", "XDG_RUNTIME_DIR")
         if name in os.environ
     }
+    child_env.update({str(key): str(value) for key, value in (extra_env or {}).items()})
     with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
         process = subprocess.Popen(
             argv,
@@ -81,6 +84,14 @@ def _bounded_command(
                 break
             time.sleep(0.05)
         return_code = process.wait()
+    redacted = False
+    for path in (stdout_path, stderr_path):
+        data = path.read_bytes()
+        for secret in secret_values:
+            if secret and secret.encode() in data:
+                data = data.replace(secret.encode(), b"[REDACTED_PROVIDER_CREDENTIAL]")
+                redacted = True
+        path.write_bytes(data)
     if failure is None and return_code != 0:
         failure = "nonzero_exit"
     receipt = {
@@ -94,6 +105,7 @@ def _bounded_command(
         "max_output_bytes": max_output_bytes,
         "stdout_digest": _file_digest(stdout_path),
         "stderr_digest": _file_digest(stderr_path),
+        "provider_credential_redacted": redacted,
     }
     _atomic_json(log_root / "command-receipt.json", receipt)
     if failure:

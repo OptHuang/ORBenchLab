@@ -42,7 +42,7 @@ def _factory(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
             {
                 "id": "author",
                 "role": "author",
-                "profile": "codex",
+                "profile": "claude-code",
                 "model": "fixture",
                 "prompt": "author task",
                 "depends_on": [],
@@ -59,8 +59,13 @@ def _factory(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
         plan,
         workdir=work,
         out=root,
-        environments={"codex": {"OPENAI_BASE_URL": VOLC, "OPENAI_API_KEY": "fixture"}},
-        executables={"codex": executable},
+        environments={
+            "claude-code": {
+                "ANTHROPIC_BASE_URL": VOLC,
+                "ANTHROPIC_AUTH_TOKEN": "fixture",
+            }
+        },
+        executables={"claude-code": executable},
     )
     assert result["status"] == "semantic-complete-e1"
     return plan_path, root / "factory-run.json", work, work / "factory/tasks/task-v2"

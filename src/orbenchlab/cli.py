@@ -33,6 +33,7 @@ from . import task_authoring as authoring_mod
 from . import volc_review as volc_review_mod
 from . import volc_rollout as volc_rollout_mod
 from . import harbor_controls as harbor_controls_mod
+from . import harbor_model_matrix as harbor_model_matrix_mod
 from . import authoring_loop as authoring_loop_mod
 from . import agent_sessions as agent_sessions_mod
 from . import agentic_factory as agentic_factory_mod
@@ -83,6 +84,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_task_author(sub)
     _add_task_screen(sub)
     _add_harbor_receipt(sub)
+    _add_harbor_model_matrix(sub)
     _add_agent_session(sub)
     _add_agent_factory(sub)
     return parser
@@ -1057,6 +1059,59 @@ def _cmd_harbor_receipt(args: argparse.Namespace) -> int:
             "control_gates": row["control_gates"],
             "report_digest": receipt["report_digest"],
             "written": {key: str(path) for key, path in paths.items()},
+        }
+    )
+    return 0
+
+
+def _add_harbor_model_matrix(sub: argparse._SubParsersAction) -> None:
+    parser = sub.add_parser(
+        "harbor-model-matrix",
+        help="run repeated real Harbor Claude Code trials with ATIF trajectories",
+    )
+    parser.add_argument("--task-dir", required=True)
+    parser.add_argument("--harbor-executable", required=True)
+    parser.add_argument("--claude-executable", required=True)
+    parser.add_argument("--model", action="append", required=True)
+    parser.add_argument("--repetitions", type=int, default=5)
+    parser.add_argument("--max-budget-usd", type=float, default=1.0)
+    parser.add_argument("--max-turns", type=int, default=40)
+    parser.add_argument("--timeout-sec", type=float, default=10_800)
+    parser.add_argument("--out", required=True)
+    parser.set_defaults(handler=_cmd_harbor_model_matrix)
+
+
+def _cmd_harbor_model_matrix(args: argparse.Namespace) -> int:
+    receipt = harbor_model_matrix_mod.launch_matrix(
+        args.task_dir,
+        harbor_executable=args.harbor_executable,
+        claude_executable=args.claude_executable,
+        out=args.out,
+        models=args.model,
+        repetitions=args.repetitions,
+        provider_env={
+            name: os.environ[name]
+            for name in (
+                "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_API_KEY",
+            )
+            if name in os.environ
+        },
+        max_budget_usd=args.max_budget_usd,
+        max_turns=args.max_turns,
+        timeout_sec=args.timeout_sec,
+    )
+    _print_json(
+        {
+            "task": receipt["task"],
+            "models": receipt["models"],
+            "repetitions": receipt["repetitions"],
+            "rectangular": receipt["rectangular"],
+            "evidence_level": receipt["evidence_level"],
+            "checkpoint_capability": receipt["checkpoint_capability"],
+            "receipt_digest": receipt["receipt_digest"],
+            "written": str(Path(args.out) / "harbor-model-matrix.json"),
         }
     )
     return 0

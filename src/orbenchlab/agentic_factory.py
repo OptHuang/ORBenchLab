@@ -42,6 +42,9 @@ _STAGE_ID = re.compile(r"[a-z][a-z0-9-]{0,63}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _PROFILES = frozenset({"codex", "claude-code"})
 _OUTPUT_KINDS = frozenset({"file", "json", "directory"})
+_JSON_TYPES = frozenset(
+    {"array", "boolean", "integer", "null", "number", "object", "string"}
+)
 DEFAULT_MAX_WORKSPACE_BYTES = 1024 * 1024 * 1024
 MAX_WORKSPACE_FILES = 20_000
 MAX_WORKSPACE_FILE_BYTES = 256 * 1024 * 1024
@@ -111,7 +114,18 @@ def _safe_relative_path(value: Any) -> str:
 def _normalise_output(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise AgenticFactoryError("required_outputs entries must be objects")
-    unknown = sorted(set(value) - {"path", "kind", "max_bytes", "json_required_keys"})
+    unknown = sorted(
+        set(value)
+        - {
+            "path",
+            "kind",
+            "max_bytes",
+            "json_required_keys",
+            "json_key_types",
+            "json_nonempty_keys",
+            "json_digest_bindings",
+        }
+    )
     if unknown:
         raise AgenticFactoryError(f"required output has unsupported key(s): {unknown}")
     kind = str(value.get("kind", ""))
@@ -133,11 +147,58 @@ def _normalise_output(value: Any) -> dict[str, Any]:
         or (json_required_keys and kind != "json")
     ):
         raise AgenticFactoryError("json_required_keys must be a unique bounded list for JSON outputs")
+    json_key_types = value.get("json_key_types", {})
+    if (
+        not isinstance(json_key_types, Mapping)
+        or any(
+            not isinstance(key, str)
+            or key not in json_required_keys
+            or expected not in _JSON_TYPES
+            for key, expected in json_key_types.items()
+        )
+        or len(json_key_types) > 64
+        or (json_key_types and kind != "json")
+    ):
+        raise AgenticFactoryError(
+            "json_key_types must map required JSON keys to supported types"
+        )
+    json_nonempty_keys = value.get("json_nonempty_keys", [])
+    if (
+        not isinstance(json_nonempty_keys, list)
+        or any(
+            not isinstance(key, str) or key not in json_required_keys
+            for key in json_nonempty_keys
+        )
+        or len(json_nonempty_keys) != len(set(json_nonempty_keys))
+        or len(json_nonempty_keys) > 64
+        or (json_nonempty_keys and kind != "json")
+    ):
+        raise AgenticFactoryError(
+            "json_nonempty_keys must be a unique subset of required JSON keys"
+        )
+    json_digest_bindings = value.get("json_digest_bindings", {})
+    if not isinstance(json_digest_bindings, Mapping):
+        raise AgenticFactoryError("json_digest_bindings must be an object")
+    normalised_bindings: dict[str, str] = {}
+    for key, target in json_digest_bindings.items():
+        if not isinstance(key, str) or key not in json_required_keys or kind != "json":
+            raise AgenticFactoryError(
+                "json_digest_bindings keys must be required JSON keys"
+            )
+        normalised_bindings[key] = _safe_relative_path(target)
+    if len(normalised_bindings) > 64:
+        raise AgenticFactoryError("json_digest_bindings must be bounded")
+    output_path = _safe_relative_path(value.get("path"))
+    if output_path in normalised_bindings.values():
+        raise AgenticFactoryError("JSON output cannot digest-bind itself")
     return {
-        "path": _safe_relative_path(value.get("path")),
+        "path": output_path,
         "kind": kind,
         "max_bytes": max_bytes,
         "json_required_keys": list(json_required_keys),
+        "json_key_types": dict(sorted(json_key_types.items())),
+        "json_nonempty_keys": list(json_nonempty_keys),
+        "json_digest_bindings": dict(sorted(normalised_bindings.items())),
     }
 
 
@@ -341,6 +402,23 @@ def validate_plan(value: Mapping[str, Any]) -> dict[str, Any]:
     if value.get("maximum_model_liability_usd") != compiled["maximum_model_liability_usd"]:
         raise AgenticFactoryError("factory plan maximum model liability is stale")
     return compiled
+
+
+def _require_hard_budget_profiles(plan: Mapping[str, Any]) -> None:
+    """Reject factory stages whose provider spend cap is not CLI-enforced."""
+
+    unsupported = sorted(
+        str(stage["id"])
+        for stage in plan["stages"]
+        if stage.get("profile") != "claude-code"
+    )
+    if unsupported:
+        raise AgenticFactoryError(
+            "factory execution or promotion requires an agent profile with a hard "
+            "provider budget; Codex CLI does not currently expose one. Unsupported "
+            "stage(s): "
+            + ", ".join(unsupported)
+        )
 
 
 def load_plan(path: str | Path) -> dict[str, Any]:
@@ -785,11 +863,40 @@ def _factory_lock(root: Path):
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
+def _json_type_matches(value: Any, expected: str) -> bool:
+    if expected == "null":
+        return value is None
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "array":
+        return isinstance(value, list)
+    return isinstance(value, Mapping)
+
+
+def _json_value_nonempty(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (Mapping, list)):
+        return bool(value)
+    return value is not None
+
+
 def _artifact(
     path: Path,
     kind: str,
     max_bytes: int,
     json_required_keys: Sequence[str] = (),
+    json_key_types: Mapping[str, str] | None = None,
+    json_nonempty_keys: Sequence[str] = (),
+    json_digest_bindings: Mapping[str, str] | None = None,
+    *,
+    workdir: Path | None = None,
 ) -> dict[str, Any] | None:
     if path.is_symlink():
         raise AgenticFactoryError(f"required output is a symlink: {path.name}")
@@ -809,6 +916,33 @@ def _artifact(
                 raise AgenticFactoryError(
                     f"required JSON output lacks its object schema keys: {path.name}"
                 )
+            if any(
+                not _json_type_matches(document.get(key), expected)
+                for key, expected in (json_key_types or {}).items()
+            ):
+                raise AgenticFactoryError(
+                    f"required JSON output violates its key type contract: {path.name}"
+                )
+            if any(
+                not _json_value_nonempty(document.get(key))
+                for key in json_nonempty_keys
+            ):
+                raise AgenticFactoryError(
+                    f"required JSON output violates its non-empty key contract: {path.name}"
+                )
+            if json_digest_bindings:
+                if workdir is None:
+                    raise AgenticFactoryError("JSON digest bindings require a workspace root")
+                for key, relative in json_digest_bindings.items():
+                    target = _artifact_path(workdir, relative)
+                    if target.is_symlink() or not target.is_file():
+                        raise AgenticFactoryError(
+                            f"required JSON digest target is unavailable: {relative}"
+                        )
+                    if document.get(key) != _file_digest(target):
+                        raise AgenticFactoryError(
+                            f"required JSON digest binding is invalid for key {key}: {path.name}"
+                        )
         return {"content_digest": _file_digest(path), "file_count": 1}
     if not path.is_dir():
         return None
@@ -830,6 +964,10 @@ def _snapshot_outputs(workdir: Path, stage: Mapping[str, Any]) -> dict[str, dict
             output["kind"],
             output["max_bytes"],
             output["json_required_keys"],
+            output["json_key_types"],
+            output["json_nonempty_keys"],
+            output["json_digest_bindings"],
+            workdir=workdir,
         )
         for output in stage["required_outputs"]
     }
@@ -848,6 +986,10 @@ def _validate_outputs(
             output["kind"],
             output["max_bytes"],
             output["json_required_keys"],
+            output["json_key_types"],
+            output["json_nonempty_keys"],
+            output["json_digest_bindings"],
+            workdir=workdir,
         )
         if after is None:
             raise AgenticFactoryError(f"stage {stage['id']} did not create required output {relative}")
@@ -973,6 +1115,7 @@ def _run_factory_locked(
     """
 
     checked = validate_plan(plan)
+    _require_hard_budget_profiles(checked)
     requested_workspace = Path(workdir)
     if requested_workspace.is_symlink() or not requested_workspace.is_dir():
         raise AgenticFactoryError("factory workdir must be a regular directory")

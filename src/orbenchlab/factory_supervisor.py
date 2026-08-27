@@ -187,6 +187,7 @@ def _bind_factory_outputs(
     """Bind supervisor inputs to immutable completed agent-stage artifacts."""
 
     plan = agentic_factory.load_plan(plan_path)
+    agentic_factory._require_hard_budget_profiles(plan)
     run = agentic_factory._load_run(factory_run_path, plan)
     if run.get("status") != "semantic-complete-e1":
         raise FactorySupervisorError("factory run is not semantic-complete-e1")
@@ -278,6 +279,94 @@ def _validate_selected_genome(
             raise FactorySupervisorError(f"task genome difficulty axis is incomplete: {name!r}")
 
 
+def _provider_budget_contract(
+    *,
+    semantic_models: Sequence[str],
+    calibration_models: Sequence[str],
+    repetitions: int,
+    max_external_attempts: int,
+    max_review_tokens: int,
+    max_calibration_tokens: int,
+    timeout_sec: float,
+    builtin_volc: bool,
+) -> dict[str, Any]:
+    """Return the immutable worst-case provider liability for all retries.
+
+    A reserved attempt is charged at its full request/token liability even if
+    the worker crashes before it can return usage.  This keeps recovery from
+    silently restoring provider budget.
+    """
+
+    semantic_requests = len(semantic_models)
+    calibration_requests = len(calibration_models) * repetitions
+    semantic_tokens = semantic_requests * max_review_tokens
+    calibration_tokens = calibration_requests * max_calibration_tokens
+    requests_per_attempt_pair = semantic_requests + calibration_requests
+    tokens_per_attempt_pair = semantic_tokens + calibration_tokens
+    return {
+        "mode": "builtin-volc" if builtin_volc else "external-adapter",
+        "hard_request_token_enforcement": bool(builtin_volc),
+        "request_token_enforcement": (
+            "fixed builtin loops, per-request output-token caps, crash-safe attempt reservations"
+            if builtin_volc
+            else "unsupported inside external adapters"
+        ),
+        "usd_budget": {
+            "hard_enforced": False,
+            "status": "unsupported-provider-pricing",
+        },
+        "max_attempts_per_provider_stage": max_external_attempts,
+        "per_attempt": {
+            "semantic_review": {
+                "requests": semantic_requests,
+                "max_output_tokens": semantic_tokens,
+                "whole_stage_timeout_sec": timeout_sec,
+            },
+            "calibration": {
+                "requests": calibration_requests,
+                "max_output_tokens": calibration_tokens,
+                "whole_stage_timeout_sec": timeout_sec,
+            },
+        },
+        "total_liability": {
+            "requests": requests_per_attempt_pair * max_external_attempts,
+            "max_output_tokens": tokens_per_attempt_pair * max_external_attempts,
+            "provider_stage_attempts": 2 * max_external_attempts,
+            "whole_stage_timeout_sec": 2 * max_external_attempts * timeout_sec,
+        },
+    }
+
+
+def _provider_budget_status(
+    stages: Mapping[str, Any],
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Conservatively debit every reserved provider-stage attempt."""
+
+    per_attempt = contract["per_attempt"]
+    reserved = {}
+    used_requests = 0
+    used_tokens = 0
+    for name in ("semantic_review", "calibration"):
+        stage = stages.get(name, {})
+        attempts = stage.get("attempts", []) if isinstance(stage, Mapping) else []
+        count = len(attempts) if isinstance(attempts, list) else 0
+        reserved[name] = count
+        used_requests += count * int(per_attempt[name]["requests"])
+        used_tokens += count * int(per_attempt[name]["max_output_tokens"])
+    total = contract["total_liability"]
+    return {
+        "reserved_attempts": reserved,
+        "debited_requests": used_requests,
+        "debited_max_output_tokens": used_tokens,
+        "remaining_requests": max(0, int(total["requests"]) - used_requests),
+        "remaining_max_output_tokens": max(
+            0, int(total["max_output_tokens"]) - used_tokens
+        ),
+        "accounting": "full per-attempt liability debited when reservation is persisted",
+    }
+
+
 def run(
     *,
     plan_path: str | Path,
@@ -341,6 +430,16 @@ def run(
     lock = (root / ".supervisor.lock").open("a+b")
     fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
     try:
+        provider_budget = _provider_budget_contract(
+            semantic_models=semantic_review_models,
+            calibration_models=calibration_models,
+            repetitions=repetitions,
+            max_external_attempts=max_external_attempts,
+            max_review_tokens=max_review_tokens,
+            max_calibration_tokens=max_calibration_tokens,
+            timeout_sec=timeout_sec,
+            builtin_volc=builtin_volc,
+        )
         identity = {
             "plan_digest": _digest(Path(plan_path)), "factory_run_digest": _digest(Path(factory_run_path)),
             "task_tree_digest": task_authoring._task_tree_digest(task),
@@ -357,13 +456,7 @@ def run(
             "semantic_review_models": list(semantic_review_models),
             "builtin_volc": bool(builtin_volc),
             "max_external_attempts": max_external_attempts,
-            "provider_budget": {
-                "semantic_requests": len(semantic_review_models),
-                "semantic_max_output_tokens": len(semantic_review_models) * max_review_tokens,
-                "calibration_requests": len(calibration_models) * repetitions,
-                "calibration_max_output_tokens": len(calibration_models) * repetitions * max_calibration_tokens,
-                "whole_stage_timeout_sec": timeout_sec,
-            },
+            "provider_budget": provider_budget,
             "timeout_sec": timeout_sec,
             "provider_route_digest": route_digest,
         }
@@ -378,6 +471,9 @@ def run(
 
         def record(name: str, result: Mapping[str, Any]) -> None:
             state["stages"][name] = dict(result)
+            state["provider_budget_status"] = _provider_budget_status(
+                state["stages"], provider_budget
+            )
             state["status"] = "active"
             _atomic(state_path, state)
 
@@ -386,7 +482,21 @@ def run(
             previous = state["stages"].get(name)
             if previous and previous.get("output_digest") not in (None, actual):
                 raise FactorySupervisorError(f"completed {name} output changed after receipt")
-            record(name, {"status": "reused", "output": str(path), "output_digest": actual})
+            preserved = {}
+            if isinstance(previous, Mapping) and isinstance(previous.get("attempts"), list):
+                preserved = {
+                    "attempt_count": len(previous["attempts"]),
+                    "attempts": list(previous["attempts"]),
+                }
+            record(
+                name,
+                {
+                    "status": "reused",
+                    "output": str(path),
+                    "output_digest": actual,
+                    **preserved,
+                },
+            )
 
         def can_attempt(name: str) -> bool:
             previous = state["stages"].get(name, {})
