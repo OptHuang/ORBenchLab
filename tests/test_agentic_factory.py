@@ -169,6 +169,154 @@ def test_factory_quarantines_missing_required_output(tmp_path: Path):
     assert receipt["failure_class"] == "session_contract_failure"
 
 
+def test_factory_quarantines_output_over_stage_byte_contract(tmp_path: Path):
+    executable = tmp_path / "oversized-output-agent"
+    executable.write_text(
+        "#!/bin/sh\ncat >/dev/null\nmkdir -p factory\nprintf '{\"payload\":\"too-large\"}\\n' > factory/paper-derive.json\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    stage = _stage("paper-derive")
+    stage["required_outputs"][0]["max_bytes"] = 8
+    plan = agentic_factory.compile_plan(
+        name="bounded artifact",
+        source_binding_digest=DIGEST,
+        stages=[stage],
+    )
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    result = agentic_factory.run_factory(
+        plan,
+        workdir=workdir,
+        out=tmp_path / "run",
+        environments=_environments(),
+        executables={"codex": executable},
+    )
+    assert result["status"] == "quarantined"
+    attempt = json.loads((tmp_path / "run/stages/paper-derive/attempt-001.json").read_text())
+    assert attempt["failure_class"] == "session_contract_failure"
+    assert "byte contract" in attempt["failure_detail"]
+
+
+def test_compile_plan_rejects_invalid_output_byte_contract():
+    stage = _stage("paper-derive")
+    stage["required_outputs"][0]["max_bytes"] = 0
+    with pytest.raises(agentic_factory.AgenticFactoryError, match="max_bytes"):
+        agentic_factory.compile_plan(
+            name="invalid artifact bound",
+            source_binding_digest=DIGEST,
+            stages=[stage],
+        )
+
+
+def test_failed_output_is_archived_and_cannot_contaminate_retry(tmp_path: Path):
+    counter = tmp_path / "attempted-once"
+    executable = tmp_path / "retry-agent"
+    executable.write_text(
+        "#!/bin/sh\ncat >/dev/null\nmkdir -p factory\n"
+        f"if [ ! -f '{counter}' ]; then touch '{counter}'; "
+        "printf '{\"claims\":[\"same\"]}\\n' > factory/paper-derive.json; exit 1; fi\n"
+        "printf '{\"claims\":[\"same\"]}\\n' > factory/paper-derive.json\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    plan = agentic_factory.compile_plan(
+        name="clean retry",
+        source_binding_digest=DIGEST,
+        stages=[_stage("paper-derive", max_attempts=2)],
+    )
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    out = tmp_path / "run"
+    result = agentic_factory.run_factory(
+        plan,
+        workdir=workdir,
+        out=out,
+        environments=_environments(),
+        executables={"codex": executable},
+    )
+    assert result["status"] == "semantic-complete-e1"
+    first = json.loads((out / "stages/paper-derive/attempt-001.json").read_text())
+    assert first["status"] == "failed"
+    assert first["retry_safe"] is True
+    assert first["failed_output_snapshots"][0]["preserved"] is True
+    snapshot = out / first["failed_output_snapshots"][0]["snapshot"]
+    assert snapshot.read_text() == '{"claims":["same"]}\n'
+    assert (workdir / "factory/paper-derive.json").read_text() == snapshot.read_text()
+
+
+def test_oversized_failed_output_is_removed_before_retry(tmp_path: Path):
+    counter = tmp_path / "attempted-once"
+    executable = tmp_path / "bounded-retry-agent"
+    executable.write_text(
+        "#!/bin/sh\ncat >/dev/null\nmkdir -p factory\n"
+        f"if [ ! -f '{counter}' ]; then touch '{counter}'; "
+        "printf '{\"payload\":\"too-large\"}\\n' > factory/paper-derive.json; exit 0; fi\n"
+        "printf '{}\\n' > factory/paper-derive.json\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    stage = _stage("paper-derive", max_attempts=2)
+    stage["required_outputs"][0]["max_bytes"] = 8
+    plan = agentic_factory.compile_plan(
+        name="bounded artifact retry",
+        source_binding_digest=DIGEST,
+        stages=[stage],
+    )
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    out = tmp_path / "run"
+    result = agentic_factory.run_factory(
+        plan,
+        workdir=workdir,
+        out=out,
+        environments=_environments(),
+        executables={"codex": executable},
+    )
+    assert result["status"] == "semantic-complete-e1"
+    first = json.loads((out / "stages/paper-derive/attempt-001.json").read_text())
+    assert "byte contract" in first["failure_detail"]
+    assert first["failed_output_snapshots"][0]["preserved"] is True
+    assert (workdir / "factory/paper-derive.json").read_text() == "{}\n"
+
+
+def test_failed_directory_output_is_not_merged_into_retry(tmp_path: Path):
+    counter = tmp_path / "attempted-once"
+    executable = tmp_path / "directory-retry-agent"
+    executable.write_text(
+        "#!/bin/sh\ncat >/dev/null\nmkdir -p factory/task\n"
+        f"if [ ! -f '{counter}' ]; then touch '{counter}'; "
+        "printf stale > factory/task/stale.txt; exit 1; fi\n"
+        "printf clean > factory/task/final.txt\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    stage = _stage(
+        "paper-derive",
+        output="factory/task",
+        max_attempts=2,
+    )
+    stage["required_outputs"][0]["kind"] = "directory"
+    plan = agentic_factory.compile_plan(
+        name="clean directory retry",
+        source_binding_digest=DIGEST,
+        stages=[stage],
+    )
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    out = tmp_path / "run"
+    result = agentic_factory.run_factory(
+        plan,
+        workdir=workdir,
+        out=out,
+        environments=_environments(),
+        executables={"codex": executable},
+    )
+    assert result["status"] == "semantic-complete-e1"
+    assert not (workdir / "factory/task/stale.txt").exists()
+    assert (workdir / "factory/task/final.txt").read_text() == "clean"
+
+
 def test_factory_checkpoint_runs_only_one_ready_stage(tmp_path: Path):
     plan = agentic_factory.compile_plan(
         name="leased worker",

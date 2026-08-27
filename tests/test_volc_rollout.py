@@ -133,13 +133,6 @@ def test_control_gates_require_oracle_acceptance_and_nop_rejection():
 
 
 def _mock_docker_run(monkeypatch, stage: Path, *, ctrf=None, reward=None, returncode=0):
-    class Completed:
-        stdout = "pytest output"
-        stderr = ""
-
-        def __init__(self):
-            self.returncode = returncode
-
     def fake_run(*args, **kwargs):
         logs = stage / "logs/verifier"
         logs.mkdir(parents=True, exist_ok=True)
@@ -147,9 +140,9 @@ def _mock_docker_run(monkeypatch, stage: Path, *, ctrf=None, reward=None, return
             (logs / "ctrf.json").write_text(json.dumps(ctrf))
         if reward is not None:
             (logs / "reward.txt").write_text(str(reward))
-        return Completed()
+        return b"pytest output", b"", returncode, None
 
-    monkeypatch.setattr(volc_rollout.subprocess, "run", fake_run)
+    monkeypatch.setattr(volc_rollout.agent_sessions, "_bounded_process", fake_run)
 
 
 def test_verifier_receipt_fails_closed_when_ctrf_is_missing(monkeypatch, tmp_path):

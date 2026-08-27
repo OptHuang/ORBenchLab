@@ -175,6 +175,13 @@ def test_default_plan_assigns_all_semantic_stages_to_agent_sessions():
     ]
     assert all(stage["profile"] == "claude-code" for stage in plan["stages"])
     assert all(stage["required_outputs"] for stage in plan["stages"])
+    primary = next(stage for stage in plan["stages"] if stage["id"] == "paper-derive-primary")
+    assert primary["required_outputs"][0]["max_bytes"] == 20_000
+    final = next(stage for stage in plan["stages"] if stage["id"] == "final-synthesis")
+    assert [output["path"] for output in final["required_outputs"]] == [
+        "factory/final/task-review-summary.json",
+        "factory/final/task-genome.json",
+    ]
     assert plan["maximum_model_liability_usd"] == 41.0
     assert agentic_factory.validate_plan(plan) == plan
 

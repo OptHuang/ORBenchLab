@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import uuid
 import fcntl
 import copy
@@ -107,16 +108,27 @@ def _safe_relative_path(value: Any) -> str:
     return normalized
 
 
-def _normalise_output(value: Any) -> dict[str, str]:
+def _normalise_output(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise AgenticFactoryError("required_outputs entries must be objects")
-    unknown = sorted(set(value) - {"path", "kind"})
+    unknown = sorted(set(value) - {"path", "kind", "max_bytes"})
     if unknown:
         raise AgenticFactoryError(f"required output has unsupported key(s): {unknown}")
     kind = str(value.get("kind", ""))
     if kind not in _OUTPUT_KINDS:
         raise AgenticFactoryError(f"required output kind must be one of {sorted(_OUTPUT_KINDS)}")
-    return {"path": _safe_relative_path(value.get("path")), "kind": kind}
+    max_bytes = value.get("max_bytes", MAX_WORKSPACE_FILE_BYTES)
+    if (
+        not isinstance(max_bytes, int)
+        or isinstance(max_bytes, bool)
+        or not 1 <= max_bytes <= MAX_WORKSPACE_FILE_BYTES
+    ):
+        raise AgenticFactoryError("required output max_bytes must be in 1..268435456")
+    return {
+        "path": _safe_relative_path(value.get("path")),
+        "kind": kind,
+        "max_bytes": max_bytes,
+    }
 
 
 def _normalise_stage(value: Any) -> dict[str, Any]:
@@ -763,12 +775,14 @@ def _factory_lock(root: Path):
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def _artifact(path: Path, kind: str) -> dict[str, Any] | None:
+def _artifact(path: Path, kind: str, max_bytes: int) -> dict[str, Any] | None:
     if path.is_symlink():
         raise AgenticFactoryError(f"required output is a symlink: {path.name}")
     if kind in {"file", "json"}:
         if not path.is_file():
             return None
+        if path.stat().st_size > max_bytes:
+            raise AgenticFactoryError(f"required output exceeds its byte contract: {path.name}")
         if kind == "json":
             try:
                 json.loads(path.read_text(encoding="utf-8"))
@@ -777,13 +791,22 @@ def _artifact(path: Path, kind: str) -> dict[str, Any] | None:
         return {"content_digest": _file_digest(path), "file_count": 1}
     if not path.is_dir():
         return None
+    byte_count = sum(
+        candidate.stat().st_size
+        for candidate in path.rglob("*")
+        if candidate.is_file() and not candidate.is_symlink()
+    )
+    if byte_count > max_bytes:
+        raise AgenticFactoryError(f"required output exceeds its byte contract: {path.name}")
     digest, count = _directory_digest(path)
     return {"content_digest": digest, "file_count": count}
 
 
 def _snapshot_outputs(workdir: Path, stage: Mapping[str, Any]) -> dict[str, dict[str, Any] | None]:
     return {
-        output["path"]: _artifact(_artifact_path(workdir, output["path"]), output["kind"])
+        output["path"]: _artifact(
+            _artifact_path(workdir, output["path"]), output["kind"], output["max_bytes"]
+        )
         for output in stage["required_outputs"]
     }
 
@@ -796,13 +819,85 @@ def _validate_outputs(
     artifacts: list[dict[str, Any]] = []
     for output in stage["required_outputs"]:
         relative = output["path"]
-        after = _artifact(_artifact_path(workdir, relative), output["kind"])
+        after = _artifact(
+            _artifact_path(workdir, relative), output["kind"], output["max_bytes"]
+        )
         if after is None:
             raise AgenticFactoryError(f"stage {stage['id']} did not create required output {relative}")
         if before.get(relative) == after:
             raise AgenticFactoryError(f"stage {stage['id']} left required output unchanged: {relative}")
         artifacts.append({"path": relative, "kind": output["kind"], **after})
     return artifacts
+
+
+def _quarantine_failed_outputs(
+    workdir: Path,
+    stage: Mapping[str, Any],
+    *,
+    evidence_root: Path,
+    attempt_number: int,
+    secret_values: Sequence[str] = (),
+) -> list[dict[str, Any]]:
+    """Remove stage-owned partial outputs before a retry and preserve safe evidence.
+
+    Required outputs have exclusive, non-overlapping owners in a compiled plan,
+    so moving only those paths cannot remove a dependency artifact. Provider
+    credentials are deleted instead of copied into the evidence tree.
+    """
+
+    secrets = [value.encode("utf-8") for value in secret_values if len(value) >= 8]
+    destination_root = (
+        evidence_root
+        / "stages"
+        / str(stage["id"])
+        / f"failed-output-{attempt_number:03d}"
+    )
+    snapshots: list[dict[str, Any]] = []
+    for output in stage["required_outputs"]:
+        relative = str(output["path"])
+        source = _artifact_path(workdir, relative)
+        if not source.exists():
+            continue
+        if source.is_symlink():
+            raise AgenticFactoryError(f"failed output is a symlink and cannot be retried: {relative}")
+        files = [source] if source.is_file() else [
+            path for path in source.rglob("*") if path.is_file() and not path.is_symlink()
+        ]
+        contains_secret = bool(secrets) and any(
+            secret in path.read_bytes() for path in files for secret in secrets
+        )
+        if contains_secret:
+            if source.is_dir():
+                shutil.rmtree(source)
+            else:
+                source.unlink()
+            snapshots.append(
+                {
+                    "path": relative,
+                    "kind": output["kind"],
+                    "preserved": False,
+                    "reason": "provider-credential-redacted",
+                }
+            )
+            continue
+        destination = destination_root.joinpath(*PurePosixPath(relative).parts)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(destination))
+        if destination.is_file():
+            content_digest, file_count = _file_digest(destination), 1
+        else:
+            content_digest, file_count = _directory_digest(destination)
+        snapshots.append(
+            {
+                "path": relative,
+                "kind": output["kind"],
+                "preserved": True,
+                "snapshot": destination.relative_to(evidence_root).as_posix(),
+                "content_digest": content_digest,
+                "file_count": file_count,
+            }
+        )
+    return snapshots
 
 
 def _stage_prompt(plan: Mapping[str, Any], stage: Mapping[str, Any]) -> str:
@@ -895,6 +990,8 @@ def _run_factory_locked(
         failure_class: str | None = None
         failure_detail: str | None = None
         artifacts: list[dict[str, Any]] = []
+        failed_output_snapshots: list[dict[str, Any]] = []
+        retry_safe = True
         workspace_usage: dict[str, int] | None = None
         stage_environment = (environments or {}).get(stage["profile"], {})
         try:
@@ -927,6 +1024,24 @@ def _run_factory_locked(
         except (AgentSessionError, AgenticFactoryError) as exc:
             failure_class = "session_contract_failure"
             failure_detail = str(exc)
+        if failure_class is not None:
+            try:
+                failed_output_snapshots = _quarantine_failed_outputs(
+                    workspace,
+                    stage,
+                    evidence_root=root,
+                    attempt_number=attempt_number,
+                    secret_values=[
+                        value
+                        for name, value in stage_environment.items()
+                        if "KEY" in name.upper() or "TOKEN" in name.upper()
+                    ],
+                )
+            except AgenticFactoryError as exc:
+                retry_safe = False
+                failure_detail = "; ".join(
+                    value for value in (failure_detail, f"failed-output quarantine: {exc}") if value
+                )
         receipt_path = Path(str(session.get("receipt_path"))) if session and session.get("receipt_path") else None
         attempt = {
             "schema_version": ATTEMPT_SCHEMA_VERSION,
@@ -944,6 +1059,8 @@ def _run_factory_locked(
                 _file_digest(receipt_path) if receipt_path and receipt_path.is_file() else None
             ),
             "output_artifacts": artifacts,
+            "failed_output_snapshots": failed_output_snapshots,
+            "retry_safe": retry_safe,
             "workspace_usage": workspace_usage,
         }
         # Trusted inputs and already-completed outputs are rechecked before the
@@ -963,7 +1080,7 @@ def _run_factory_locked(
         if failure_class is None:
             state["status"] = "completed"
             state["output_artifacts"] = artifacts
-        elif attempt_number >= stage["max_attempts"]:
+        elif not retry_safe or attempt_number >= stage["max_attempts"]:
             state["status"] = "failed"
             run["status"] = "quarantined"
             run["quarantine"] = {

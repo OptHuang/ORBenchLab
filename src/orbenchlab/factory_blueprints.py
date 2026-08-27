@@ -301,7 +301,13 @@ def _stage(
     max_attempts: int = 2,
     max_budget_usd: float = 1.0,
     max_output_bytes: int = 8 * 1024 * 1024,
+    artifact_max_bytes: int = 256 * 1024 * 1024,
+    additional_outputs: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
+    required_outputs = [
+        {"path": output, "kind": kind, "max_bytes": artifact_max_bytes}
+    ]
+    required_outputs.extend(dict(value) for value in additional_outputs)
     return {
         "id": stage_id,
         "role": role,
@@ -313,7 +319,7 @@ def _stage(
         "max_attempts": max_attempts,
         "max_budget_usd": max_budget_usd,
         "max_output_bytes": max_output_bytes,
-        "required_outputs": [{"path": output, "kind": kind}],
+        "required_outputs": required_outputs,
     }
 
 
@@ -354,11 +360,14 @@ def paper_to_benchmark_plan(
             "a structured evidence map with page/section anchors and no task design yet. For this "
             "stage, inspect only paper.txt, paper.pdf and paper-provenance.json: do not inspect seed-task, "
             "run solvers/tests, or evaluate an existing task. Do not re-extract the complete PDF: use "
-            "the page markers in paper.txt, write the required JSON promptly, validate it locally, and stop.",
+            "the page markers in paper.txt. Keep the JSON under 20000 UTF-8 bytes: prioritize executable "
+            "claims, blockers and no more than six task-relevant interactions; omit narrative repetition. "
+            "Write it promptly, validate it locally, and stop immediately after validation.",
             "factory/evidence/paper-derivation-primary.json",
             model=author_model,
             profile=profile,
             max_budget_usd=2.0,
+            artifact_max_bytes=20_000,
         ),
         _stage(
             "paper-derive-critic",
@@ -371,6 +380,7 @@ def paper_to_benchmark_plan(
             profile=profile,
             depends_on=("paper-derive-primary",),
             max_budget_usd=2.0,
+            artifact_max_bytes=20_000,
         ),
         _stage(
             "task-design-a",
@@ -568,13 +578,29 @@ def paper_to_benchmark_plan(
             common
             + " Produce the human review packet: what the task is, paper provenance, verifier contract, "
             "difficulty axes/variants, frontier-vs-weak repeated outcomes, trajectory bottlenecks, intervention "
-            "evidence level, costs, limitations and exact accepted/quarantined artifacts. Never promote from "
-            "agent opinion alone.",
+            "evidence level, costs, limitations and exact accepted/quarantined artifacts. Also select exactly "
+            "one concrete final task directory and write factory/final/task-genome.json for deterministic "
+            "pipeline ingestion. The genome must be a JSON object with family equal to the selected task.toml "
+            "[task].name basename with hyphens replaced by underscores (falling back to the directory name), "
+            "a non-empty title and "
+            "design_goal, a source provenance object, and a non-empty difficulty_axes object whose axes declare "
+            "levels, meaning and expected_direction. source.paper_provenance_digest must be the SHA-256 digest "
+            "of factory-input/paper-provenance.json. Record the selected task path relative to the workspace in "
+            "both outputs as selected_task. Never promote "
+            "from agent opinion alone.",
             "factory/final/task-review-summary.json",
             model=reviewers[0],
             profile=profile,
             depends_on=("calibration",),
             timeout_sec=3600,
+            artifact_max_bytes=64_000,
+            additional_outputs=(
+                {
+                    "path": "factory/final/task-genome.json",
+                    "kind": "json",
+                    "max_bytes": 64_000,
+                },
+            ),
         ),
     ]
     return compile_plan(

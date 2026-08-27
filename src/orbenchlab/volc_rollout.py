@@ -16,14 +16,15 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import shutil
-import subprocess
 import tempfile
 import tomllib
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .core.errors import ORBenchError
+from . import agent_sessions
 from .volc_review import VolcConfig, VolcReviewError, call_reviewer
 
 
@@ -210,17 +211,17 @@ def _run_container(
         "sh",
         "/tests/test.sh",
     ]
-    try:
-        completed = subprocess.run(
-            command,
-            text=True,
-            capture_output=True,
-            timeout=timeout_sec,
-            check=False,
-        )
-    except FileNotFoundError:
-        raise VolcRolloutError("docker executable is not available") from None
-    except subprocess.TimeoutExpired:
+    stdout, stderr, returncode, process_failure = agent_sessions._bounded_process(
+        command,
+        cwd=stage,
+        env=os.environ,
+        stdin=b"",
+        timeout_sec=timeout_sec,
+        max_output_bytes=agent_sessions.DEFAULT_MAX_OUTPUT_BYTES,
+    )
+    if process_failure == "launch_error":
+        raise VolcRolloutError("docker executable is not available")
+    if process_failure == "timeout":
         return {
             "status": "timeout",
             "returncode": None,
@@ -228,17 +229,25 @@ def _run_container(
             "receipt_valid": False,
             "error_type": "VerifierTimeout",
         }
+    if process_failure == "output_limit_exceeded":
+        return {
+            "status": "infra_error",
+            "returncode": returncode,
+            "timeout_sec": timeout_sec,
+            "receipt_valid": False,
+            "error_type": "VerifierOutputLimitExceeded",
+        }
     ctrf = logs / "ctrf.json"
     reward = logs / "reward.txt"
     summary: dict[str, Any] = {
         "status": "infra_error",
-        "returncode": completed.returncode,
+        "returncode": returncode,
         "timeout_sec": timeout_sec,
-        "stdout_digest": _digest(completed.stdout[-8000:]),
-        "stderr_digest": _digest(completed.stderr[-8000:]),
+        "stdout_digest": _digest(stdout[-8000:].decode("utf-8", errors="replace")),
+        "stderr_digest": _digest(stderr[-8000:].decode("utf-8", errors="replace")),
         "receipt_valid": False,
     }
-    if completed.returncode != 0:
+    if returncode != 0:
         summary["error_type"] = "VerifierEntrypointError"
         return summary
     if not ctrf.is_file() or not reward.is_file():

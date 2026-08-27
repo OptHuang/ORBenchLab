@@ -202,12 +202,21 @@ def _add_agent_factory(sub: argparse._SubParsersAction) -> None:
     for flag in ("plan", "factory-run", "workdir", "task-dir", "task-genome", "paper-provenance", "out", "test-image"):
         supervise.add_argument(f"--{flag}", required=True)
     supervise.add_argument("--harbor-executable")
+    supervise.add_argument(
+        "--harbor-cli-executable",
+        help="launch fresh Oracle/NOP Harbor jobs instead of consuming pre-existing jobs",
+    )
     supervise.add_argument("--review-executable")
     supervise.add_argument("--review-model", action="append", required=True)
     supervise.add_argument("--executed-task-dir", default="")
     supervise.add_argument("--oracle-job", default="")
     supervise.add_argument("--nop-job", default="")
     supervise.add_argument("--calibration-executable")
+    supervise.add_argument(
+        "--external-volc-adapters",
+        action="store_true",
+        help="require external review/calibration wrappers instead of built-in Volc stages",
+    )
     supervise.add_argument("--model", action="append", required=True)
     supervise.add_argument("--repetitions", type=int, default=5)
     supervise.add_argument("--timeout-sec", type=float, default=600)
@@ -353,11 +362,13 @@ def _cmd_agent_factory_supervise(args: argparse.Namespace) -> int:
         plan_path=args.plan, factory_run_path=args.factory_run, workdir=args.workdir,
         task_dir=args.task_dir, task_genome=args.task_genome, paper_provenance=args.paper_provenance, out=args.out,
         harbor_executable=args.harbor_executable,
+        harbor_cli_executable=args.harbor_cli_executable,
         semantic_review_executable=args.review_executable,
         semantic_review_models=args.review_model,
         harbor_inputs={"executed_task_dir": args.executed_task_dir, "oracle_job": args.oracle_job, "nop_job": args.nop_job},
         calibration_executable=args.calibration_executable, calibration_models=args.model,
         test_image=args.test_image, repetitions=args.repetitions, timeout_sec=args.timeout_sec,
+        builtin_volc=not args.external_volc_adapters,
         provider_env={name: os.environ[name] for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY") if name in os.environ},
     )
     _print_json({"status": result["status"], "promoted": result["promoted"], "identity_digest": result["identity_digest"], "written": str(Path(args.out) / "supervisor-state.json")})
