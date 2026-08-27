@@ -90,7 +90,7 @@ def test_missing_task_is_blocked(tmp_path: Path):
 
 
 def test_complete_skeleton_is_ready_for_review_and_round_linked(tmp_path: Path):
-    task = _make_candidate(tmp_path / "task")
+    task = _make_candidate(tmp_path / "jobshop-replan")
     paper = _paper(tmp_path / "paper.json")
     first = task_authoring.validate_task(task, paper_provenance=paper, round_number=1)
     assert first["decision"] == "ready-for-human-review"
@@ -116,7 +116,7 @@ def test_complete_skeleton_is_ready_for_review_and_round_linked(tmp_path: Path):
 
 
 def test_rubric_regression_catches_missing_ctrf_and_security_hazard(tmp_path: Path):
-    task = _make_candidate(tmp_path / "task")
+    task = _make_candidate(tmp_path / "jobshop-replan")
     paper = _paper(tmp_path / "paper.json")
     test_script = task / "tests/test.sh"
     test_script.write_text("#!/bin/sh\npytest /tests/test_state.py\n", encoding="utf-8")
@@ -130,10 +130,32 @@ def test_rubric_regression_catches_missing_ctrf_and_security_hazard(tmp_path: Pa
 
 
 def test_receipt_digest_is_independent_of_checkout_path(tmp_path: Path):
-    first_root = _make_candidate(tmp_path / "checkout-a" / "task")
-    second_root = _make_candidate(tmp_path / "checkout-b" / "task")
+    first_root = _make_candidate(tmp_path / "checkout-a" / "jobshop-replan")
+    second_root = _make_candidate(tmp_path / "checkout-b" / "jobshop-replan")
     first_paper = _paper(tmp_path / "checkout-a" / "paper.json")
     second_paper = _paper(tmp_path / "checkout-b" / "paper.json")
     first = task_authoring.validate_task(first_root, paper_provenance=first_paper)
     second = task_authoring.validate_task(second_root, paper_provenance=second_paper)
     assert first["receipt_digest"] == second["receipt_digest"]
+
+
+def test_paper_source_digest_mismatch_is_blocked(tmp_path: Path):
+    task = _make_candidate(tmp_path / "jobshop-replan")
+    source = tmp_path / "paper.txt"
+    source.write_text("paper bytes", encoding="utf-8")
+    provenance = tmp_path / "paper.json"
+    provenance.write_text(
+        json.dumps(
+            {
+                "title": "Paper",
+                "url": "https://arxiv.org/abs/2602.02029",
+                "source_content_digest": "sha256:" + "b" * 64,
+                "source_path": str(source),
+                "license_status": "registry-resolved",
+            }
+        ),
+        encoding="utf-8",
+    )
+    receipt = task_authoring.validate_task(task, paper_provenance=provenance)
+    assert receipt["decision"] == "blocked"
+    assert receipt["provenance_checks"][0]["status"] == "fail"

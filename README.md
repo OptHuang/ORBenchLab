@@ -79,7 +79,9 @@ novelty, agentic scope, anti-cheat robustness, and test/instruction alignment
 remain explicit `review` items. A receipt is therefore `blocked`,
 `ready-for-human-review`, or `ready-for-harbor-validation`; it is never a
 TB-Science acceptance or PR approval. Later rounds link the previous receipt
-digest so an agent-tuning loop remains auditable.
+digest so an agent-tuning loop remains auditable. A paper digest without a
+local `source_path` byte match and registry resolution remains a review item;
+the gate does not trust a caller-provided hash as independent evidence.
 
 ## Why this exists
 

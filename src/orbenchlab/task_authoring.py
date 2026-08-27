@@ -30,8 +30,9 @@ class TaskAuthoringError(ORBenchError):
 
 
 AUTHORING_SCHEMA_VERSION = "orbenchlab.tbscience-authoring.v1"
-RUBRIC_SOURCE = "https://github.com/harbor-framework/terminal-bench-science/blob/main/rubrics/task-implementation.toml"
-TASK_TEMPLATE_SOURCE = "https://github.com/harbor-framework/terminal-bench-science/blob/main/task-template.toml"
+RUBRIC_COMMIT = "9e22cdb7f3201eb2a3f4f06164938d9a8bb39df1"
+RUBRIC_SOURCE = f"https://github.com/harbor-framework/terminal-bench-science/blob/{RUBRIC_COMMIT}/rubrics/task-implementation.toml"
+TASK_TEMPLATE_SOURCE = f"https://github.com/harbor-framework/terminal-bench-science/blob/{RUBRIC_COMMIT}/task-template.toml"
 
 # The names are copied from the current TB-Science implementation rubric.  The
 # list is kept here so a receipt makes rubric coverage explicit even when a
@@ -203,8 +204,23 @@ def _paper_provenance(path: Path | None) -> tuple[dict[str, Any], list[Criterion
         return doc, [_criterion("paper_provenance", "fail", "paper url must be http(s)", path.name)]
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(doc["source_content_digest"])):
         return doc, [_criterion("paper_provenance", "fail", "source_content_digest must be sha256:<64 lowercase hex>", path.name)]
-    if str(doc["license_status"]).lower() in {"unknown", "unverified", "missing"}:
-        return doc, [_criterion("paper_provenance", "review", "license boundary requires human confirmation", path.name)]
+    source_binding = False
+    source_path = doc.get("source_path")
+    if source_path:
+        source = Path(str(source_path))
+        if not source.is_absolute():
+            source = path.parent / source
+        if not source.is_file() or source.is_symlink():
+            return doc, [_criterion("paper_provenance", "fail", "source_path does not resolve to a regular local file", path.name)]
+        actual = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
+        if actual != str(doc["source_content_digest"]):
+            return doc, [_criterion("paper_provenance", "fail", "source_content_digest does not match source_path bytes", path.name)]
+        source_binding = True
+        # Do not put a machine-specific absolute path into the receipt digest.
+        doc["source_path"] = source.name
+    status = str(doc["license_status"]).lower().replace("-", "_")
+    if status != "registry_resolved" or not source_binding:
+        return doc, [_criterion("paper_provenance", "review", "paper/license provenance is caller- or human-asserted; local source binding and registry resolution are still required", path.name)]
     return doc, [_criterion("paper_provenance", "pass", "paper title, URL, content digest and license status are recorded", path.name)]
 
 
@@ -267,13 +283,15 @@ def _mechanical_checks(task_dir: Path, config: Mapping[str, Any], readme: str) -
         + ", ".join(sorted(unknown_keys))
     )
     checks.append(_criterion("task_toml_schema", "pass" if schema_ok else "fail", schema_reason, "task.toml"))
-    checks.append(_criterion("task_name", "pass" if task_name.startswith("terminal-bench-science/") and slug_ok else "fail", "task name uses the TB-Science namespace and <=3 kebab-case words" if task_name.startswith("terminal-bench-science/") and slug_ok else "task.name must be terminal-bench-science/<kebab-slug> with at most 3 words", "task.toml"))
+    name_ok = task_name.startswith("terminal-bench-science/") and slug_ok and task_dir.name == slug
+    checks.append(_criterion("task_name", "pass" if name_ok else "fail", "task name uses the TB-Science namespace, matches the directory and has <=3 kebab-case words" if name_ok else "task.name must be terminal-bench-science/<kebab-slug> with at most 3 words and match the task directory name", "task.toml"))
     checks.append(_criterion("well_specified", "pass" if description.strip() and instruction_text.strip() else "fail", "description and instruction.md are present" if description.strip() and instruction_text.strip() else "task description and instruction.md are required", "task.toml", "instruction.md"))
     checks.append(_criterion("task_readme", "pass" if readme_path.is_file() else "review", "README.md is present" if readme_path.is_file() else "README.md is optional in TB-Science; reviewer should confirm the task has sufficient development context", "README.md"))
     solution_ok = solution_dir.is_dir() and any(solution_dir.iterdir())
     checks.append(_criterion("solution_quality", "pass" if solution_ok else "fail", "solution directory is non-empty" if solution_ok else "solution/ must contain a reference solution", "solution"))
     checks.append(_criterion("verifiable", "pass" if test_script.is_file() and tests_dockerfile.is_file() else "fail", "tests/test.sh and tests/Dockerfile are present" if test_script.is_file() and tests_dockerfile.is_file() else "tests/test.sh and tests/Dockerfile are required", "tests/test.sh", "tests/Dockerfile"))
-    checks.append(_criterion("functional_verification", "pass" if re.search(r"(?:pytest|python(?:3)?\s+[^\n]+|bash\s+[^\n]+)", test_text) else "fail", "test script executes a program/test runner" if re.search(r"(?:pytest|python(?:3)?\s+[^\n]+|bash\s+[^\n]+)", test_text) else "test.sh appears not to execute a test or verifier", "tests/test.sh"))
+    executes_tests = bool(re.search(r"(?m)^\s*(?:pytest|python(?:3)?\b|bash\b)\s+", test_text))
+    checks.append(_criterion("functional_verification", "pass" if executes_tests else "fail", "test script executes a program/test runner" if executes_tests else "test.sh appears not to execute a test or verifier", "tests/test.sh"))
     has_pytest = "pytest" in test_text
     ctrf_ok = bool(re.search(r"--ctrf(?:\s+|=).*(?:/logs/verifier/ctrf\.json|ctrf\.json)", test_text))
     ctrf_status = "pass" if (has_pytest and ctrf_ok) else "fail" if has_pytest else "review"
@@ -320,7 +338,14 @@ def _mechanical_checks(task_dir: Path, config: Mapping[str, Any], readme: str) -
         for path in task_dir.iterdir()
         if path.name not in _ALLOWED_ROOT_FILES and path.name not in _ALLOWED_ROOT_DIRS
     )
-    checks.append(_criterion("no_extraneous_files", "pass" if not extras else "fail", "root contains only task-template files/directories" if not extras else "unexpected root entries: " + ", ".join(extras), "task directory"))
+    junk_names = {"__pycache__", ".pytest_cache", ".mypy_cache", ".DS_Store"}
+    nested_junk = sorted(
+        path.relative_to(task_dir).as_posix()
+        for path in task_dir.rglob("*")
+        if path.name in junk_names or path.suffix == ".pyc"
+    )
+    all_extras = extras + nested_junk
+    checks.append(_criterion("no_extraneous_files", "pass" if not all_extras else "fail", "task tree has no unreviewed root entries or generated caches" if not all_extras else "unexpected task-tree entries: " + ", ".join(all_extras), "task directory"))
     checks.append(_criterion("structured_data_schema", "pass" if any(path.suffix in {".json", ".csv", ".jsonl"} for path in _files_under(task_dir)) else "review", "task contains structured data artifacts" if any(path.suffix in {".json", ".csv", ".jsonl"} for path in _files_under(task_dir)) else "structured output schema needs reviewer confirmation"))
     checks.append(_criterion("do_not_modify_enforced", "pass" if re.search(r"do not modify|must not modify|leave .*unchanged", instruction_text, re.I) else "review", "instruction states immutable inputs" if re.search(r"do not modify|must not modify|leave .*unchanged", instruction_text, re.I) else "reviewer must confirm whether immutable inputs need an explicit contract", "instruction.md"))
     return checks
@@ -420,6 +445,7 @@ def validate_task(
         "task_dir": root.name,
         "round": int(round_number),
         "rubric": {
+            "commit": RUBRIC_COMMIT,
             "implementation_source": RUBRIC_SOURCE,
             "task_template_source": TASK_TEMPLATE_SOURCE,
             "implementation_criteria_count": len(IMPLEMENTATION_CRITERIA),
@@ -477,6 +503,7 @@ __all__ = [
     "AUTHORING_SCHEMA_VERSION",
     "IMPLEMENTATION_CRITERIA",
     "PROPOSAL_CRITERIA",
+    "RUBRIC_COMMIT",
     "RUBRIC_SOURCE",
     "TASK_TEMPLATE_SOURCE",
     "TaskAuthoringError",
