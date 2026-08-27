@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from orbenchlab import source_intake as intake
+from orbenchlab import task_authoring
 from orbenchlab.core import schema as schema_mod
 from orbenchlab.cli import main
 
@@ -199,6 +200,62 @@ def test_bundle_refuses_different_overwrite(repo_root, tmp_path):
     altered = intake.collect(_feeds(), fetcher=_fixture_fetcher(repo_root), created_at="2026-08-28T00:00:00Z")
     with pytest.raises(intake.SourceIntakeError, match="refusing to overwrite"):
         intake.write_bundle(altered, out)
+
+
+def test_bind_paper_rehashes_source_bytes_and_validates_bundle(repo_root, tmp_path):
+    result = intake.collect(
+        _feeds(), fetcher=_fixture_fetcher(repo_root), created_at="2026-08-27T00:00:00Z"
+    )
+    bundle = tmp_path / "bundle"
+    intake.write_bundle(result, bundle)
+    item = next(value for value in result.items if value.source_kind == "arxiv")
+    paper = tmp_path / "paper.pdf"
+    paper.write_bytes(b"%PDF-1.4 exact fixture bytes\n")
+
+    binding = intake.bind_paper(
+        bundle,
+        item_uid=item.item_uid,
+        source_file=paper,
+        license_status="registry-resolved",
+    )
+
+    assert binding["title"] == item.title
+    assert binding["url"] == item.canonical_url
+    assert binding["source_content_digest"] != item.content_digest
+    assert binding["source_path"] == str(paper.resolve())
+    written = intake.write_paper_binding(binding, tmp_path / "bound")
+    assert written.name == "paper-provenance.json"
+    assert json.loads(written.read_text())["binding_digest"] == binding["binding_digest"]
+    _, checks = task_authoring._paper_provenance(written)
+    assert checks[0].status == "pass"
+
+
+def test_bind_paper_rejects_tampered_manifest_and_unknown_item(repo_root, tmp_path):
+    result = intake.collect(
+        _feeds(), fetcher=_fixture_fetcher(repo_root), created_at="2026-08-27T00:00:00Z"
+    )
+    bundle = tmp_path / "bundle"
+    paths = intake.write_bundle(result, bundle)
+    paper = tmp_path / "paper.pdf"
+    paper.write_bytes(b"paper")
+    with pytest.raises(intake.SourceIntakeError, match="exactly one"):
+        intake.bind_paper(
+            bundle,
+            item_uid="sha256:" + "f" * 64,
+            source_file=paper,
+            license_status="pending-human",
+        )
+    manifest = json.loads(paths["manifest"].read_text())
+    manifest["files"]["intake.json"] = "sha256:" + "0" * 64
+    paths["manifest"].write_text(json.dumps(manifest))
+    item = result.review_queue[0]["item_uid"]
+    with pytest.raises(intake.SourceIntakeError, match="digest contract"):
+        intake.bind_paper(
+            bundle,
+            item_uid=item,
+            source_file=paper,
+            license_status="pending-human",
+        )
 
 
 def test_cli_intake_validate_is_network_free(capsys, tmp_path):

@@ -191,3 +191,15 @@ def test_round_two_without_previous_receipt_is_blocked(tmp_path: Path):
     receipt = task_authoring.validate_task(task, round_number=2)
     assert receipt["decision"] == "blocked"
     assert any(item["name"] == "previous_receipt" and item["status"] == "fail" for item in receipt["provenance_checks"])
+
+
+def test_authoring_round_cannot_skip_a_receipt(tmp_path: Path):
+    task = _make_candidate(tmp_path / "task")
+    first = task_authoring.validate_task(task, round_number=1)
+    path = task_authoring.write_receipt(first, tmp_path / "round1")["json"]
+
+    third = task_authoring.validate_task(task, round_number=3, previous_receipt=path)
+
+    assert third["decision"] == "blocked"
+    finding = next(item for item in third["provenance_checks"] if item["name"] == "previous_receipt")
+    assert "exactly current round minus one" in finding["reason"]

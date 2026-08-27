@@ -267,8 +267,12 @@ def _previous_receipt(
     if previous.get("task_dir") != task_dir.name:
         problems.append("task directory mismatch")
     previous_round = previous.get("round")
-    if not isinstance(previous_round, int) or isinstance(previous_round, bool) or previous_round >= round_number:
-        problems.append("previous round must be an integer smaller than the current round")
+    if (
+        not isinstance(previous_round, int)
+        or isinstance(previous_round, bool)
+        or previous_round != round_number - 1
+    ):
+        problems.append("previous round must be exactly current round minus one")
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(previous.get("task_tree_digest", ""))):
         problems.append("previous task_tree_digest is missing or malformed")
     recorded_digest = str(previous.get("receipt_digest", ""))

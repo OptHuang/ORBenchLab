@@ -35,6 +35,7 @@ class VolcReviewError(ORBenchError):
 DEFAULT_MAX_TOKENS = 1600
 DEFAULT_TIMEOUT_SEC = 120
 MAX_FILE_BYTES = 64_000
+MAX_SNAPSHOT_BYTES = 256_000
 VOLC_HOST_SUFFIXES = ("volces.com", "volcengine.com")
 
 
@@ -98,11 +99,19 @@ def _file_digest(path: Path) -> str:
 
 def _bounded_task_snapshot(task_dir: Path) -> list[dict[str, Any]]:
     files: list[dict[str, Any]] = []
+    preview_bytes = 0
     for path in sorted(
         (p for p in task_dir.rglob("*") if p.is_file() and not p.is_symlink()),
         key=lambda p: p.relative_to(task_dir).as_posix(),
     ):
         relative = path.relative_to(task_dir).as_posix()
+        parts = path.relative_to(task_dir).parts
+        filename = path.name.lower()
+        if any(part.startswith(".") for part in parts) or re.search(
+            r"(?:^|[._-])(env|token|secret|credential|auth|private[_-]?key)(?:$|[._-])",
+            filename,
+        ):
+            raise VolcReviewError(f"task snapshot refuses hidden or credential-like file: {relative}")
         entry: dict[str, Any] = {"path": relative, "bytes": path.stat().st_size, "digest": _file_digest(path)}
         if path.stat().st_size <= MAX_FILE_BYTES and path.suffix.lower() in {".md", ".toml", ".yaml", ".yml", ".json", ".jsonl", ".py", ".sh"}:
             try:
@@ -112,9 +121,63 @@ def _bounded_task_snapshot(task_dir: Path) -> list[dict[str, Any]]:
             # The reviewer needs structure, not an unbounded data dump.  Do not
             # include files in common secret/data locations even if present.
             if not any(part.lower() in {"secret", "secrets", ".ssh", ".aws", ".config"} for part in path.parts):
-                entry["preview"] = text[:MAX_FILE_BYTES]
+                preview = text[:MAX_FILE_BYTES]
+                preview_bytes += len(preview.encode("utf-8"))
+                if preview_bytes > MAX_SNAPSHOT_BYTES:
+                    raise VolcReviewError("task snapshot previews exceed 256000 UTF-8 bytes")
+                entry["preview"] = preview
         files.append(entry)
     return files
+
+
+def _task_tree_digest(task_dir: Path) -> str:
+    entries = []
+    for path in sorted(task_dir.rglob("*")):
+        if path.is_file() and not path.is_symlink():
+            entries.append(
+                {
+                    "path": path.relative_to(task_dir).as_posix(),
+                    "content_digest": _file_digest(path),
+                }
+            )
+    return _digest(entries)
+
+
+def _validate_review_inputs(
+    task_dir: Path,
+    paper: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    *,
+    round_number: int,
+) -> None:
+    """Reject stale or forged authoring inputs before any paid model call."""
+
+    if receipt.get("authoring_schema_version") != "orbenchlab.tbscience-authoring.v1":
+        raise VolcReviewError("authoring receipt schema is unsupported")
+    supplied = receipt.get("receipt_digest")
+    unsigned = {key: value for key, value in receipt.items() if key != "receipt_digest"}
+    if not isinstance(supplied, str) or supplied != _digest(unsigned):
+        raise VolcReviewError("authoring receipt digest does not match its contents")
+    if receipt.get("task_dir") != task_dir.name:
+        raise VolcReviewError("authoring receipt task directory does not match current task")
+    current_tree = _task_tree_digest(task_dir)
+    if receipt.get("task_tree_digest") != current_tree:
+        raise VolcReviewError("authoring receipt task-tree digest is stale")
+    if (
+        not isinstance(round_number, int)
+        or isinstance(round_number, bool)
+        or round_number <= 0
+        or receipt.get("round") != round_number
+    ):
+        raise VolcReviewError("authoring receipt round does not match review round")
+    receipt_paper = receipt.get("paper")
+    if not isinstance(receipt_paper, Mapping) or (
+        receipt_paper.get("source_content_digest") != paper.get("source_content_digest")
+    ):
+        raise VolcReviewError("paper digest does not match authoring receipt")
+    # Materialize the bounded snapshot now so secret-like filenames and the
+    # aggregate preview cap fail before the first provider request.
+    _bounded_task_snapshot(task_dir)
 
 
 def _json_object(text: str) -> dict[str, Any]:
@@ -342,6 +405,12 @@ def review_task(
     selected = [str(model).strip() for model in models if str(model).strip()]
     if not selected:
         selected = [config.default_model]
+    _validate_review_inputs(
+        root,
+        paper_provenance,
+        receipt,
+        round_number=round_number,
+    )
     system = (
         "You are an evidence-calibrated TB-Science task reviewer. "
         "Do not expose secrets. Do not claim Harbor acceptance. Keep semantic judgments as review when evidence is insufficient."

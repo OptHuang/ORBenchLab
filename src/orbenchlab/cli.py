@@ -320,6 +320,21 @@ def _add_intake(sub: argparse._SubParsersAction) -> None:
     )
     collect_parser.set_defaults(handler=_cmd_intake_collect)
 
+    bind_parser = inner.add_parser(
+        "bind-paper",
+        help="bind one checksummed intake item to exact local paper bytes",
+    )
+    bind_parser.add_argument("--intake", required=True, help="intake bundle directory or intake.json")
+    bind_parser.add_argument("--item-uid", required=True)
+    bind_parser.add_argument("--source-file", required=True, help="local PDF/Markdown paper; read only")
+    bind_parser.add_argument(
+        "--license-status",
+        required=True,
+        choices=("pending-human", "registry-resolved"),
+    )
+    bind_parser.add_argument("--out", required=True, help="paper-provenance.json or output directory")
+    bind_parser.set_defaults(handler=_cmd_intake_bind_paper)
+
 
 def _cmd_intake_validate(args: argparse.Namespace) -> int:
     feeds = intake_mod.load_feed_config(args.config)
@@ -360,6 +375,28 @@ def _cmd_intake_collect(args: argparse.Namespace) -> int:
     # A partial snapshot is useful and is left on disk, but CI/automation must
     # notice that at least one configured source failed.
     return 8 if result.has_errors else 0
+
+
+def _cmd_intake_bind_paper(args: argparse.Namespace) -> int:
+    binding = intake_mod.bind_paper(
+        args.intake,
+        item_uid=args.item_uid,
+        source_file=args.source_file,
+        license_status=args.license_status,
+    )
+    path = intake_mod.write_paper_binding(binding, args.out)
+    _print_json(
+        {
+            "item_uid": binding["intake_item_uid"],
+            "source_content_digest": binding["source_content_digest"],
+            "license_status": binding["license_status"],
+            "binding_digest": binding["binding_digest"],
+            "model_calls": 0,
+            "raw_sources_modified": False,
+            "written": str(path),
+        }
+    )
+    return 0
 
 
 # --------------------------------------------------------------------------- #

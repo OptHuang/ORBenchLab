@@ -5,7 +5,15 @@ from pathlib import Path
 
 import pytest
 
-from orbenchlab.volc_review import VolcConfig, VolcReviewError, call_reviewer, review_task, write_review
+from orbenchlab.volc_review import (
+    VolcConfig,
+    VolcReviewError,
+    _digest,
+    _task_tree_digest,
+    call_reviewer,
+    review_task,
+    write_review,
+)
 
 
 class _Response:
@@ -99,18 +107,23 @@ def test_review_task_is_blocked_by_static_receipt_and_writes_summary(tmp_path: P
         }
 
     monkeypatch.setattr("orbenchlab.volc_review.call_reviewer", fake_call)
+    paper_digest = "sha256:" + "c" * 64
+    receipt = {
+        "authoring_schema_version": "orbenchlab.tbscience-authoring.v1",
+        "task_dir": task.name,
+        "decision": "blocked",
+        "round": 1,
+        "task_tree_digest": _task_tree_digest(task),
+        "paper": {"source_content_digest": paper_digest},
+        "counts": {"fail": 1, "pass": 0, "review": 0},
+        "implementation_criteria": [],
+        "provenance_checks": [],
+    }
+    receipt["receipt_digest"] = _digest(receipt)
     review = review_task(
         task,
-        paper_provenance={"source_content_digest": "sha256:" + "c" * 64},
-        receipt={
-            "decision": "blocked",
-            "round": 1,
-            "receipt_digest": "sha256:" + "d" * 64,
-            "task_tree_digest": "sha256:" + "e" * 64,
-            "counts": {"fail": 1, "pass": 0, "review": 0},
-            "implementation_criteria": [],
-            "provenance_checks": [],
-        },
+        paper_provenance={"source_content_digest": paper_digest},
+        receipt=receipt,
         config=config,
         models=["ark-code-latest", "deepseek-v4-flash"],
         round_number=1,
@@ -121,3 +134,58 @@ def test_review_task_is_blocked_by_static_receipt_and_writes_summary(tmp_path: P
     written = json.loads(paths["json"].read_text(encoding="utf-8"))
     assert written["review_digest"].startswith("sha256:")
     assert "secret-token" not in paths["json"].read_text(encoding="utf-8")
+
+
+def test_review_rejects_stale_receipt_before_provider_call(tmp_path: Path, monkeypatch):
+    task = tmp_path / "task"
+    task.mkdir()
+    (task / "instruction.md").write_text("public")
+    paper_digest = "sha256:" + "c" * 64
+    receipt = {
+        "authoring_schema_version": "orbenchlab.tbscience-authoring.v1",
+        "task_dir": task.name,
+        "decision": "ready-for-human-review",
+        "round": 1,
+        "task_tree_digest": _task_tree_digest(task),
+        "paper": {"source_content_digest": paper_digest},
+    }
+    receipt["receipt_digest"] = _digest(receipt)
+    (task / "instruction.md").write_text("changed after receipt")
+    called = []
+    monkeypatch.setattr("orbenchlab.volc_review.call_reviewer", lambda *a, **k: called.append(True))
+    with pytest.raises(VolcReviewError, match="stale"):
+        review_task(
+            task,
+            paper_provenance={"source_content_digest": paper_digest},
+            receipt=receipt,
+            config=VolcConfig("https://ark.cn-beijing.volces.com/api/coding", "secret", "ark-code-latest"),
+            models=["ark-code-latest"],
+            round_number=1,
+        )
+    assert called == []
+
+
+def test_review_snapshot_rejects_secret_like_file_before_provider(tmp_path: Path):
+    task = tmp_path / "task"
+    task.mkdir()
+    (task / "instruction.md").write_text("public")
+    (task / ".env").write_text("TOKEN=do-not-send")
+    paper_digest = "sha256:" + "c" * 64
+    receipt = {
+        "authoring_schema_version": "orbenchlab.tbscience-authoring.v1",
+        "task_dir": task.name,
+        "decision": "ready-for-human-review",
+        "round": 1,
+        "task_tree_digest": _task_tree_digest(task),
+        "paper": {"source_content_digest": paper_digest},
+    }
+    receipt["receipt_digest"] = _digest(receipt)
+    with pytest.raises(VolcReviewError, match="credential-like"):
+        review_task(
+            task,
+            paper_provenance={"source_content_digest": paper_digest},
+            receipt=receipt,
+            config=VolcConfig("https://ark.cn-beijing.volces.com/api/coding", "secret", "ark-code-latest"),
+            models=["ark-code-latest"],
+            round_number=1,
+        )

@@ -61,6 +61,24 @@ injection is not inferred from this report.
 For a paper-backed candidate, run the authoring gate before packaging anything
 for Harbor:
 
+First bind a metadata intake item to the exact bytes of a local paper (the
+source file is read only and is never moved):
+
+```bash
+orbench intake bind-paper \
+  --intake artifacts/intake/2026-08-28 \
+  --item-uid sha256:... \
+  --source-file papers/candidate.pdf \
+  --license-status pending-human \
+  --out artifacts/paper-bindings/candidate
+```
+
+This command revalidates `intake.json`, `review_queue.jsonl` and their manifest,
+requires one matching pending item, and hashes the paper bytes independently of
+the intake metadata digest. `registry-resolved` is an explicit caller-supplied
+license assertion; use `pending-human` until registry evidence has actually
+been checked.
+
 ```bash
 orbench task-author validate \
   --task-dir path/to/task \
@@ -105,7 +123,9 @@ The command refuses non-Volc HTTPS hosts, sends only bounded public evidence,
 and writes a structured reviewer digest rather than raw prompts or model
 responses. It never upgrades a statically blocked receipt; its output is a
 revision proposal with task purpose, difficulty axes, rubric findings and
-next edits. The official automation still requires `harbor check` and runtime
+next edits. Before any paid call it revalidates the receipt checksum, exact
+current task tree, round number and paper digest, and refuses hidden or
+credential-like task files. The official automation still requires `harbor check` and runtime
 evidence before a task can be submitted.[TB-Science review automation](https://github.com/harbor-framework/terminal-bench-science/blob/main/TASK_REVIEW_AUTOMATION.md)
 
 For a fast, task-local model screen on an execution host that already has the

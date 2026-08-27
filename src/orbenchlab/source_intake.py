@@ -55,6 +55,7 @@ _MAX_SUMMARY = 2_000
 _MAX_AUTHORS = 20
 _MAX_TAGS = 40
 _MAX_ENTRIES_PER_FEED = 10_000
+_MAX_BOUND_SOURCE_BYTES = 100 * 1024 * 1024
 
 
 class SourceIntakeError(ORBenchError):
@@ -977,6 +978,111 @@ def load_intake(path: str | Path) -> dict[str, Any]:
     if not isinstance(payload, dict) or payload.get("schema_version") != INTAKE_SCHEMA_VERSION:
         raise SourceIntakeError("intake artifact has an unsupported schema version")
     return payload
+
+
+def bind_paper(
+    intake: str | Path,
+    *,
+    item_uid: str,
+    source_file: str | Path,
+    license_status: str,
+) -> dict[str, Any]:
+    """Bind one checksummed intake item to the exact bytes of a local paper."""
+
+    requested = str(item_uid).strip()
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", requested):
+        raise SourceIntakeError("item_uid must be sha256:<64 lowercase hex>")
+    root = Path(intake)
+    intake_path = root / "intake.json" if root.is_dir() else root
+    bundle = intake_path.parent
+    queue_path = bundle / "review_queue.jsonl"
+    manifest_path = bundle / "intake-manifest.json"
+    if any(path.is_symlink() or not path.is_file() for path in (intake_path, queue_path, manifest_path)):
+        raise SourceIntakeError("bind-paper requires a complete regular-file intake bundle")
+    try:
+        intake_bytes = intake_path.read_bytes()
+        queue_bytes = queue_path.read_bytes()
+        document = json.loads(intake_bytes.decode("utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        queue = [json.loads(line) for line in queue_bytes.decode("utf-8").splitlines() if line]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise SourceIntakeError("intake bundle contains malformed JSON") from None
+    if not isinstance(document, Mapping) or not isinstance(manifest, Mapping):
+        raise SourceIntakeError("intake bundle roots must be objects")
+    schema = schema_mod.load_schema(schema_mod.schemas_dir() / "source_intake.schema.json")
+    try:
+        schema_mod.validate(document, schema, name="source intake")
+    except ORBenchError as exc:
+        raise SourceIntakeError(f"intake bundle schema validation failed: {exc}") from None
+    files = manifest.get("files")
+    if (
+        manifest.get("schema_version") != INTAKE_SCHEMA_VERSION
+        or manifest.get("intake_id") != document.get("intake_id")
+        or not isinstance(files, Mapping)
+        or files.get("intake.json") != _digest(intake_bytes)
+        or files.get("review_queue.jsonl") != _digest(queue_bytes)
+        or manifest.get("review_queue_digest") != _digest(queue_bytes)
+        or document.get("review_queue_digest") != _digest(queue_bytes)
+        or manifest.get("review_queue_count") != len(queue)
+        or document.get("review_queue_count") != len(queue)
+    ):
+        raise SourceIntakeError("intake manifest/review queue digest contract failed")
+    items = [
+        item
+        for item in document.get("items", [])
+        if isinstance(item, Mapping) and item.get("item_uid") == requested
+    ]
+    queued = [
+        item
+        for item in queue
+        if isinstance(item, Mapping) and item.get("item_uid") == requested
+    ]
+    if len(items) != 1 or len(queued) != 1:
+        raise SourceIntakeError("item_uid must identify exactly one pending review-queue item")
+    item, queue_item = items[0], queued[0]
+    if (
+        queue_item.get("state") != "pending"
+        or queue_item.get("title") != item.get("title")
+        or queue_item.get("canonical_url") != item.get("canonical_url")
+        or queue_item.get("content_digest") != item.get("content_digest")
+    ):
+        raise SourceIntakeError("review-queue item does not match intake metadata")
+    source = Path(source_file)
+    if source.is_symlink() or not source.is_file():
+        raise SourceIntakeError("source-file must be a regular non-symlink file")
+    size = source.stat().st_size
+    if size <= 0 or size > _MAX_BOUND_SOURCE_BYTES:
+        raise SourceIntakeError("source-file must contain 1..104857600 bytes")
+    status = str(license_status).strip().lower().replace("-", "_")
+    if status not in {"pending_human", "registry_resolved"}:
+        raise SourceIntakeError("license-status must be pending-human or registry-resolved")
+    url = item.get("canonical_url")
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        raise SourceIntakeError("selected intake item has no canonical paper URL")
+    provenance: dict[str, Any] = {
+        "paper_provenance_schema_version": "orbenchlab.paper-provenance.v1",
+        "title": str(item["title"]),
+        "url": url,
+        "source_content_digest": _digest(source.read_bytes()),
+        "source_path": str(source.resolve()),
+        "license_status": status,
+        "license_assertion": "caller-supplied",
+        "intake_id": document["intake_id"],
+        "intake_snapshot_digest": document["snapshot_digest"],
+        "intake_item_uid": requested,
+        "intake_metadata_digest": item["content_digest"],
+    }
+    provenance["binding_digest"] = _digest(_canonical_json(provenance))
+    return provenance
+
+
+def write_paper_binding(binding: Mapping[str, Any], out: str | Path) -> Path:
+    destination = Path(out)
+    path = destination if destination.suffix.lower() == ".json" else destination / "paper-provenance.json"
+    data = _canonical_json(dict(binding)) + b"\n"
+    _check_existing(path, data)
+    _write_atomic_if_same(path, data)
+    return path
 
 
 def validate_config_mapping(value: Mapping[str, Any]) -> tuple[FeedSpec, ...]:
