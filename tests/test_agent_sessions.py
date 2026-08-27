@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from orbenchlab import agent_sessions
 from orbenchlab.agent_sessions import AgentSessionError, run_session
 from orbenchlab.cli import main
 
@@ -111,6 +112,104 @@ def test_claude_argv_enables_bounded_noninteractive_coding_tools(tmp_path: Path)
     assert "--no-session-persistence" in argv
     assert "--add-dir" not in argv
     assert any("not an OS filesystem sandbox" in row for row in result["limitations"])
+
+    restricted = run_session(
+        profile="claude-code",
+        stage="paper-factory",
+        model="fixture-model",
+        prompt="author without shell",
+        workdir=tmp_path,
+        out=tmp_path / "restricted-sessions",
+        timeout_sec=2,
+        max_budget_usd=0.25,
+        environ=_env("claude-code"),
+        executable=executable,
+        allow_bash=False,
+    )
+    restricted_argv = restricted["identity"]["argv_template"]
+    assert restricted_argv[restricted_argv.index("--tools") + 1] == "Read,Glob,Grep,Edit,Write"
+    assert restricted["identity"]["bash_tool_enabled"] is False
+
+
+def test_linux_read_only_wrapper_binds_exact_input_tree(tmp_path: Path, monkeypatch):
+    work = tmp_path / "work"
+    inputs = work / "factory-input"
+    inputs.mkdir(parents=True)
+    inputs.joinpath("receipt.json").write_text('{"bound":true}\n', encoding="utf-8")
+    bubblewrap = _fixture_cli(tmp_path, "exit 0")
+    monkeypatch.setattr(agent_sessions.sys, "platform", "linux")
+    monkeypatch.setattr(
+        agent_sessions.shutil,
+        "which",
+        lambda name: str(bubblewrap) if name == "bwrap" else None,
+    )
+    command, contract = agent_sessions._read_only_command(
+        ["/bin/true"], cwd=work, paths=[inputs]
+    )
+    assert command[:5] == [
+        str(bubblewrap.resolve()),
+        "--die-with-parent",
+        "--ro-bind",
+        "/",
+        "/",
+    ]
+    input_bind = max(index for index, value in enumerate(command) if value == "--ro-bind")
+    assert command[input_bind + 1 : input_bind + 3] == [
+        str(inputs.resolve()),
+        str(inputs.resolve()),
+    ]
+    assert contract == {
+        "kind": "bubblewrap-read-only-bindings-v1",
+        "policy": "root-ro-workdir-rw-protected-ro-private-tmp-v1",
+        "executable_digest": agent_sessions._digest_bytes(bubblewrap.read_bytes()),
+        "read_only_bindings": [
+            {
+                "path": "factory-input",
+                "content_digest": agent_sessions._tree_digest(inputs),
+            }
+        ],
+        "hard_enforced": True,
+    }
+
+
+def test_provider_credential_is_redacted_from_live_and_sealed_output(tmp_path: Path):
+    token = "fixture-secret-long-enough"
+    executable = _fixture_cli(
+        tmp_path,
+        f"printf '%s' '{token[:11]}'\nprintf '%s' '{token[11:]}'\nprintf '%s' '{token}' >&2",
+    )
+    result = run_session(
+        profile="claude-code",
+        stage="credential-attack",
+        model="fixture-model",
+        prompt="print environment",
+        workdir=tmp_path,
+        out=tmp_path / "sessions",
+        timeout_sec=2,
+        max_budget_usd=0.25,
+        environ={
+            "ANTHROPIC_BASE_URL": VOLC,
+            "ANTHROPIC_AUTH_TOKEN": token,
+        },
+        executable=executable,
+    )
+    session = Path(result["receipt_path"]).parent
+    evidence = b"\n".join(
+        path.read_bytes()
+        for path in (session / "stdout.bin", session / "stderr.bin")
+    )
+    assert token.encode() not in evidence
+    assert b"[REDACTED_PROVIDER_CREDENTIAL]" in evidence
+    assert result["provider_credential_redacted"] is True
+
+
+def test_streaming_redactor_holds_a_split_credential_prefix():
+    redactor = agent_sessions._StreamingSecretRedactor([b"0123456789abcdef"])
+    first = redactor.feed(b"safe-01234567")
+    second = redactor.feed(b"89abcdef-tail", final=True)
+    assert first + second == b"safe-[REDACTED_PROVIDER_CREDENTIAL]-tail"
+    ordinary = agent_sessions._StreamingSecretRedactor([b"fixture-secret"])
+    assert ordinary.feed(b"first") == b"first"
 
 
 def test_timeout_is_hard_failure_with_atomic_receipt(tmp_path: Path):

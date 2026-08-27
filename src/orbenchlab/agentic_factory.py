@@ -25,7 +25,12 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
-from .agent_sessions import DEFAULT_MAX_OUTPUT_BYTES, AgentSessionError, run_session
+from .agent_sessions import (
+    DEFAULT_MAX_OUTPUT_BYTES,
+    AgentSessionError,
+    _tree_digest as _session_tree_digest,
+    run_session,
+)
 from .core.errors import ORBenchError
 
 
@@ -463,6 +468,24 @@ def _new_run(plan: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _has_restricted_factory_tools(identity: Mapping[str, Any]) -> bool:
+    """Recompute the persisted Claude tool policy from the signed argv."""
+
+    argv = identity.get("argv_template")
+    expected = "Read,Glob,Grep,Edit,Write"
+    if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
+        return False
+    if argv.count("--tools") != 1 or argv.count("--allowedTools") != 1:
+        return False
+    try:
+        return (
+            argv[argv.index("--tools") + 1] == expected
+            and argv[argv.index("--allowedTools") + 1] == expected
+        )
+    except IndexError:
+        return False
+
+
 def _validate_session_receipt(
     root: Path,
     plan: Mapping[str, Any],
@@ -507,6 +530,35 @@ def _validate_session_receipt(
         or identity.get("max_budget_usd") != stage["max_budget_usd"]
     ):
         raise AgenticFactoryError("factory attempt session receipt failed its signed binding")
+    if plan.get("workspace_manifest"):
+        sandbox = identity.get("filesystem_sandbox")
+        bindings = sandbox.get("read_only_bindings") if isinstance(sandbox, Mapping) else None
+        if (
+            not isinstance(sandbox, Mapping)
+            or sandbox.get("hard_enforced") is not True
+            or sandbox.get("kind")
+            not in {
+                "bubblewrap-read-only-bindings-v1",
+                "sandbox-exec-read-only-subpaths-v1",
+            }
+            or sandbox.get("policy")
+            not in {
+                "root-ro-workdir-rw-protected-ro-private-tmp-v1",
+                "default-deny-write-workdir-rw-protected-ro-v1",
+            }
+            or identity.get("bash_tool_enabled") is not False
+            or not _has_restricted_factory_tools(identity)
+            or not isinstance(bindings, list)
+            or not bindings
+            or not any(
+                isinstance(binding, Mapping)
+                and binding.get("path") == "factory-input"
+                for binding in bindings
+            )
+        ):
+            raise AgenticFactoryError(
+                "factory session did not hard-protect its immutable input snapshot"
+            )
     session_root = path.parent
     stdout_path = session_root / "stdout.bin"
     stderr_path = session_root / "stderr.bin"
@@ -1079,7 +1131,8 @@ def _stage_prompt(plan: Mapping[str, Any], stage: Mapping[str, Any]) -> str:
         "required_outputs": stage["required_outputs"],
         "rule": (
             "Work autonomously inside the supplied workspace. Create every required output. "
-            "Do not claim that semantic output is Harbor/verifier acceptance."
+            "Do not claim that semantic output is Harbor/verifier acceptance. The immutable-paper "
+            "factory disables Bash; use Read/Glob/Grep/Edit/Write and leave command execution to trusted gates."
         ),
     }
     return stage["prompt"] + "\n\nORBENCH_FACTORY_CONTRACT\n" + json.dumps(
@@ -1164,6 +1217,19 @@ def _run_factory_locked(
         retry_safe = True
         workspace_usage: dict[str, int] | None = None
         stage_environment = (environments or {}).get(stage["profile"], {})
+        protected_inputs = (
+            [workspace / "factory-input"]
+            if checked.get("workspace_manifest")
+            else []
+        )
+        if checked.get("workspace_manifest"):
+            for completed_id, completed_state in run["stages"].items():
+                if completed_state["status"] != "completed":
+                    continue
+                for output in stage_by_id[completed_id]["required_outputs"]:
+                    protected_inputs.append(
+                        _artifact_path(workspace, output["path"])
+                    )
         try:
             session = run_session(
                 profile=stage["profile"],
@@ -1177,7 +1243,40 @@ def _run_factory_locked(
                 max_output_bytes=stage["max_output_bytes"],
                 environ=stage_environment,
                 executable=(executables or {}).get(stage["profile"]),
+                read_only_paths=protected_inputs,
+                allow_bash=not bool(checked.get("workspace_manifest")),
             )
+            if checked.get("workspace_manifest"):
+                identity = session.get("identity")
+                sandbox = (
+                    identity.get("filesystem_sandbox")
+                    if isinstance(identity, Mapping)
+                    else None
+                )
+                bindings = (
+                    sandbox.get("read_only_bindings")
+                    if isinstance(sandbox, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(bindings, list)
+                    or {
+                        str(binding.get("path")): binding.get("content_digest")
+                        for binding in bindings
+                        if isinstance(binding, Mapping)
+                    }
+                    != {
+                        path.relative_to(workspace).as_posix(): (
+                            _session_tree_digest(path)
+                            if path.is_dir()
+                            else "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+                        )
+                        for path in protected_inputs
+                    }
+                ):
+                    raise AgenticFactoryError(
+                        "factory session input binding changed during execution"
+                    )
             workspace_usage = _validate_workspace_limits(
                 workspace,
                 max_bytes=checked["max_workspace_bytes"],

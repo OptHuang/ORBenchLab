@@ -626,6 +626,26 @@ def test_completed_attempt_requires_exact_agent_session_binding(tmp_path: Path):
         agentic_factory.run_factory(plan, workdir=workdir, out=out)
 
 
+def test_factory_tool_policy_is_recomputed_from_persisted_argv():
+    expected = "Read,Glob,Grep,Edit,Write"
+    identity = {
+        "argv_template": [
+            "--tools",
+            expected,
+            "--allowedTools",
+            expected,
+        ]
+    }
+    assert agentic_factory._has_restricted_factory_tools(identity)
+
+    forged = json.loads(json.dumps(identity))
+    forged["argv_template"][1] += ",Bash"
+    assert not agentic_factory._has_restricted_factory_tools(forged)
+    assert not agentic_factory._has_restricted_factory_tools(
+        {"argv_template": ["--tools", expected, "--allowedTools"]}
+    )
+
+
 def test_factory_lock_serializes_two_processes_for_one_run(tmp_path: Path):
     plan = agentic_factory.compile_plan(
         name="factory lock",

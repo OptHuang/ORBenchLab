@@ -344,6 +344,7 @@ def paper_to_benchmark_plan(
     frontier_model: str,
     weak_model: str,
     profile: str = "claude-code",
+    held_out_confirmation: bool = False,
 ) -> dict[str, Any]:
     """Compile the default autonomous paper-to-calibrated-task semantic DAG.
 
@@ -497,7 +498,8 @@ def paper_to_benchmark_plan(
             common
             + " Copy factory-input/seed-task to factory/tasks/task-v1 and replace it with the selected "
             "paper-backed task. Implement task.toml, environment, instruction, solution, data and strict "
-            "rubric tests. Run all feasible local static/tests; leave no placeholder or human TODO.",
+            "rubric tests. Inspect the complete result and leave no placeholder or human TODO; the trusted "
+            "harness, not this no-Bash semantic session, owns command execution.",
             "factory/tasks/task-v1",
             model=author_model,
             profile=profile,
@@ -510,7 +512,7 @@ def paper_to_benchmark_plan(
             "independent scientific-faithfulness reviewer",
             common
             + " Review task-v1 against the paper evidence and TB-Science expectations. Inspect every "
-            "file, run useful checks, and write prioritized, source-grounded defects. Do not edit task-v1.",
+            "file and write prioritized, source-grounded defects. Do not edit task-v1 or claim runtime tests.",
             "factory/reviews/task-review-science.json",
             model=reviewers[0],
             profile=profile,
@@ -521,7 +523,8 @@ def paper_to_benchmark_plan(
             "independent verifier and anti-cheating reviewer",
             common
             + " Attack task-v1's verifier, rubric, hidden/public separation, determinism, resource limits, "
-            "Oracle/NOP semantics and shortcut resistance. Run tests where possible. Do not edit task-v1.",
+            "Oracle/NOP semantics and shortcut resistance by complete code inspection. Do not edit task-v1 "
+            "or claim that this semantic session executed tests.",
             "factory/reviews/task-review-verifier.json",
             model=reviewers[1],
             profile=profile,
@@ -532,7 +535,8 @@ def paper_to_benchmark_plan(
             "senior task repair agent",
             common
             + " Copy task-v1 to factory/tasks/task-v2, resolve every supported finding from both reviews, "
-            "and run the repository's deterministic task-authoring gate plus task tests. Preserve a "
+            "and prepare it for the repository's deterministic task-authoring gate plus task tests, which "
+            "the trusted harness will execute after this stage. Preserve a "
             "machine-readable repair ledger inside task-v2/data.",
             "factory/tasks/task-v2",
             model=author_model,
@@ -630,7 +634,16 @@ def paper_to_benchmark_plan(
             common
             + " Copy task-v2 into factory/tasks/variants and implement the smallest useful lattice of "
             "versioned variants. Each variant must state exactly one or a controlled combination of changed "
-            "axes, preserve paper fidelity, pass static checks and keep distinct task identities.",
+            "axes, preserve paper fidelity, be ready for trusted static checks and keep distinct task identities. Include at "
+            "least three ordered levels and write factory/tasks/variants/variant-manifest.json with schema_version "
+            "orbenchlab.variant-manifest.v1, one primary_axis object (name, expected_direction, ordered_levels), "
+            "and variants rows (variant_id, relative_path, level, axis_levels). Paths are relative to the variants "
+            "directory and each must contain a complete strict task. Set evaluation_mode to "
+            + (
+                "held-out-confirmation. The trusted harness will freeze a preregistration before launching any variant trials."
+                if held_out_confirmation
+                else "exploratory; do not describe these trials as confirmatory."
+            ),
             "factory/tasks/variants",
             model=author_model,
             profile=profile,

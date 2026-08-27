@@ -16,9 +16,10 @@ import selectors
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from .core.errors import ORBenchError
@@ -44,6 +45,7 @@ _PROFILES = {
 }
 _SAFE_HOST_ENV = ("HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR")
 DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024
+_REDACTION = b"[REDACTED_PROVIDER_CREDENTIAL]"
 
 
 def _digest_bytes(value: bytes) -> str:
@@ -75,10 +77,11 @@ def _argv(
     model: str,
     *,
     max_budget_usd: float,
+    allow_bash: bool,
 ) -> list[str]:
     if profile == "codex":
         return [executable, "exec", "--json", "--model", model, "-"]
-    coding_tools = "Read,Glob,Grep,Edit,Write,Bash"
+    coding_tools = "Read,Glob,Grep,Edit,Write" + (",Bash" if allow_bash else "")
     return [
         executable,
         "--print",
@@ -140,6 +143,96 @@ def _session_env(profile: str, supplied: Mapping[str, str]) -> tuple[dict[str, s
     return child, _digest({"host": host, "path": parsed.path.rstrip("/")})
 
 
+def _read_only_command(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    paths: Sequence[str | Path],
+) -> tuple[list[str], dict[str, Any] | None]:
+    """Wrap a command in an inherited OS policy for immutable input paths."""
+
+    if not paths:
+        return list(command), None
+    cwd = cwd.resolve()
+    bindings = []
+    for value in paths:
+        requested = Path(value)
+        if requested.is_symlink() or not requested.exists():
+            raise AgentSessionError("read-only session input must exist and not be a symlink")
+        resolved = requested.resolve()
+        try:
+            relative = resolved.relative_to(cwd).as_posix()
+        except ValueError:
+            raise AgentSessionError("read-only session input must be inside the workdir") from None
+        bindings.append(
+            {
+                "path": relative,
+                "content_digest": (
+                    _tree_digest(resolved)
+                    if resolved.is_dir()
+                    else _digest_bytes(resolved.read_bytes())
+                ),
+            }
+        )
+    if len({row["path"] for row in bindings}) != len(bindings):
+        raise AgentSessionError("read-only session inputs must be unique")
+    resolved_paths = [cwd / row["path"] for row in bindings]
+    if sys.platform.startswith("linux"):
+        sandbox = shutil.which("bwrap")
+        if not sandbox:
+            raise AgentSessionError("Bubblewrap is required for read-only factory inputs")
+        sandbox_path = Path(sandbox).resolve()
+        wrapped = [
+            str(sandbox_path),
+            "--die-with-parent",
+            "--ro-bind",
+            "/",
+            "/",
+            "--tmpfs",
+            "/tmp",
+            "--bind",
+            str(cwd),
+            str(cwd),
+            "--proc",
+            "/proc",
+            "--dev-bind",
+            "/dev",
+            "/dev",
+        ]
+        for path in resolved_paths:
+            wrapped.extend(["--ro-bind", str(path), str(path)])
+        wrapped.extend(["--chdir", str(cwd), "--", *command])
+        kind = "bubblewrap-read-only-bindings-v1"
+        policy = "root-ro-workdir-rw-protected-ro-private-tmp-v1"
+    elif sys.platform == "darwin":
+        sandbox = shutil.which("sandbox-exec")
+        if not sandbox:
+            raise AgentSessionError("sandbox-exec is required for read-only factory inputs")
+        sandbox_path = Path(sandbox).resolve()
+        quoted = [str(path).replace('"', '\\"') for path in resolved_paths]
+        writable = str(cwd).replace('"', '\\"')
+        profile = (
+            "(version 1)\n(allow default)\n(deny file-write*)\n"
+            f'(allow file-write* (subpath "{writable}"))\n'
+            + "\n".join(
+                f'(deny file-write* (subpath "{path}"))' for path in quoted
+            )
+        )
+        wrapped = [str(sandbox_path), "-p", profile, *command]
+        kind = "sandbox-exec-read-only-subpaths-v1"
+        policy = "default-deny-write-workdir-rw-protected-ro-v1"
+    else:
+        raise AgentSessionError("this platform has no supported read-only factory sandbox")
+    contract = {
+        "kind": kind,
+        "policy": policy,
+        "executable_digest": _digest_bytes(sandbox_path.read_bytes()),
+        "read_only_bindings": bindings,
+        "hard_enforced": True,
+    }
+    return wrapped, contract
+
+
 def _valid_reuse(path: Path, session_id: str) -> dict[str, Any] | None:
     try:
         receipt = json.loads(path.read_text(encoding="utf-8"))
@@ -179,6 +272,66 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+
+
+class _StreamingSecretRedactor:
+    """Redact exact credentials without leaking chunk-boundary prefixes."""
+
+    def __init__(self, secrets: Sequence[bytes]):
+        self.secrets = tuple(
+            sorted({value for value in secrets if len(value) >= 8}, key=len, reverse=True)
+        )
+        self.pending = b""
+        self.redacted = False
+        self.maximum = max((len(value) for value in self.secrets), default=1)
+
+    def feed(self, chunk: bytes, *, final: bool = False) -> bytes:
+        data = self.pending + chunk
+        held = 0
+        if not final and self.secrets:
+            for length in range(1, min(self.maximum - 1, len(data)) + 1):
+                suffix = data[-length:]
+                if any(secret.startswith(suffix) for secret in self.secrets):
+                    held = length
+        limit = len(data) - held
+        output = bytearray()
+        index = 0
+        while index < limit:
+            match = next(
+                (secret for secret in self.secrets if data.startswith(secret, index)),
+                None,
+            )
+            if match is not None:
+                output.extend(_REDACTION)
+                self.redacted = True
+                index += len(match)
+            else:
+                output.append(data[index])
+                index += 1
+        self.pending = data[index:]
+        if final:
+            while self.pending:
+                match = next(
+                    (
+                        secret
+                        for secret in self.secrets
+                        if self.pending.startswith(secret)
+                    ),
+                    None,
+                )
+                if match is not None:
+                    output.extend(_REDACTION)
+                    self.redacted = True
+                    self.pending = self.pending[len(match) :]
+                else:
+                    output.append(self.pending[0])
+                    self.pending = self.pending[1:]
+        return bytes(output)
+
+
+def _redact_bytes(value: bytes, secrets: Sequence[bytes]) -> tuple[bytes, bool]:
+    redactor = _StreamingSecretRedactor(secrets)
+    return redactor.feed(value, final=True), redactor.redacted
 
 
 def _bounded_process(
@@ -369,6 +522,8 @@ def run_session(
     executable: str | Path | None = None,
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
     max_budget_usd: float | None = None,
+    read_only_paths: Sequence[str | Path] = (),
+    allow_bash: bool = True,
 ) -> dict[str, Any]:
     """Run or safely reuse one deterministic autonomous-agent session."""
 
@@ -397,15 +552,26 @@ def run_session(
     if not cwd.is_dir() or cwd.is_symlink():
         raise AgentSessionError("workdir must be a real directory")
     child_env, route_digest = _session_env(profile, environ)
+    secret_values = tuple(
+        str(value).encode()
+        for name, value in environ.items()
+        if ("KEY" in name.upper() or "TOKEN" in name.upper()) and str(value)
+    )
     requested = str(executable or ("codex" if profile == "codex" else "claude"))
     resolved = shutil.which(requested) if not Path(requested).is_absolute() else requested
     if not resolved or not Path(resolved).is_file():
         raise AgentSessionError("agent CLI executable is unavailable")
-    command = _argv(
+    agent_command = _argv(
         profile,
         str(Path(resolved).resolve()),
         model.strip(),
         max_budget_usd=budget,
+        allow_bash=allow_bash,
+    )
+    command, filesystem_sandbox = _read_only_command(
+        agent_command,
+        cwd=cwd,
+        paths=read_only_paths,
     )
     output_root = Path(out).resolve()
     input_tree_digest = _tree_digest(cwd, exclude=output_root)
@@ -416,7 +582,7 @@ def run_session(
         "model": model.strip(),
         "prompt_digest": _digest_bytes(prompt.encode()),
         "route_digest": route_digest,
-        "argv_template": command[1:],
+        "argv_template": agent_command[1:],
         "workdir_binding": _digest(str(cwd)),
         "executable_digest": _digest_bytes(Path(resolved).read_bytes()),
         "timeout_sec": timeout_sec,
@@ -427,6 +593,8 @@ def run_session(
             if profile == "claude-code"
             else "unsupported-codex-cli"
         ),
+        "filesystem_sandbox": filesystem_sandbox,
+        "bash_tool_enabled": bool(allow_bash),
     }
     session_id = _digest(identity).removeprefix("sha256:")[:32]
     session_dir = output_root / session_id
@@ -448,10 +616,14 @@ def run_session(
             "wb"
         ) as live_stderr:
             live_streams = {"stdout": live_stdout, "stderr": live_stderr}
+            live_redactors = {
+                name: _StreamingSecretRedactor(secret_values)
+                for name in live_streams
+            }
 
             def write_live(name: str, chunk: bytes) -> None:
                 stream = live_streams[name]
-                stream.write(chunk)
+                stream.write(live_redactors[name].feed(chunk))
                 stream.flush()
 
             stdout, stderr, exit_code, failure_class = _bounded_process(
@@ -463,7 +635,12 @@ def run_session(
                 max_output_bytes=max_output_bytes,
                 on_chunk=write_live,
             )
+            for name, stream in live_streams.items():
+                stream.write(live_redactors[name].feed(b"", final=True))
+                stream.flush()
         usage, usage_parser = _parse_usage(profile, stdout)
+        stdout, stdout_redacted = _redact_bytes(stdout, secret_values)
+        stderr, stderr_redacted = _redact_bytes(stderr, secret_values)
 
         _atomic_bytes(session_dir / "stdout.bin", stdout)
         _atomic_bytes(session_dir / "stderr.bin", stderr)
@@ -488,6 +665,7 @@ def run_session(
             "elapsed_sec": round(time.monotonic() - started, 3),
             "max_output_bytes": max_output_bytes,
             "captured_output_bytes": len(stdout) + len(stderr),
+            "provider_credential_redacted": stdout_redacted or stderr_redacted,
             "budget": {
                 "max_budget_usd": budget,
                 "enforcement": identity["budget_enforcement"],
@@ -515,9 +693,18 @@ def run_session(
             "limitations": [
                 "Agent completion is not static-gate, verifier, or Harbor evidence.",
                 (
-                    "The workdir is the process cwd and evidence boundary, not an OS filesystem "
+                    "Declared read-only inputs are protected by an inherited OS sandbox, but other "
+                    "host-account paths and the writable workdir are not isolated."
+                    if filesystem_sandbox is not None
+                    else "The workdir is the process cwd and evidence boundary, not an OS filesystem "
                     "sandbox; enabled coding tools, especially Bash, retain the host account's "
                     "filesystem permissions. Run untrusted stages in an external container/worktree sandbox."
+                ),
+                (
+                    "Bash is disabled; semantic factory agents cannot read the provider credential "
+                    "from a child shell or initiate arbitrary shell-network egress."
+                    if not allow_bash
+                    else "Bash inherits the agent process environment; use only on an externally isolated worker."
                 ),
                 "This process harness does not provide network isolation.",
                 "Live trace files support monitoring, but this runner does not inject hints into an active checkpoint.",

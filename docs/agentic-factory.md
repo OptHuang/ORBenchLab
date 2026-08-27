@@ -13,6 +13,7 @@ sessions and enforces the parts that should not depend on model judgment:
 - one atomic receipt per attempt and safe successful-session reuse;
 - required output paths and content digests;
 - crash recovery, factory-level locking and fail-closed quarantine;
+- OS-enforced read-only factory inputs (Bubblewrap on Linux, sandbox-exec on macOS);
 - explicit evidence levels and no promotion from agent opinion.
 
 ## Default DAG
@@ -98,6 +99,40 @@ orbench agent-factory run \
   --out out/factory-run
 ```
 
+For the unattended semantic/runtime loop, use `autopilot`. It advances one
+agent stage at a time, pauses at `runtime-controls` and `calibration`, launches
+real Harbor Oracle/NOP and repeated Claude Code trials, installs only validated
+receipts and sanitized ATIF bundles under `factory-input/trusted/`, then resumes
+the DAG:
+
+```bash
+orbench agent-factory autopilot \
+  --plan out/factory-plan.json \
+  --workdir out/factory-workspace \
+  --factory-out out/factory-run \
+  --out out/autopilot \
+  --harbor-executable /absolute/path/to/harbor \
+  --claude-executable /absolute/path/to/claude \
+  --frontier-model doubao-seed-2.0-pro \
+  --weak-model doubao-seed-2.0-lite \
+  --repetitions 5 \
+  --max-budget-usd 0.5 \
+  --max-variants 6 \
+  --max-job-attempts 2 \
+  --max-harbor-liability-usd 100
+```
+
+The state file is content-bound and resumable. The worst-case Harbor model
+liability includes the baseline plus every allowed variant and every crash-safe
+job attempt before the first trial starts. Each whole model job is atomically
+charged before Harbor launches, so a crashed job cannot restore budget. Variant
+promotion requires at least three ordered levels, clean
+Oracle/NOP controls, a complete equal-budget frontier/weak rectangle with at
+least five repetitions per cell, recomputed Wilson intervals, monotonicity and
+a conservative separation level. Exploratory selection remains labelled
+exploratory; `--held-out` is accepted only when the manifest predeclares and
+digest-binds selection evidence.
+
 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` or the corresponding OpenAI
 profile variables are read only at the session boundary. Receipts contain a
 route digest and never the credential.
@@ -132,8 +167,11 @@ binds it to the exact Harbor and calibration artifact bytes. Agent-written
 acceptance.
 
 The finalizer consumes independent receipts; it does not itself launch Docker,
-Harbor or the repeated model campaign. A higher-level unattended controller
-must still execute those commands and pass their exact output paths here.
+Harbor or the repeated model campaign. `agent-factory autopilot` now owns the
+semantic/runtime loop and produces its final agent review packet plus trusted
+E3 runtime receipts. Formal release promotion remains a separate deterministic
+`agent-factory supervise`/`finalize` step, so semantic completion cannot silently
+publish a task.
 
 For a real repeated Harbor coding-agent matrix with verifier outcomes and ATIF
 trajectories, use the bounded launcher. The Claude executable is mounted
@@ -160,10 +198,18 @@ evidence are rejected. This remains E3 because every arm is a fresh restart.
 ## Current security boundary
 
 The CLI runner restricts environment variables, customizations, MCP servers,
-time and captured output. Its working directory is an execution and evidence
-boundary, not an operating-system filesystem or network sandbox. Claude's Bash
-tool and Codex inherit the host account's filesystem permissions. Production
-unattended workers should therefore run in a disposable VM/container or a
-dedicated low-privilege account with read-only inputs and an explicit egress
-policy. Separate factory roots can run concurrently; one factory state chain is
+time and captured output. Paper-factory sessions disable Bash entirely; agents
+use Read/Glob/Grep/Edit/Write while deterministic and Harbor gates own command
+execution. This prevents a paper-prompt-injected shell from reading or
+exfiltrating the provider credential. Factory sessions additionally require an inherited
+OS policy that makes the complete `factory-input/` tree immutable: Bubblewrap
+on Linux mounts the host root read-only, exposes only the workspace as writable,
+then remounts trusted inputs and completed outputs read-only. macOS uses a
+default-deny-write sandbox with equivalent workspace/protected-path rules. A
+platform without one of these mechanisms fails closed. This protects trusted
+receipts from the agent, but it is not a complete host or network sandbox:
+Claude's Bash tool can still access other paths allowed to the host account.
+Production unattended workers should therefore still run in a disposable
+VM/container or dedicated low-privilege account with an explicit egress policy.
+Separate factory roots can run concurrently; one factory state chain is
 serialized to prevent receipt races.

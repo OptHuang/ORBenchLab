@@ -40,6 +40,8 @@ from . import agentic_factory as agentic_factory_mod
 from . import factory_blueprints as factory_blueprints_mod
 from . import factory_finalize as factory_finalize_mod
 from . import factory_supervisor as factory_supervisor_mod
+from . import difficulty_matrix as difficulty_matrix_mod
+from . import factory_autopilot as factory_autopilot_mod
 
 PROG = "orbench"
 
@@ -85,9 +87,57 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_task_screen(sub)
     _add_harbor_receipt(sub)
     _add_harbor_model_matrix(sub)
+    _add_difficulty_matrix(sub)
     _add_agent_session(sub)
     _add_agent_factory(sub)
     return parser
+
+
+def _add_difficulty_matrix(sub: argparse._SubParsersAction) -> None:
+    parser = sub.add_parser(
+        "difficulty-matrix",
+        help="validate an ordered E3 difficulty lattice from Harbor evidence",
+    )
+    parser.add_argument("--manifest", required=True)
+    parser.add_argument("--variants-root", required=True)
+    parser.add_argument("--evidence-map", required=True, help="JSON map from variant id to model/control receipts")
+    parser.add_argument("--frontier-model", required=True)
+    parser.add_argument("--weak-model", required=True)
+    parser.add_argument("--held-out", action="store_true")
+    parser.add_argument("--preregistration")
+    parser.add_argument("--out", required=True)
+    parser.set_defaults(handler=_cmd_difficulty_matrix)
+
+
+def _cmd_difficulty_matrix(args: argparse.Namespace) -> int:
+    try:
+        evidence = json.loads(Path(args.evidence_map).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise difficulty_matrix_mod.DifficultyMatrixError(
+            "difficulty evidence map is not valid UTF-8 JSON"
+        ) from None
+    if not isinstance(evidence, dict):
+        raise difficulty_matrix_mod.DifficultyMatrixError("difficulty evidence map must be an object")
+    receipt = difficulty_matrix_mod.build_receipt(
+        manifest_path=args.manifest,
+        variants_root=args.variants_root,
+        evidence=evidence,
+        frontier_model=args.frontier_model,
+        weak_model=args.weak_model,
+        held_out=args.held_out,
+        preregistration_path=args.preregistration,
+    )
+    path = difficulty_matrix_mod.write_receipt(receipt, args.out)
+    _print_json(
+        {
+            "decision": receipt["decision"],
+            "evidence_level": receipt["evidence_level"],
+            "checkpoint_capability": receipt["checkpoint_capability"],
+            "receipt_digest": receipt["receipt_digest"],
+            "written": str(path),
+        }
+    )
+    return 0 if receipt["decision"] != "quarantine" else 8
 
 
 def _add_agent_session(sub: argparse._SubParsersAction) -> None:
@@ -167,6 +217,7 @@ def _add_agent_factory(sub: argparse._SubParsersAction) -> None:
     prepare_parser.add_argument("--weak-model", required=True)
     prepare_parser.add_argument("--pdftotext-executable", default="pdftotext")
     prepare_parser.add_argument("--paper-text-timeout-sec", type=float, default=120.0)
+    prepare_parser.add_argument("--held-out-confirmation", action="store_true")
     prepare_parser.add_argument(
         "--profile", choices=["codex", "claude-code"], default="claude-code"
     )
@@ -180,6 +231,31 @@ def _add_agent_factory(sub: argparse._SubParsersAction) -> None:
     run_parser.add_argument("--codex-executable")
     run_parser.add_argument("--claude-executable")
     run_parser.set_defaults(handler=_cmd_agent_factory_run)
+
+    autopilot = inner.add_parser(
+        "autopilot",
+        help="run or resume semantic agents and trusted Harbor runtime barriers",
+    )
+    for flag in (
+        "plan",
+        "workdir",
+        "factory-out",
+        "out",
+        "harbor-executable",
+        "claude-executable",
+        "frontier-model",
+        "weak-model",
+    ):
+        autopilot.add_argument(f"--{flag}", required=True)
+    autopilot.add_argument("--repetitions", type=int, default=5)
+    autopilot.add_argument("--max-budget-usd", type=float, default=0.5)
+    autopilot.add_argument("--max-turns", type=int, default=40)
+    autopilot.add_argument("--harbor-timeout-sec", type=float, default=10_800)
+    autopilot.add_argument("--max-variants", type=int, default=6)
+    autopilot.add_argument("--max-job-attempts", type=int, default=2)
+    autopilot.add_argument("--max-harbor-liability-usd", type=float, default=100.0)
+    autopilot.add_argument("--held-out", action="store_true")
+    autopilot.set_defaults(handler=_cmd_agent_factory_autopilot)
 
     finalize_parser = inner.add_parser(
         "finalize", help="independently gate an E1 factory run into an E3 release candidate"
@@ -277,6 +353,7 @@ def _cmd_agent_factory_prepare_paper(args: argparse.Namespace) -> int:
         frontier_model=args.frontier_model,
         weak_model=args.weak_model,
         profile=args.profile,
+        held_out_confirmation=args.held_out_confirmation,
     )
     path = agentic_factory_mod.write_plan(plan, args.plan_out)
     _print_json(
@@ -335,6 +412,49 @@ def _cmd_agent_factory_run(args: argparse.Namespace) -> int:
         }
     )
     return 0 if result["status"] in {"active", "semantic-complete-e1"} else 8
+
+
+def _cmd_agent_factory_autopilot(args: argparse.Namespace) -> int:
+    plan = agentic_factory_mod.load_plan(args.plan)
+    provider_env = {
+        name: os.environ[name]
+        for name in (
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        )
+        if name in os.environ
+    }
+    result = factory_autopilot_mod.run(
+        plan,
+        workdir=args.workdir,
+        factory_out=args.factory_out,
+        out=args.out,
+        harbor_executable=args.harbor_executable,
+        claude_executable=args.claude_executable,
+        frontier_model=args.frontier_model,
+        weak_model=args.weak_model,
+        provider_env=provider_env,
+        repetitions=args.repetitions,
+        max_budget_usd=args.max_budget_usd,
+        max_turns=args.max_turns,
+        harbor_timeout_sec=args.harbor_timeout_sec,
+        max_variants=args.max_variants,
+        max_harbor_liability_usd=args.max_harbor_liability_usd,
+        max_job_attempts=args.max_job_attempts,
+        held_out=args.held_out,
+    )
+    _print_json(
+        {
+            "status": result["status"],
+            "identity_digest": result["identity_digest"],
+            "factory_run_digest": result.get("factory_run_digest"),
+            "selected_task": result.get("selected_task"),
+            "barriers": result.get("barriers", {}),
+            "written": str(Path(args.out) / "autopilot-state.json"),
+        }
+    )
+    return 0 if result["status"] == "semantic-complete-e1" else 8
 
 
 def _cmd_agent_factory_finalize(args: argparse.Namespace) -> int:
@@ -1077,11 +1197,25 @@ def _add_harbor_model_matrix(sub: argparse._SubParsersAction) -> None:
     parser.add_argument("--max-budget-usd", type=float, default=1.0)
     parser.add_argument("--max-turns", type=int, default=40)
     parser.add_argument("--timeout-sec", type=float, default=10_800)
+    parser.add_argument("--max-job-attempts", type=int, default=2)
+    parser.add_argument(
+        "--harbor-control-receipt",
+        help="optional matching Oracle/NOP receipt used to build screening-report.json",
+    )
     parser.add_argument("--out", required=True)
     parser.set_defaults(handler=_cmd_harbor_model_matrix)
 
 
 def _cmd_harbor_model_matrix(args: argparse.Namespace) -> int:
+    provider_env = {
+        name: os.environ[name]
+        for name in (
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        )
+        if name in os.environ
+    }
     receipt = harbor_model_matrix_mod.launch_matrix(
         args.task_dir,
         harbor_executable=args.harbor_executable,
@@ -1089,19 +1223,42 @@ def _cmd_harbor_model_matrix(args: argparse.Namespace) -> int:
         out=args.out,
         models=args.model,
         repetitions=args.repetitions,
-        provider_env={
-            name: os.environ[name]
-            for name in (
-                "ANTHROPIC_BASE_URL",
-                "ANTHROPIC_AUTH_TOKEN",
-                "ANTHROPIC_API_KEY",
-            )
-            if name in os.environ
-        },
+        provider_env=provider_env,
         max_budget_usd=args.max_budget_usd,
         max_turns=args.max_turns,
         timeout_sec=args.timeout_sec,
+        max_job_attempts=args.max_job_attempts,
     )
+    trace_manifest = harbor_model_matrix_mod.write_trace_bundle(
+        receipt,
+        matrix_root=args.out,
+        out=Path(args.out) / "trace-bundle",
+        secret_values=[
+            value
+            for name, value in provider_env.items()
+            if "KEY" in name or "TOKEN" in name
+        ],
+    )
+    screening_path = None
+    if args.harbor_control_receipt:
+        try:
+            controls = json.loads(
+                Path(args.harbor_control_receipt).read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            raise harbor_model_matrix_mod.HarborModelMatrixError(
+                "Harbor control receipt is not valid UTF-8 JSON"
+            ) from None
+        if not isinstance(controls, dict):
+            raise harbor_model_matrix_mod.HarborModelMatrixError(
+                "Harbor control receipt root must be an object"
+            )
+        harbor_model_matrix_mod.build_screening_report(
+            receipt,
+            harbor_controls=controls,
+            out=args.out,
+        )
+        screening_path = str(Path(args.out) / "screening-report.json")
     _print_json(
         {
             "task": receipt["task"],
@@ -1111,7 +1268,9 @@ def _cmd_harbor_model_matrix(args: argparse.Namespace) -> int:
             "evidence_level": receipt["evidence_level"],
             "checkpoint_capability": receipt["checkpoint_capability"],
             "receipt_digest": receipt["receipt_digest"],
+            "trace_manifest_digest": trace_manifest["manifest_digest"],
             "written": str(Path(args.out) / "harbor-model-matrix.json"),
+            "screening_report": screening_path,
         }
     )
     return 0

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from orbenchlab import harbor_model_matrix
+from orbenchlab import harbor_launcher, harbor_model_matrix
 from orbenchlab.cli import main
 
 
@@ -54,6 +54,8 @@ for attempt in range(1, repetitions + 1):
     trial.joinpath('result.json').write_text(json.dumps({{
         'task_name': 'terminal-bench-science/demo-task',
         'exception_info': exception,
+        'agent_result': {{'n_input_tokens': 10, 'n_cache_tokens': 2,
+        'n_output_tokens': 3, 'cost_usd': 0.25}},
         'verifier_result': {{'rewards': {{'reward': reward}}}},
     }}))
     trial.joinpath('verifier/reward.txt').write_text(str(reward) + '\\n')
@@ -112,7 +114,11 @@ def test_launches_reuses_and_validates_rectangular_atif_matrix(tmp_path: Path):
         row["agent_failure_class"] for row in first["trials"] if row["model_id"] == "weak"
     } == {"NonZeroAgentExitCodeError"}
     assert all(row["trajectories"][0]["steps"] == 1 for row in first["trials"])
+    assert all(row["usage"]["cost_usd"] == 0.25 for row in first["trials"])
     assert len(list((out / "jobs").glob("*/result.json"))) == 2
+    assert len(list((out / "reservations").glob("*.json"))) == 2
+    assert first["agent"]["max_job_attempts_per_model"] == 2
+    assert first["agent"]["maximum_model_liability_usd"] == 4.0
     evidence = "\n".join(
         path.read_text(encoding="utf-8", errors="replace")
         for path in out.rglob("*")
@@ -120,6 +126,44 @@ def test_launches_reuses_and_validates_rectangular_atif_matrix(tmp_path: Path):
     )
     assert "fixture-provider-secret" not in evidence
     assert "[REDACTED_PROVIDER_CREDENTIAL]" in evidence
+
+    bundle = harbor_model_matrix.write_trace_bundle(
+        first,
+        matrix_root=out,
+        out=tmp_path / "trace-bundle",
+        secret_values=[PROVIDER["ANTHROPIC_AUTH_TOKEN"]],
+    )
+    assert len(bundle["trajectories"]) == 4
+    assert harbor_model_matrix.write_trace_bundle(
+        first,
+        matrix_root=out,
+        out=tmp_path / "trace-bundle",
+    )["manifest_digest"] == bundle["manifest_digest"]
+
+    controls = {
+        "schema_version": "orbenchlab.screening-report.v1",
+        "harbor_receipt_schema_version": "orbenchlab.harbor-controls.v1",
+        "task_tree_digest": first["task_tree_digest"],
+        "tasks": [
+            {
+                "task": first["task"],
+                "control_gates": {
+                    "oracle": {"gate": "pass"},
+                    "nop": {"gate": "pass"},
+                },
+            }
+        ],
+    }
+    controls["report_digest"] = harbor_model_matrix._digest(controls)
+    screening = harbor_model_matrix.build_screening_report(
+        first,
+        harbor_controls=controls,
+        out=tmp_path / "screening",
+    )
+    assert screening["harbor_model_matrix_digest"] == first["receipt_digest"]
+    assert screening["tasks"][0]["evidence_level"] == "E3"
+    assert len(screening["trials"]) == 4
+    assert screening["tasks"][0]["decision"] == "collect-more-evidence"
 
 
 def test_missing_atif_trajectory_fails_closed(tmp_path: Path):
@@ -134,6 +178,35 @@ def test_missing_atif_trajectory_fails_closed(tmp_path: Path):
             provider_env=PROVIDER,
             timeout_sec=5,
         )
+
+
+def test_crashed_harbor_jobs_consume_the_persisted_attempt_cap(tmp_path: Path):
+    harbor = tmp_path / "harbor"
+    harbor.write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
+    harbor.chmod(0o755)
+    task = _task(tmp_path)
+    claude = _claude(tmp_path)
+    kwargs = dict(
+        task_dir=task,
+        harbor_executable=harbor,
+        claude_executable=claude,
+        out=tmp_path / "out",
+        models=["frontier"],
+        repetitions=5,
+        provider_env=PROVIDER,
+        max_budget_usd=0.5,
+        max_job_attempts=2,
+        timeout_sec=5,
+    )
+    for _ in range(2):
+        with pytest.raises(harbor_launcher.HarborLauncherError, match="nonzero_exit"):
+            harbor_model_matrix.launch_matrix(**kwargs)
+    reservations = list((tmp_path / "out/reservations").glob("*.json"))
+    assert len(reservations) == 2
+    assert sum(json.loads(path.read_text())["reserved_liability_usd"] for path in reservations) == 5.0
+    with pytest.raises(harbor_model_matrix.HarborModelMatrixError, match="attempt cap"):
+        harbor_model_matrix.launch_matrix(**kwargs)
+    assert len(list((tmp_path / "out/reservations").glob("*.json"))) == 2
 
 
 def test_cli_runs_real_harbor_matrix_contract(tmp_path: Path, monkeypatch, capsys):
