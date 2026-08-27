@@ -360,14 +360,14 @@ def paper_to_benchmark_plan(
             "a structured evidence map with page/section anchors and no task design yet. For this "
             "stage, inspect only paper.txt, paper.pdf and paper-provenance.json: do not inspect seed-task, "
             "run solvers/tests, or evaluate an existing task. Do not re-extract the complete PDF: use "
-            "the page markers in paper.txt. Keep the JSON under 20000 UTF-8 bytes: prioritize executable "
+            "the page markers in paper.txt. Keep the JSON under 24000 UTF-8 bytes: prioritize executable "
             "claims, blockers and no more than six task-relevant interactions; omit narrative repetition. "
             "Write it promptly, validate it locally, and stop immediately after validation.",
             "factory/evidence/paper-derivation-primary.json",
             model=author_model,
             profile=profile,
             max_budget_usd=2.0,
-            artifact_max_bytes=20_000,
+            artifact_max_bytes=24_000,
         ),
         _stage(
             "paper-derive-critic",
@@ -380,7 +380,7 @@ def paper_to_benchmark_plan(
             profile=profile,
             depends_on=("paper-derive-primary",),
             max_budget_usd=2.0,
-            artifact_max_bytes=20_000,
+            artifact_max_bytes=24_000,
         ),
         _stage(
             "task-design-a",
