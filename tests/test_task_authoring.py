@@ -96,6 +96,8 @@ def test_complete_skeleton_is_ready_for_review_and_round_linked(tmp_path: Path):
     assert first["decision"] == "ready-for-human-review"
     assert first["counts"]["fail"] == 0
     assert first["counts"]["review"] >= 1
+    assert sum(first["counts"].values()) == 39
+    assert sum(first["overall_counts"].values()) == 40
     paths = task_authoring.write_receipt(first, tmp_path / "round-1")
     second = task_authoring.validate_task(
         task,

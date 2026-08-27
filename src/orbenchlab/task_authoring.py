@@ -486,6 +486,16 @@ def validate_task(
     all_checks = [*criteria, *paper_checks]
     fail_count = sum(item.status == "fail" for item in all_checks)
     review_count = sum(item.status == "review" for item in all_checks)
+    implementation_counts = {
+        "pass": sum(item.status == "pass" for item in criteria),
+        "fail": sum(item.status == "fail" for item in criteria),
+        "review": sum(item.status == "review" for item in criteria),
+    }
+    overall_counts = {
+        "pass": sum(item.status == "pass" for item in all_checks),
+        "fail": fail_count,
+        "review": review_count,
+    }
     if fail_count:
         decision = "blocked"
     elif review_count:
@@ -515,7 +525,11 @@ def validate_task(
         "proposal_criteria": proposal,
         "implementation_criteria": [item.as_dict() for item in sorted(criteria, key=lambda item: item.name)],
         "provenance_checks": [item.as_dict() for item in [*paper_checks, *previous_checks]],
-        "counts": {"pass": sum(item.status == "pass" for item in all_checks), "fail": fail_count, "review": review_count},
+        # ``counts`` covers exactly the 39 implementation-rubric entries.
+        # Provenance/chain checks are additional and are reported separately so
+        # a 39-item rubric cannot silently acquire a 40th status.
+        "counts": implementation_counts,
+        "overall_counts": overall_counts,
         "decision": decision,
         "previous_receipt_digest": previous_digest,
         "limitations": [
@@ -539,7 +553,8 @@ def write_receipt(receipt: Mapping[str, Any], out: str | Path) -> dict[str, Path
         "",
         f"- Decision: **{receipt['decision']}**",
         f"- Round: `{receipt['round']}`",
-        f"- Counts: `{receipt['counts']}`",
+        f"- Implementation counts (39 criteria): `{receipt['counts']}`",
+        f"- Overall counts (including provenance): `{receipt.get('overall_counts', receipt['counts'])}`",
         f"- Rubric: `{receipt['rubric']['implementation_criteria_count']}` criteria from {receipt['rubric']['implementation_source']}",
         f"- Receipt digest: `{receipt['receipt_digest']}`",
         "",

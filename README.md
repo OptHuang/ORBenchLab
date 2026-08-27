@@ -83,7 +83,9 @@ digest so an agent-tuning loop remains auditable. A paper digest without a
 local `source_path` byte match and registry resolution remains a review item;
 the gate does not trust a caller-provided hash as independent evidence. Each
 receipt also records a path-independent `task_tree_digest`, so changes to any
-task file are visible between rounds.
+task file are visible between rounds. The receipt separates the 39-item
+implementation counts from additional paper/round provenance counts, so the
+rubric count and status totals cannot contradict each other.
 
 When the static gate has produced a receipt, the semantic authoring pass can
 be delegated to Volcengine models on the execution host:
