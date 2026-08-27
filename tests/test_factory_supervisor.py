@@ -199,3 +199,50 @@ def test_external_adapter_output_is_hard_bounded(tmp_path: Path):
     )
     assert result["status"] == "blocked"
     assert result["failure_class"] == "output_limit_exceeded"
+
+
+def test_failed_external_stage_stops_after_attempt_cap(tmp_path: Path, monkeypatch):
+    plan, run, work, task, paper, genome = _fixture(tmp_path)
+    monkeypatch.setattr(
+        factory_supervisor.task_authoring,
+        "validate_task",
+        lambda *args, **kwargs: {"decision": "ready-for-human-review"},
+    )
+    def write_static(receipt, out):
+        path = Path(out) / "authoring-receipt.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(receipt), encoding="utf-8")
+        return {"json": path}
+    monkeypatch.setattr(factory_supervisor.task_authoring, "write_receipt", write_static)
+    counter = tmp_path / "counter"
+    command = tmp_path / "no-receipt"
+    command.write_text(
+        f"#!/bin/sh\nprintf x >> '{counter}'\nexit 0\n",
+        encoding="utf-8",
+    )
+    command.chmod(0o755)
+    kwargs = dict(
+        plan_path=plan,
+        factory_run_path=run,
+        workdir=work,
+        task_dir=task,
+        task_genome=genome,
+        paper_provenance=paper,
+        out=tmp_path / "supervised",
+        harbor_executable=None,
+        semantic_review_executable=command,
+        semantic_review_models=["review-a", "review-b"],
+        harbor_inputs={},
+        calibration_executable=None,
+        calibration_models=["frontier", "weak"],
+        test_image="image",
+        repetitions=5,
+        provider_env=PROVIDER,
+        max_external_attempts=2,
+    )
+    factory_supervisor.run(**kwargs)
+    factory_supervisor.run(**kwargs)
+    third = factory_supervisor.run(**kwargs)
+    assert counter.read_text() == "xx"
+    assert third["stages"]["semantic_review"]["failure_class"] == "attempts_exhausted"
+    assert third["stages"]["semantic_review"]["attempt_count"] == 2

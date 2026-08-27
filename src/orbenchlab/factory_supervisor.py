@@ -222,10 +222,17 @@ def run(
     timeout_sec: float = 600,
     harbor_cli_executable: str | None = None,
     builtin_volc: bool = False,
+    max_external_attempts: int = 2,
 ) -> dict[str, Any]:
     """Execute or resume the fixed five-stage control-plane."""
 
-    if repetitions < 5 or len(set(calibration_models)) < 2 or len(set(semantic_review_models)) < 2 or timeout_sec <= 0:
+    if (
+        repetitions < 5
+        or len(set(calibration_models)) < 2
+        or len(set(semantic_review_models)) < 2
+        or timeout_sec <= 0
+        or not 1 <= max_external_attempts <= 5
+    ):
         raise FactorySupervisorError("calibration requires two distinct models, >=5 repetitions and positive timeout")
     root = Path(out)
     workspace = Path(workdir).resolve()
@@ -268,6 +275,7 @@ def run(
             "semantic_review_adapter": _executable_binding(semantic_review_executable),
             "semantic_review_models": list(semantic_review_models),
             "builtin_volc": bool(builtin_volc),
+            "max_external_attempts": max_external_attempts,
             "timeout_sec": timeout_sec,
             "provider_route_digest": route_digest,
         }
@@ -292,6 +300,36 @@ def run(
                 raise FactorySupervisorError(f"completed {name} output changed after receipt")
             record(name, {"status": "reused", "output": str(path), "output_digest": actual})
 
+        def can_attempt(name: str) -> bool:
+            previous = state["stages"].get(name, {})
+            attempts = previous.get("attempts", []) if isinstance(previous, Mapping) else []
+            return isinstance(attempts, list) and len(attempts) < max_external_attempts
+
+        def record_attempt(name: str, result: Mapping[str, Any]) -> None:
+            previous = state["stages"].get(name, {})
+            attempts = list(previous.get("attempts", [])) if isinstance(previous, Mapping) else []
+            summary = {
+                key: value
+                for key, value in result.items()
+                if key not in {"attempts", "attempt_count"}
+            }
+            attempts.append({"attempt": len(attempts) + 1, **summary})
+            record(name, {**dict(result), "attempt_count": len(attempts), "attempts": attempts})
+
+        def record_exhausted(name: str) -> None:
+            previous = state["stages"].get(name, {})
+            attempts = list(previous.get("attempts", [])) if isinstance(previous, Mapping) else []
+            record(
+                name,
+                {
+                    "status": "blocked",
+                    "failure_class": "attempts_exhausted",
+                    "last_failure_class": previous.get("failure_class") if isinstance(previous, Mapping) else None,
+                    "attempt_count": len(attempts),
+                    "attempts": attempts,
+                },
+            )
+
         static_json = root / "static" / "authoring-receipt.json"
         if not static_json.exists():
             receipt = task_authoring.validate_task(task, paper_provenance=paper_path)
@@ -308,6 +346,8 @@ def run(
         elif not static_passed:
             semantic = {"status": "blocked", "failure_class": "upstream_static_blocked"}
             record("semantic_review", semantic)
+        elif not can_attempt("semantic_review"):
+            record_exhausted("semantic_review")
         elif builtin_volc:
             try:
                 config = volc_review.VolcConfig(
@@ -337,14 +377,14 @@ def run(
                     "failure_class": "volc_review_failed",
                     "failure_detail": str(exc),
                 }
-            record("semantic_review", semantic)
+            record_attempt("semantic_review", semantic)
         else:
             args = ["--task-dir", str(task), "--paper-provenance", str(paper_path), "--receipt", str(static_json), "--round", "1", "--models", ",".join(semantic_review_models), "--out", str(root / "semantic")]
             semantic = _command(semantic_review_executable, args, timeout_sec=timeout_sec, cwd=workspace, child_env=provider_child)
             if semantic.get("status") == "passed" and not semantic_json.is_file():
                 semantic = {**semantic, "status": "blocked", "failure_class": "expected_receipt_missing"}
             if semantic_json.is_file(): semantic = {**semantic, "output": str(semantic_json), "output_digest": _digest(semantic_json)}
-            record("semantic_review", semantic)
+            record_attempt("semantic_review", semantic)
         semantic_passed = False
         if semantic_json.is_file():
             semantic_receipt = json.loads(semantic_json.read_text(encoding="utf-8"))
@@ -356,6 +396,8 @@ def run(
         elif not semantic_passed:
             harbor = {"status": "blocked", "failure_class": "upstream_semantic_blocked"}
             record("harbor", harbor)
+        elif not can_attempt("harbor"):
+            record_exhausted("harbor")
         else:
             required = ("executed_task_dir", "oracle_job", "nop_job")
             if harbor_cli_executable:
@@ -386,7 +428,7 @@ def run(
             if harbor.get("status") == "passed" and not harbor_json.is_file():
                 harbor = {**harbor, "status": "blocked", "failure_class": "expected_receipt_missing"}
             if harbor_json.is_file(): harbor = {**harbor, "output": str(harbor_json), "output_digest": _digest(harbor_json)}
-            record("harbor", harbor)
+            record_attempt("harbor", harbor)
 
         calibration_json = root / "calibration" / "screening-report.json"
         if calibration_json.exists():
@@ -394,6 +436,8 @@ def run(
         elif not semantic_passed:
             calibration = {"status": "blocked", "failure_class": "upstream_semantic_blocked"}
             record("calibration", calibration)
+        elif not can_attempt("calibration"):
+            record_exhausted("calibration")
         elif builtin_volc:
             try:
                 config = volc_review.VolcConfig(
@@ -425,14 +469,14 @@ def run(
                     "failure_class": "volc_calibration_failed",
                     "failure_detail": str(exc),
                 }
-            record("calibration", calibration)
+            record_attempt("calibration", calibration)
         else:
             args = ["--task-dir", str(task), "--test-image", test_image, "--out", str(root / "calibration"), "--models", ",".join(calibration_models), "--repetitions", str(repetitions), "--hint-level", "0", "--controls", "oracle,nop"]
             calibration = _command(calibration_executable, args, timeout_sec=timeout_sec, cwd=workspace, child_env=provider_child)
             if calibration.get("status") == "passed" and not calibration_json.is_file():
                 calibration = {**calibration, "status": "blocked", "failure_class": "expected_receipt_missing"}
             if calibration_json.is_file(): calibration = {**calibration, "output": str(calibration_json), "output_digest": _digest(calibration_json)}
-            record("calibration", calibration)
+            record_attempt("calibration", calibration)
 
         cards_json = root / "cards" / "task-cards.json"
         evidence = [path for path in (harbor_json, calibration_json) if path.is_file()]

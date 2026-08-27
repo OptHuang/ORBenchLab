@@ -220,6 +220,7 @@ def _add_agent_factory(sub: argparse._SubParsersAction) -> None:
     supervise.add_argument("--model", action="append", required=True)
     supervise.add_argument("--repetitions", type=int, default=5)
     supervise.add_argument("--timeout-sec", type=float, default=600)
+    supervise.add_argument("--max-external-attempts", type=int, default=2)
     supervise.set_defaults(handler=_cmd_agent_factory_supervise)
 
 
@@ -369,6 +370,7 @@ def _cmd_agent_factory_supervise(args: argparse.Namespace) -> int:
         calibration_executable=args.calibration_executable, calibration_models=args.model,
         test_image=args.test_image, repetitions=args.repetitions, timeout_sec=args.timeout_sec,
         builtin_volc=not args.external_volc_adapters,
+        max_external_attempts=args.max_external_attempts,
         provider_env={name: os.environ[name] for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY") if name in os.environ},
     )
     _print_json({"status": result["status"], "promoted": result["promoted"], "identity_digest": result["identity_digest"], "written": str(Path(args.out) / "supervisor-state.json")})
