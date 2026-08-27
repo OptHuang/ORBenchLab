@@ -211,6 +211,7 @@ def paper_to_benchmark_plan(
             "factory/evidence/paper-derivation-primary.json",
             model=author_model,
             profile=profile,
+            max_budget_usd=2.0,
         ),
         _stage(
             "paper-derive-critic",
@@ -222,6 +223,7 @@ def paper_to_benchmark_plan(
             model=reviewers[0],
             profile=profile,
             depends_on=("paper-derive-primary",),
+            max_budget_usd=2.0,
         ),
         _stage(
             "task-design-a",

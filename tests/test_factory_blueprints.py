@@ -98,6 +98,7 @@ def test_default_plan_assigns_all_semantic_stages_to_agent_sessions():
     ]
     assert all(stage["profile"] == "claude-code" for stage in plan["stages"])
     assert all(stage["required_outputs"] for stage in plan["stages"])
+    assert plan["maximum_model_liability_usd"] == 41.0
     assert agentic_factory.validate_plan(plan) == plan
 
 
