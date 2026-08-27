@@ -95,6 +95,12 @@ def _add_agent_session(sub: argparse._SubParsersAction) -> None:
     run.add_argument("--out", required=True)
     run.add_argument("--timeout-sec", type=float, required=True)
     run.add_argument(
+        "--max-budget-usd",
+        type=float,
+        required=True,
+        help="per-session provider budget intent; hard-enforced by Claude CLI only",
+    )
+    run.add_argument(
         "--max-output-bytes",
         type=int,
         default=agent_sessions_mod.DEFAULT_MAX_OUTPUT_BYTES,
@@ -119,6 +125,7 @@ def _cmd_agent_session_run(args: argparse.Namespace) -> int:
         workdir=args.workdir,
         out=args.out,
         timeout_sec=args.timeout_sec,
+        max_budget_usd=args.max_budget_usd,
         max_output_bytes=args.max_output_bytes,
         environ=supplied,
         executable=args.executable,

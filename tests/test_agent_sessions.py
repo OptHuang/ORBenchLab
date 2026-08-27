@@ -46,6 +46,7 @@ def test_session_writes_bound_receipt_and_reuses_success(tmp_path: Path, profile
         workdir=tmp_path,
         out=out,
         timeout_sec=5,
+        max_budget_usd=0.25,
         environ=_env(profile),
         executable=executable,
     )
@@ -57,6 +58,7 @@ def test_session_writes_bound_receipt_and_reuses_success(tmp_path: Path, profile
         workdir=tmp_path,
         out=out,
         timeout_sec=5,
+        max_budget_usd=0.25,
         environ=_env(profile),
         executable=executable,
     )
@@ -81,6 +83,7 @@ def test_claude_argv_enables_bounded_noninteractive_coding_tools(tmp_path: Path)
         workdir=tmp_path,
         out=tmp_path / "sessions",
         timeout_sec=2,
+        max_budget_usd=0.25,
         environ=_env("claude-code"),
         executable=executable,
     )
@@ -89,6 +92,13 @@ def test_claude_argv_enables_bounded_noninteractive_coding_tools(tmp_path: Path)
     assert argv[argv.index("--tools") + 1] == tools
     assert argv[argv.index("--allowedTools") + 1] == tools
     assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+    assert argv[argv.index("--max-budget-usd") + 1] == "0.25"
+    assert result["identity"]["max_budget_usd"] == 0.25
+    assert result["budget"] == {
+        "max_budget_usd": 0.25,
+        "enforcement": "claude-cli-max-budget-usd",
+        "hard_enforced_by_cli": True,
+    }
     assert "--safe-mode" in argv
     assert "--strict-mcp-config" in argv
     assert "--no-session-persistence" in argv
@@ -106,6 +116,7 @@ def test_timeout_is_hard_failure_with_atomic_receipt(tmp_path: Path):
         workdir=tmp_path,
         out=tmp_path / "sessions",
         timeout_sec=0.05,
+        max_budget_usd=0.25,
         environ=_env("claude-code"),
         executable=executable,
     )
@@ -123,6 +134,7 @@ def test_output_limit_kills_process_group_without_unbounded_capture(tmp_path: Pa
         workdir=tmp_path,
         out=tmp_path / "sessions",
         timeout_sec=5,
+        max_budget_usd=0.25,
         max_output_bytes=2048,
         environ=_env("codex"),
         executable="/usr/bin/yes",
@@ -148,6 +160,7 @@ def test_same_session_is_serialised_across_processes_and_reused(tmp_path: Path):
         "workdir": tmp_path,
         "out": tmp_path / "sessions",
         "timeout_sec": 3,
+        "max_budget_usd": 0.25,
         "environ": _env("codex"),
         "executable": executable,
     }
@@ -175,6 +188,7 @@ def test_route_and_environment_fail_closed(tmp_path: Path):
             workdir=tmp_path,
             out=tmp_path / "sessions",
             timeout_sec=1,
+            max_budget_usd=0.25,
             environ={"OPENAI_BASE_URL": "https://example.test/v1", "OPENAI_API_KEY": "x"},
             executable=executable,
         )
@@ -188,6 +202,7 @@ def test_route_and_environment_fail_closed(tmp_path: Path):
             workdir=tmp_path,
             out=tmp_path / "sessions",
             timeout_sec=1,
+            max_budget_usd=0.25,
             environ=poisoned,
             executable=executable,
         )
@@ -205,9 +220,48 @@ def test_cli_runs_fixture_profile_without_provider_call(tmp_path: Path, monkeypa
             "--model", "fixture-model", "--prompt-file", str(prompt), "--workdir",
             str(tmp_path), "--out", str(tmp_path / "sessions"), "--timeout-sec", "2",
             "--executable", str(executable),
+            "--max-budget-usd", "0.25",
         ]
     )
     payload = json.loads(capsys.readouterr().out)
     assert code == 0
     assert payload["status"] == "completed"
     assert "fixture-secret" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize("value", [None, 0, -1, float("inf"), float("nan"), 101, True])
+def test_session_rejects_missing_or_unsafe_budget_before_launch(tmp_path: Path, value):
+    executable = _fixture_cli(tmp_path, "printf launched > should-not-exist")
+    with pytest.raises(AgentSessionError, match="max_budget_usd"):
+        run_session(
+            profile="codex",
+            stage="reviewer",
+            model="fixture-model",
+            prompt="review",
+            workdir=tmp_path,
+            out=tmp_path / "sessions",
+            timeout_sec=1,
+            max_budget_usd=value,
+            environ=_env("codex"),
+            executable=executable,
+        )
+    assert not (tmp_path / "should-not-exist").exists()
+
+
+def test_codex_records_that_dollar_budget_is_not_cli_enforced(tmp_path: Path):
+    executable = _fixture_cli(tmp_path, "printf done")
+    result = run_session(
+        profile="codex",
+        stage="reviewer",
+        model="fixture-model",
+        prompt="review",
+        workdir=tmp_path,
+        out=tmp_path / "sessions",
+        timeout_sec=1,
+        max_budget_usd=0.25,
+        environ=_env("codex"),
+        executable=executable,
+    )
+    assert result["budget"]["hard_enforced_by_cli"] is False
+    assert result["budget"]["enforcement"] == "unsupported-codex-cli"
+    assert "--max-budget-usd" not in result["identity"]["argv_template"]

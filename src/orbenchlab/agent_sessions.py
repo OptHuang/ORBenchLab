@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import fcntl
 import json
+import math
 import os
 import selectors
 import shutil
@@ -68,7 +69,13 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     )
 
 
-def _argv(profile: str, executable: str, model: str) -> list[str]:
+def _argv(
+    profile: str,
+    executable: str,
+    model: str,
+    *,
+    max_budget_usd: float,
+) -> list[str]:
     if profile == "codex":
         return [executable, "exec", "--json", "--model", model, "-"]
     coding_tools = "Read,Glob,Grep,Edit,Write,Bash"
@@ -84,6 +91,8 @@ def _argv(profile: str, executable: str, model: str) -> list[str]:
         "--no-session-persistence",
         "--permission-mode",
         "dontAsk",
+        "--max-budget-usd",
+        format(max_budget_usd, ".12g"),
         "--tools",
         coding_tools,
         "--allowedTools",
@@ -279,6 +288,7 @@ def run_session(
     environ: Mapping[str, str],
     executable: str | Path | None = None,
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+    max_budget_usd: float | None = None,
 ) -> dict[str, Any]:
     """Run or safely reuse one deterministic autonomous-agent session."""
 
@@ -294,6 +304,15 @@ def run_session(
         or not 1 <= max_output_bytes <= 256 * 1024 * 1024
     ):
         raise AgentSessionError("stage, model, prompt and timeout must be positive")
+    if (
+        max_budget_usd is None
+        or isinstance(max_budget_usd, bool)
+        or not isinstance(max_budget_usd, (int, float))
+        or not math.isfinite(float(max_budget_usd))
+        or not 0 < float(max_budget_usd) <= 100.0
+    ):
+        raise AgentSessionError("max_budget_usd must be a finite value in (0, 100]")
+    budget = float(max_budget_usd)
     cwd = Path(workdir).resolve()
     if not cwd.is_dir() or cwd.is_symlink():
         raise AgentSessionError("workdir must be a real directory")
@@ -302,7 +321,12 @@ def run_session(
     resolved = shutil.which(requested) if not Path(requested).is_absolute() else requested
     if not resolved or not Path(resolved).is_file():
         raise AgentSessionError("agent CLI executable is unavailable")
-    command = _argv(profile, str(Path(resolved).resolve()), model.strip())
+    command = _argv(
+        profile,
+        str(Path(resolved).resolve()),
+        model.strip(),
+        max_budget_usd=budget,
+    )
     output_root = Path(out).resolve()
     input_tree_digest = _tree_digest(cwd, exclude=output_root)
     identity = {
@@ -317,6 +341,12 @@ def run_session(
         "executable_digest": _digest_bytes(Path(resolved).read_bytes()),
         "timeout_sec": timeout_sec,
         "max_output_bytes": max_output_bytes,
+        "max_budget_usd": budget,
+        "budget_enforcement": (
+            "claude-cli-max-budget-usd"
+            if profile == "claude-code"
+            else "unsupported-codex-cli"
+        ),
     }
     session_id = _digest(identity).removeprefix("sha256:")[:32]
     session_dir = output_root / session_id
@@ -357,6 +387,11 @@ def run_session(
             "elapsed_sec": round(time.monotonic() - started, 3),
             "max_output_bytes": max_output_bytes,
             "captured_output_bytes": len(stdout) + len(stderr),
+            "budget": {
+                "max_budget_usd": budget,
+                "enforcement": identity["budget_enforcement"],
+                "hard_enforced_by_cli": profile == "claude-code",
+            },
             "stdout_digest": _digest_bytes(stdout),
             "stderr_digest": _digest_bytes(stderr),
             "trace_digest": _digest(
