@@ -157,6 +157,9 @@ derivation evidence; author patches cannot modify that reserved file.
 The exact `{path, content}` single-file shorthand returned by some Volc coding
 endpoints is accepted only with those two fields: the runner supplies trusted
 round/CAS bindings locally and then applies the same path, secret and size gates.
+On a Volc `/api/coding` base URL, explicit reviewer model IDs are sent through
+that gateway's Anthropic-compatible messages endpoint rather than being moved
+to an unrelated chat-completions route.
 
 For a fast, task-local model screen on an execution host that already has the
 Volcengine environment and a pinned verifier image, use:

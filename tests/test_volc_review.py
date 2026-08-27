@@ -57,16 +57,17 @@ def test_call_reviewer_records_digests_without_token(monkeypatch):
     assert "secret-token" not in json.dumps(result)
 
 
-def test_call_reviewer_routes_explicit_ark_model_id_through_openai_compat(monkeypatch):
+def test_call_reviewer_routes_explicit_model_through_anthropic_coding_gateway(monkeypatch):
     observed = {}
 
     def fake_open(request, timeout):
         observed["url"] = request.full_url
-        observed["authorization"] = request.headers.get("Authorization")
+        observed["api_key"] = request.headers.get("X-api-key")
         return _Response(
             {
-                "choices": [{"message": {"content": '{"decision":"needs-human"}'}}],
-                "usage": {"prompt_tokens": 7, "completion_tokens": 2},
+                "type": "message",
+                "content": [{"type": "text", "text": '{"decision":"needs-human"}'}],
+                "usage": {"input_tokens": 7, "output_tokens": 2},
             }
         )
 
@@ -84,9 +85,9 @@ def test_call_reviewer_routes_explicit_ark_model_id_through_openai_compat(monkey
         user="user",
     )
 
-    assert observed["url"] == "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
-    assert observed["authorization"] == "Bearer secret-token"
-    assert result["protocol"] == "openai"
+    assert observed["url"] == "https://ark.cn-beijing.volces.com/api/coding/v1/messages"
+    assert observed["api_key"] == "secret-token"
+    assert result["protocol"] == "anthropic"
     assert result["usage"] == {"input_tokens": 7, "output_tokens": 2}
     assert "secret-token" not in json.dumps(result)
 

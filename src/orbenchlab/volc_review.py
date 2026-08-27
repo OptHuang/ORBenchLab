@@ -377,7 +377,16 @@ def call_reviewer(
 
     if not model or max_tokens <= 0:
         raise VolcReviewError("model and max_tokens must be positive")
-    protocol = "anthropic" if model in {config.default_model, "ark-code-latest"} else "openai"
+    base_path = urlsplit(config.base_url).path.rstrip("/")
+    # Volc's coding gateway multiplexes explicit model ids (including
+    # DeepSeek) behind the Anthropic-compatible messages endpoint. Sending a
+    # non-default id to /api/v3/chat/completions produces a false availability
+    # failure even when that id is authorized on /api/coding/v1/messages.
+    protocol = (
+        "anthropic"
+        if base_path.endswith("/api/coding") or model in {config.default_model, "ark-code-latest"}
+        else "openai"
+    )
     if protocol == "anthropic":
         payload = {
             "model": model,
