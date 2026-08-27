@@ -61,3 +61,18 @@ this prototype intentionally has no task-authoring or publishing command.
 For offline tests, call `orbenchlab.source_intake.collect` with an injected
 fetcher returning `FetchResponse`.  This exercises exactly the same parser and
 digest path without network access.
+
+## Daily scheduling (operator-controlled)
+
+The collector is safe to schedule because it has no model or credential path,
+but scheduling remains an explicit operator choice.  For example, a cron entry
+can invoke a small wrapper that sets `RUN_DATE` and passes the previous bundle:
+
+```cron
+17 7 * * * cd /absolute/path/to/ORBenchLab && RUN_DATE="$(date -u +\%F)" .venv/bin/orbench intake collect --config intake/or-feeds.yaml --out "artifacts/source-intake/${RUN_DATE}" --previous "artifacts/source-intake/$(date -u -d 'yesterday' +\%F)" >> artifacts/source-intake/intake.log 2>&1
+```
+
+On macOS, replace the GNU `date -d 'yesterday'` expression with an explicit
+wrapper or launchd job.  Exit code `8` means the snapshot was written but at
+least one feed failed; alert on it and review the partial bundle instead of
+promoting it automatically.
