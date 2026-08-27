@@ -18,7 +18,7 @@ import signal
 import subprocess
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 
@@ -148,35 +148,53 @@ def _read_only_command(
     *,
     cwd: Path,
     paths: Sequence[str | Path],
+    hidden_paths: Sequence[str | Path] = (),
 ) -> tuple[list[str], dict[str, Any] | None]:
-    """Wrap a command in an inherited OS policy for immutable input paths."""
+    """Wrap a command with immutable visible inputs and unreadable hidden paths."""
 
-    if not paths:
+    if not paths and not hidden_paths:
         return list(command), None
     cwd = cwd.resolve()
-    bindings = []
-    for value in paths:
-        requested = Path(value)
-        if requested.is_symlink() or not requested.exists():
-            raise AgentSessionError("read-only session input must exist and not be a symlink")
-        resolved = requested.resolve()
-        try:
-            relative = resolved.relative_to(cwd).as_posix()
-        except ValueError:
-            raise AgentSessionError("read-only session input must be inside the workdir") from None
-        bindings.append(
-            {
-                "path": relative,
-                "content_digest": (
-                    _tree_digest(resolved)
-                    if resolved.is_dir()
-                    else _digest_bytes(resolved.read_bytes())
-                ),
-            }
-        )
-    if len({row["path"] for row in bindings}) != len(bindings):
-        raise AgentSessionError("read-only session inputs must be unique")
+    def bindings_for(values: Sequence[str | Path], *, label: str) -> list[dict[str, Any]]:
+        rows = []
+        for value in values:
+            requested = Path(value)
+            if requested.is_symlink() or not requested.exists():
+                raise AgentSessionError(f"{label} session path must exist and not be a symlink")
+            resolved = requested.resolve()
+            try:
+                relative = resolved.relative_to(cwd).as_posix()
+            except ValueError:
+                raise AgentSessionError(f"{label} session path must be inside the workdir") from None
+            rows.append(
+                {
+                    "path": relative,
+                    "kind": "directory" if resolved.is_dir() else "file",
+                    "content_digest": (
+                        _tree_digest(resolved)
+                        if resolved.is_dir()
+                        else _digest_bytes(resolved.read_bytes())
+                    ),
+                }
+            )
+        if len({row["path"] for row in rows}) != len(rows):
+            raise AgentSessionError(f"{label} session paths must be unique")
+        return rows
+
+    bindings = bindings_for(paths, label="read-only")
+    hidden_bindings = bindings_for(hidden_paths, label="hidden")
+    visible_names = {row["path"] for row in bindings}
+    hidden_names = {row["path"] for row in hidden_bindings}
+    if visible_names & hidden_names:
+        raise AgentSessionError("session paths cannot be both visible and hidden")
+    for left in visible_names:
+        left_path = PurePosixPath(left)
+        for right in hidden_names:
+            right_path = PurePosixPath(right)
+            if left_path in right_path.parents or right_path in left_path.parents:
+                raise AgentSessionError("visible and hidden session paths may not overlap")
     resolved_paths = [cwd / row["path"] for row in bindings]
+    resolved_hidden = [(cwd / row["path"], row["kind"]) for row in hidden_bindings]
     if sys.platform.startswith("linux"):
         sandbox = shutil.which("bwrap")
         if not sandbox:
@@ -201,6 +219,11 @@ def _read_only_command(
         ]
         for path in resolved_paths:
             wrapped.extend(["--ro-bind", str(path), str(path)])
+        for path, path_kind in resolved_hidden:
+            if path_kind == "directory":
+                wrapped.extend(["--tmpfs", str(path), "--remount-ro", str(path)])
+            else:
+                wrapped.extend(["--ro-bind", "/dev/null", str(path)])
         wrapped.extend(["--chdir", str(cwd), "--", *command])
         kind = "bubblewrap-read-only-bindings-v1"
         policy = "root-ro-workdir-rw-protected-ro-private-tmp-v1"
@@ -210,12 +233,18 @@ def _read_only_command(
             raise AgentSessionError("sandbox-exec is required for read-only factory inputs")
         sandbox_path = Path(sandbox).resolve()
         quoted = [str(path).replace('"', '\\"') for path in resolved_paths]
+        hidden_quoted = [str(path).replace('"', '\\"') for path, _ in resolved_hidden]
         writable = str(cwd).replace('"', '\\"')
         profile = (
             "(version 1)\n(allow default)\n(deny file-write*)\n"
             f'(allow file-write* (subpath "{writable}"))\n'
             + "\n".join(
                 f'(deny file-write* (subpath "{path}"))' for path in quoted
+            )
+            + "\n"
+            + "\n".join(
+                f'(deny file-read* file-write* (subpath "{path}"))'
+                for path in hidden_quoted
             )
         )
         wrapped = [str(sandbox_path), "-p", profile, *command]
@@ -228,6 +257,7 @@ def _read_only_command(
         "policy": policy,
         "executable_digest": _digest_bytes(sandbox_path.read_bytes()),
         "read_only_bindings": bindings,
+        "hidden_bindings": hidden_bindings,
         "hard_enforced": True,
     }
     return wrapped, contract
@@ -523,6 +553,7 @@ def run_session(
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
     max_budget_usd: float | None = None,
     read_only_paths: Sequence[str | Path] = (),
+    hidden_paths: Sequence[str | Path] = (),
     allow_bash: bool = True,
 ) -> dict[str, Any]:
     """Run or safely reuse one deterministic autonomous-agent session."""
@@ -572,6 +603,7 @@ def run_session(
         agent_command,
         cwd=cwd,
         paths=read_only_paths,
+        hidden_paths=hidden_paths,
     )
     output_root = Path(out).resolve()
     input_tree_digest = _tree_digest(cwd, exclude=output_root)

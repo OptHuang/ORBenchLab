@@ -165,11 +165,46 @@ def test_linux_read_only_wrapper_binds_exact_input_tree(tmp_path: Path, monkeypa
         "read_only_bindings": [
             {
                 "path": "factory-input",
+                "kind": "directory",
                 "content_digest": agent_sessions._tree_digest(inputs),
             }
         ],
+        "hidden_bindings": [],
         "hard_enforced": True,
     }
+
+
+def test_linux_wrapper_masks_hidden_file_after_workspace_bind(tmp_path: Path, monkeypatch):
+    work = tmp_path / "work"
+    visible = work / "visible.json"
+    hidden = work / "independent.json"
+    work.mkdir()
+    visible.write_text('{"visible":true}\n', encoding="utf-8")
+    hidden.write_text('{"must_not_be_read":true}\n', encoding="utf-8")
+    bubblewrap = _fixture_cli(tmp_path, "exit 0")
+    monkeypatch.setattr(agent_sessions.sys, "platform", "linux")
+    monkeypatch.setattr(
+        agent_sessions.shutil,
+        "which",
+        lambda name: str(bubblewrap) if name == "bwrap" else None,
+    )
+    command, contract = agent_sessions._read_only_command(
+        ["/bin/true"], cwd=work, paths=[visible], hidden_paths=[hidden]
+    )
+    workspace_bind = command.index("--bind")
+    visible_bind = command.index("--ro-bind", workspace_bind)
+    hidden_bind = command.index("--ro-bind", visible_bind + 1)
+    assert command[hidden_bind + 1 : hidden_bind + 3] == [
+        "/dev/null",
+        str(hidden.resolve()),
+    ]
+    assert contract["hidden_bindings"] == [
+        {
+            "path": "independent.json",
+            "kind": "file",
+            "content_digest": agent_sessions._digest_bytes(hidden.read_bytes()),
+        }
+    ]
 
 
 def test_provider_credential_is_redacted_from_live_and_sealed_output(tmp_path: Path):

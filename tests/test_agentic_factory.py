@@ -357,6 +357,40 @@ def test_runtime_prompt_supplies_trusted_digest_and_resume_recomputes_it(tmp_pat
         )
 
 
+def test_visibility_exposes_only_dependency_ancestor_outputs(tmp_path: Path):
+    stages = [
+        _stage("design-a"),
+        _stage("design-b"),
+        {**_stage("synthesis"), "depends_on": ["design-a"]},
+    ]
+    plan = agentic_factory.compile_plan(
+        name="blind parallel review",
+        source_binding_digest=DIGEST,
+        stages=stages,
+        workspace_manifest="factory-input/workspace-manifest.json",
+    )
+    (tmp_path / "factory-input").mkdir()
+    (tmp_path / "factory/design-a.json").parent.mkdir()
+    (tmp_path / "factory/design-a.json").write_text('{"a":1}\n', encoding="utf-8")
+    (tmp_path / "factory/design-b.json").write_text('{"b":1}\n', encoding="utf-8")
+    visible, hidden = agentic_factory._visibility_paths(
+        plan,
+        workspace=tmp_path,
+        stage_id="design-b",
+        completed_stage_ids=["design-a"],
+    )
+    assert visible == [tmp_path / "factory-input"]
+    assert hidden == [tmp_path / "factory/design-a.json"]
+    visible, hidden = agentic_factory._visibility_paths(
+        plan,
+        workspace=tmp_path,
+        stage_id="synthesis",
+        completed_stage_ids=["design-a", "design-b"],
+    )
+    assert visible == [tmp_path / "factory-input", tmp_path / "factory/design-a.json"]
+    assert hidden == [tmp_path / "factory/design-b.json"]
+
+
 def test_failed_output_is_archived_and_cannot_contaminate_retry(tmp_path: Path):
     counter = tmp_path / "attempted-once"
     executable = tmp_path / "retry-agent"

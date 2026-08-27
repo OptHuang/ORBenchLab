@@ -24,6 +24,14 @@ sessions and enforces the parts that should not depend on model judgment:
 2. two independent task designs and autonomous selection;
 3. strict task implementation;
 4. independent scientific and verifier reviews;
+
+Independence is enforced by the session filesystem view, not by prompt wording.
+Each semantic stage can read `factory-input/` plus outputs owned by its transitive
+dependency ancestors. Already-completed outputs from non-ancestor stages are
+still protected from writes and are additionally masked from reads (Bubblewrap
+mount masks on Linux, sandbox-exec read denials on macOS). The visible and hidden
+path digests, together with the completed-stage snapshot, are persisted in the
+session and attempt receipts so resume replays the same DAG visibility boundary.
 5. task repair;
 6. semantic indexing of trusted Harbor Oracle/NOP controls;
 7. semantic indexing of a trusted equal-budget frontier/weak Harbor model matrix;

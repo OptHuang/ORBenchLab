@@ -536,6 +536,40 @@ def _validate_session_receipt(
     if plan.get("workspace_manifest"):
         sandbox = identity.get("filesystem_sandbox")
         bindings = sandbox.get("read_only_bindings") if isinstance(sandbox, Mapping) else None
+        hidden_bindings = sandbox.get("hidden_bindings") if isinstance(sandbox, Mapping) else None
+        completed_snapshot = attempt.get("visibility_completed_stage_ids")
+        if workspace is None or not isinstance(completed_snapshot, list):
+            raise AgenticFactoryError("factory attempt lacks a replayable visibility snapshot")
+        visible_paths, hidden_paths = _visibility_paths(
+            plan,
+            workspace=workspace,
+            stage_id=stage["id"],
+            completed_stage_ids=completed_snapshot,
+        )
+
+        def expected_rows(paths: Sequence[Path]) -> dict[str, dict[str, str]]:
+            return {
+                path.relative_to(workspace).as_posix(): {
+                    "kind": "directory" if path.is_dir() else "file",
+                    "content_digest": (
+                        _session_tree_digest(path)
+                        if path.is_dir()
+                        else _file_digest(path)
+                    ),
+                }
+                for path in paths
+            }
+
+        def supplied_rows(value: Any) -> dict[str, dict[str, str]] | None:
+            if not isinstance(value, list) or any(not isinstance(row, Mapping) for row in value):
+                return None
+            return {
+                str(row.get("path")): {
+                    "kind": str(row.get("kind")),
+                    "content_digest": str(row.get("content_digest")),
+                }
+                for row in value
+            }
         if (
             not isinstance(sandbox, Mapping)
             or sandbox.get("hard_enforced") is not True
@@ -553,11 +587,8 @@ def _validate_session_receipt(
             or not _has_restricted_factory_tools(identity)
             or not isinstance(bindings, list)
             or not bindings
-            or not any(
-                isinstance(binding, Mapping)
-                and binding.get("path") == "factory-input"
-                for binding in bindings
-            )
+            or supplied_rows(bindings) != expected_rows(visible_paths)
+            or supplied_rows(hidden_bindings) != expected_rows(hidden_paths)
         ):
             raise AgenticFactoryError(
                 "factory session did not hard-protect its immutable input snapshot"
@@ -801,6 +832,45 @@ def ready_stages(plan: Mapping[str, Any], run: Mapping[str, Any]) -> list[str]:
         if all(states.get(dep, {}).get("status") == "completed" for dep in stage["depends_on"]):
             ready.append(stage["id"])
     return ready
+
+
+def _stage_ancestors(plan: Mapping[str, Any], stage_id: str) -> set[str]:
+    by_id = {stage["id"]: stage for stage in plan["stages"]}
+    ancestors: set[str] = set()
+    pending = list(by_id[stage_id]["depends_on"])
+    while pending:
+        candidate = pending.pop()
+        if candidate in ancestors:
+            continue
+        ancestors.add(candidate)
+        pending.extend(by_id[candidate]["depends_on"])
+    return ancestors
+
+
+def _visibility_paths(
+    plan: Mapping[str, Any],
+    *,
+    workspace: Path,
+    stage_id: str,
+    completed_stage_ids: Sequence[str],
+) -> tuple[list[Path], list[Path]]:
+    """Resolve the exact least-visibility view for one stage attempt."""
+
+    by_id = {stage["id"]: stage for stage in plan["stages"]}
+    known = set(by_id)
+    completed = list(completed_stage_ids)
+    if len(completed) != len(set(completed)) or any(value not in known for value in completed):
+        raise AgenticFactoryError("factory visibility snapshot contains invalid stages")
+    ancestors = _stage_ancestors(plan, stage_id)
+    if not plan.get("workspace_manifest"):
+        return [], []
+    visible = [workspace / "factory-input"]
+    hidden: list[Path] = []
+    for completed_id in completed:
+        destination = visible if completed_id in ancestors else hidden
+        for output in by_id[completed_id]["required_outputs"]:
+            destination.append(_artifact_path(workspace, output["path"]))
+    return visible, hidden
 
 
 def _directory_digest(path: Path) -> tuple[str, int]:
@@ -1263,19 +1333,17 @@ def _run_factory_locked(
         retry_safe = True
         workspace_usage: dict[str, int] | None = None
         stage_environment = (environments or {}).get(stage["profile"], {})
-        protected_inputs = (
-            [workspace / "factory-input"]
-            if checked.get("workspace_manifest")
-            else []
+        visibility_completed_stage_ids = [
+            completed_id
+            for completed_id, completed_state in run["stages"].items()
+            if completed_state["status"] == "completed"
+        ]
+        protected_inputs, hidden_inputs = _visibility_paths(
+            checked,
+            workspace=workspace,
+            stage_id=stage_id,
+            completed_stage_ids=visibility_completed_stage_ids,
         )
-        if checked.get("workspace_manifest"):
-            for completed_id, completed_state in run["stages"].items():
-                if completed_state["status"] != "completed":
-                    continue
-                for output in stage_by_id[completed_id]["required_outputs"]:
-                    protected_inputs.append(
-                        _artifact_path(workspace, output["path"])
-                    )
         try:
             session = run_session(
                 profile=stage["profile"],
@@ -1290,6 +1358,7 @@ def _run_factory_locked(
                 environ=stage_environment,
                 executable=(executables or {}).get(stage["profile"]),
                 read_only_paths=protected_inputs,
+                hidden_paths=hidden_inputs,
                 allow_bash=not bool(checked.get("workspace_manifest")),
             )
             if checked.get("workspace_manifest"):
@@ -1304,21 +1373,37 @@ def _run_factory_locked(
                     if isinstance(sandbox, Mapping)
                     else None
                 )
-                if (
-                    not isinstance(bindings, list)
-                    or {
-                        str(binding.get("path")): binding.get("content_digest")
-                        for binding in bindings
-                        if isinstance(binding, Mapping)
+                hidden_bindings = (
+                    sandbox.get("hidden_bindings")
+                    if isinstance(sandbox, Mapping)
+                    else None
+                )
+                def binding_map(value: Any) -> dict[str, tuple[str, str]] | None:
+                    if not isinstance(value, list) or any(
+                        not isinstance(binding, Mapping) for binding in value
+                    ):
+                        return None
+                    return {
+                        str(binding.get("path")): (
+                            str(binding.get("kind")),
+                            str(binding.get("content_digest")),
+                        )
+                        for binding in value
                     }
-                    != {
+
+                def path_map(paths: Sequence[Path]) -> dict[str, tuple[str, str]]:
+                    return {
                         path.relative_to(workspace).as_posix(): (
+                            "directory" if path.is_dir() else "file",
                             _session_tree_digest(path)
                             if path.is_dir()
-                            else "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+                            else "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
                         )
-                        for path in protected_inputs
+                        for path in paths
                     }
+                if (
+                    binding_map(bindings) != path_map(protected_inputs)
+                    or binding_map(hidden_bindings) != path_map(hidden_inputs)
                 ):
                     raise AgenticFactoryError(
                         "factory session input binding changed during execution"
@@ -1377,6 +1462,7 @@ def _run_factory_locked(
             "failed_output_snapshots": failed_output_snapshots,
             "retry_safe": retry_safe,
             "workspace_usage": workspace_usage,
+            "visibility_completed_stage_ids": visibility_completed_stage_ids,
         }
         # Trusted inputs and already-completed outputs are rechecked before the
         # attempt receipt is made immutable. If this check fails, there is no
