@@ -21,7 +21,7 @@ task_contract:
 acceptance:
   hard: [oracle smoke passes, six mutation controls are rejected, static gate has no fail]
   evidence:
-    minimum_seeds_per_cell: 3
+    minimum_seeds_per_cell: 5
     minimum_difficulty_levels: 3
     minimum_agent_systems: 2
     required_evidence_level: E3

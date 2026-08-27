@@ -32,6 +32,7 @@ from . import pipeline as pipeline_mod
 from . import task_authoring as authoring_mod
 from . import volc_review as volc_review_mod
 from . import volc_rollout as volc_rollout_mod
+from . import harbor_controls as harbor_controls_mod
 
 PROG = "orbench"
 
@@ -75,6 +76,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_pipeline(sub)
     _add_task_author(sub)
     _add_task_screen(sub)
+    _add_harbor_receipt(sub)
     return parser
 
 
@@ -560,12 +562,14 @@ def _add_task_screen(sub: argparse._SubParsersAction) -> None:
             "This is not Harbor acceptance."
         ),
     )
-    parser.add_argument("--task-dir", required=True, help="strict task directory")
-    parser.add_argument("--test-image", required=True, help="Docker image containing pytest and CTRF")
+    parser.add_argument("--task-dir", action="append", required=True, help="strict task directory; repeat for a suite")
+    parser.add_argument("--test-image", action="append", required=True, help="matching Docker verifier image; repeat in task order")
     parser.add_argument("--out", required=True, help="screening output directory")
     parser.add_argument("--models", default="", help="comma-separated Volc model ids")
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--hint-level", type=int, default=0, help="contract reminder level (0=none, 1=exact output reminder)")
+    parser.add_argument("--hint-levels", default="", help="comma-separated matrix; overrides --hint-level")
+    parser.add_argument("--controls", default="oracle,nop", help="comma-separated zero-model controls")
     parser.add_argument("--timeout-sec", type=int, default=120)
     parser.add_argument("--max-tokens", type=int, default=2400)
     parser.set_defaults(handler=_cmd_task_screen)
@@ -574,26 +578,96 @@ def _add_task_screen(sub: argparse._SubParsersAction) -> None:
 def _cmd_task_screen(args: argparse.Namespace) -> int:
     config = volc_review_mod.VolcConfig.from_env(timeout_sec=args.timeout_sec)
     models = [value.strip() for value in args.models.split(",") if value.strip()]
-    report = volc_rollout_mod.run_rollout(
-        args.task_dir,
-        config=config,
-        models=models,
-        test_image=args.test_image,
-        out=args.out,
-        repetitions=args.repetitions,
-        hint_level=args.hint_level,
-        timeout_sec=args.timeout_sec,
-        max_tokens=args.max_tokens,
-    )
-    arms = report["tasks"][0]["arms"]
+    controls = [value.strip() for value in args.controls.split(",") if value.strip()]
+    if len(args.task_dir) != len(args.test_image):
+        raise volc_rollout_mod.VolcRolloutError(
+            "--task-dir and --test-image must be repeated the same number of times"
+        )
+    try:
+        hint_levels = (
+            [int(value.strip()) for value in args.hint_levels.split(",") if value.strip()]
+            if args.hint_levels
+            else [args.hint_level]
+        )
+    except ValueError:
+        raise volc_rollout_mod.VolcRolloutError("--hint-levels must contain integers") from None
+    tasks = list(zip(args.task_dir, args.test_image, strict=True))
+    if len(tasks) == 1:
+        report = volc_rollout_mod.run_rollout(
+            tasks[0][0],
+            config=config,
+            models=models,
+            test_image=tasks[0][1],
+            out=args.out,
+            repetitions=args.repetitions,
+            hint_levels=hint_levels,
+            controls=controls,
+            timeout_sec=args.timeout_sec,
+            max_tokens=args.max_tokens,
+        )
+    else:
+        report = volc_rollout_mod.run_suite(
+            tasks,
+            config=config,
+            models=models,
+            out=args.out,
+            repetitions=args.repetitions,
+            hint_levels=hint_levels,
+            controls=controls,
+            timeout_sec=args.timeout_sec,
+            max_tokens=args.max_tokens,
+        )
     _print_json(
         {
-            "task": report["task"],
-            "decision": report["tasks"][0]["decision"],
-            "evidence_level": report["tasks"][0]["evidence_level"],
-            "arms": arms,
+            "tasks": [row["task"] for row in report["tasks"]],
+            "decisions": {row["task"]: row["decision"] for row in report["tasks"]},
+            "evidence_levels": {row["task"]: row["evidence_level"] for row in report["tasks"]},
+            "arms": {row["task"]: row["arms"] for row in report["tasks"]},
             "report_digest": report["report_digest"],
             "written": {"json": str(Path(args.out) / "screening-report.json"), "markdown": str(Path(args.out) / "screening-report.md")},
+        }
+    )
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# real Harbor Oracle/NOP evidence
+# --------------------------------------------------------------------------- #
+
+
+def _add_harbor_receipt(sub: argparse._SubParsersAction) -> None:
+    parser = sub.add_parser(
+        "harbor-receipt",
+        help="validate completed Harbor Oracle/NOP jobs into a pipeline receipt",
+        description=(
+            "Fail closed unless both jobs contain one clean completed trial, a consistent "
+            "reward, a valid CTRF report, and an artifact manifest."
+        ),
+    )
+    parser.add_argument("--task-dir", required=True)
+    parser.add_argument("--executed-task-dir", required=True)
+    parser.add_argument("--oracle-job", required=True)
+    parser.add_argument("--nop-job", required=True)
+    parser.add_argument("--out", required=True)
+    parser.set_defaults(handler=_cmd_harbor_receipt)
+
+
+def _cmd_harbor_receipt(args: argparse.Namespace) -> int:
+    receipt = harbor_controls_mod.build_receipt(
+        args.task_dir,
+        executed_task_dir=args.executed_task_dir,
+        oracle_job=args.oracle_job,
+        nop_job=args.nop_job,
+    )
+    paths = harbor_controls_mod.write_receipt(receipt, args.out)
+    row = receipt["tasks"][0]
+    _print_json(
+        {
+            "task": row["task"],
+            "evidence_level": row["evidence_level"],
+            "control_gates": row["control_gates"],
+            "report_digest": receipt["report_digest"],
+            "written": {key: str(path) for key, path in paths.items()},
         }
     )
     return 0

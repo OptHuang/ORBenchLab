@@ -49,19 +49,24 @@
             "type": "object",
             "additionalProperties": false,
             "required": [
-              "model", "n_observed", "n_complete", "metric_n", "solve_rate",
+              "model", "n_observed", "n_complete", "metric_n", "solve_n",
+              "quality_n", "feasibility_n", "solve_rate",
               "quality_pass_rate", "mean_feasibility", "infra_exceptions",
-              "evidence_levels", "source_reports"
+              "failure_modes", "evidence_levels", "source_reports"
             ],
             "properties": {
               "model": {"type": "string"},
               "n_observed": {"type": "integer", "minimum": 0},
               "n_complete": {"type": "integer", "minimum": 0},
               "metric_n": {"type": "integer", "minimum": 0},
+              "solve_n": {"type": "integer", "minimum": 0},
+              "quality_n": {"type": "integer", "minimum": 0},
+              "feasibility_n": {"type": "integer", "minimum": 0},
               "solve_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
               "quality_pass_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
               "mean_feasibility": {"type": ["number", "null"], "minimum": 0},
               "infra_exceptions": {"type": "array", "items": {"type": "string"}},
+              "failure_modes": {"type": "array", "items": {"type": "string"}},
               "evidence_levels": {"type": "array", "items": {"type": "string"}},
               "source_reports": {"type": "array", "items": {"type": "string"}}
             }
@@ -78,9 +83,11 @@
     "evidence": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["level", "source_reports", "report_digests"],
+      "required": ["level", "task_genome_path", "task_genome_digest", "source_reports", "report_digests"],
       "properties": {
         "level": {"type": "string"},
+        "task_genome_path": {"type": ["string", "null"]},
+        "task_genome_digest": {"type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$"},
         "source_reports": {"type": "array", "items": {"type": "string"}},
         "report_digests": {"type": "array", "items": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}}
       }

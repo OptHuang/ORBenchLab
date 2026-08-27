@@ -1,9 +1,10 @@
 """Volcengine-backed authoring review for paper-derived TB-Science tasks.
 
-The client deliberately uses the Anthropic-compatible Volcengine endpoint that
-the execution host already provisions for Claude Code.  It is not a generic
-provider router: refusing non-Volc hosts keeps the user's requirement that all
-agent work in this pipeline uses the Volc route auditable.  Prompts contain
+The client uses only Volcengine routes: the Anthropic-compatible Coding Plan
+endpoint for its configured alias and the same host's OpenAI-compatible Ark
+endpoint for explicit model ids.  It is not a generic provider router:
+refusing non-Volc hosts keeps the user's requirement that all agent work in
+this pipeline uses the Volc route auditable.  Prompts contain
 only public paper metadata, a bounded task-tree snapshot, and the static
 authoring receipt.  Raw prompts/responses are never written to artifacts.
 """
@@ -20,7 +21,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from .core.errors import ORBenchError
 
@@ -68,6 +69,11 @@ class VolcConfig:
     @property
     def endpoint(self) -> str:
         return self.base_url + "/v1/messages"
+
+    @property
+    def openai_endpoint(self) -> str:
+        parsed = urlsplit(self.base_url)
+        return urlunsplit((parsed.scheme, parsed.netloc, "/api/v3/chat/completions", "", ""))
 
     def public_dict(self) -> dict[str, Any]:
         parsed = urlsplit(self.base_url)
@@ -154,6 +160,24 @@ def _safe_response(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _safe_openai_response(payload: Mapping[str, Any]) -> dict[str, Any]:
+    choices = payload.get("choices")
+    first = choices[0] if isinstance(choices, list) and choices else None
+    message = first.get("message") if isinstance(first, Mapping) else None
+    text = message.get("content") if isinstance(message, Mapping) else None
+    if not isinstance(text, str) or not text.strip():
+        raise VolcReviewError("Volc OpenAI-compatible response content is empty")
+    usage = payload.get("usage") if isinstance(payload.get("usage"), Mapping) else {}
+    return {
+        "parsed": _json_object(text),
+        "response_digest": _digest({"text": text}),
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens"),
+            "output_tokens": usage.get("completion_tokens"),
+        },
+    }
+
+
 def _normalize_review(value: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize heterogeneous model JSON into the review contract.
 
@@ -212,24 +236,40 @@ def call_reviewer(
 
     if not model or max_tokens <= 0:
         raise VolcReviewError("model and max_tokens must be positive")
-    body = json.dumps(
-        {
+    protocol = "anthropic" if model in {config.default_model, "ark-code-latest"} else "openai"
+    if protocol == "anthropic":
+        payload = {
             "model": model,
             "max_tokens": max_tokens,
             "system": system,
             "messages": [{"role": "user", "content": user}],
-        },
-        ensure_ascii=False,
-    ).encode()
-    request = urllib.request.Request(
-        config.endpoint,
-        data=body,
-        method="POST",
-        headers={
+        }
+        endpoint = config.endpoint
+        headers = {
             "x-api-key": config.token,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
-        },
+        }
+    else:
+        payload = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }
+        endpoint = config.openai_endpoint
+        headers = {
+            "authorization": f"Bearer {config.token}",
+            "content-type": "application/json",
+        }
+    body = json.dumps(payload, ensure_ascii=False).encode()
+    request = urllib.request.Request(
+        endpoint,
+        data=body,
+        method="POST",
+        headers=headers,
     )
     started = time.monotonic()
     try:
@@ -239,12 +279,19 @@ def call_reviewer(
         raise VolcReviewError(f"Volc reviewer request failed: {type(exc).__name__}") from None
     if not isinstance(response_payload, Mapping):
         raise VolcReviewError("Volc reviewer returned a non-object response")
-    result = _safe_response(response_payload)
+    result = (
+        _safe_response(response_payload)
+        if protocol == "anthropic"
+        else _safe_openai_response(response_payload)
+    )
     result.update(
         {
             "model": model,
+            "protocol": protocol,
             "elapsed_sec": round(time.monotonic() - started, 3),
-            "request_digest": _digest({"model": model, "system": system, "user": user}),
+            "request_digest": _digest(
+                {"model": model, "protocol": protocol, "system": system, "user": user}
+            ),
         }
     )
     return result

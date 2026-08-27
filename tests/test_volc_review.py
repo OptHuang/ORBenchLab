@@ -48,6 +48,40 @@ def test_call_reviewer_records_digests_without_token(monkeypatch):
     assert "secret-token" not in json.dumps(result)
 
 
+def test_call_reviewer_routes_explicit_ark_model_id_through_openai_compat(monkeypatch):
+    observed = {}
+
+    def fake_open(request, timeout):
+        observed["url"] = request.full_url
+        observed["authorization"] = request.headers.get("Authorization")
+        return _Response(
+            {
+                "choices": [{"message": {"content": '{"decision":"needs-human"}'}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 2},
+            }
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_open)
+    config = VolcConfig(
+        "https://ark.cn-beijing.volces.com/api/coding",
+        "secret-token",
+        "ark-code-latest",
+    )
+
+    result = call_reviewer(
+        config,
+        model="deepseek-v3-1-250821",
+        system="system",
+        user="user",
+    )
+
+    assert observed["url"] == "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+    assert observed["authorization"] == "Bearer secret-token"
+    assert result["protocol"] == "openai"
+    assert result["usage"] == {"input_tokens": 7, "output_tokens": 2}
+    assert "secret-token" not in json.dumps(result)
+
+
 def test_review_task_is_blocked_by_static_receipt_and_writes_summary(tmp_path: Path, monkeypatch):
     task = tmp_path / "task"
     task.mkdir()

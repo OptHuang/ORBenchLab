@@ -116,19 +116,46 @@ set -a; . ~/.config/claude/ark-volces.env; set +a
 orbench task-screen \
   --task-dir examples/tasks/alphaevolve-scheduling \
   --test-image orbenchlab-alpha-tests:9b02e26 \
-  --models ark-code-latest \
-  --repetitions 3 --hint-level 0 \
-  --out artifacts/screening/alphaevolve-volc
+  --task-dir examples/tasks/vrp-recovery \
+  --test-image orbenchlab-vrp-tests:9b02e26 \
+  --models ark-code-latest,deepseek-v4-flash \
+  --repetitions 2 --hint-levels 0,1,2 \
+  --controls oracle,nop \
+  --out artifacts/screening/or-task-suite
 ```
 
 `task-screen` exposes only the task contract and input data to the model,
 accepts a bounded `solver.py`, executes it with `--network none`, reruns the
-task's verifier, and records digests plus CTRF aggregates. `hint-level` is an
+task's verifier, and records digests plus validated reward/CTRF aggregates.
+Missing or contradictory verifier receipts fail closed, and Oracle/NOP are
+mandatory. `hint-level` is an
 explicit restart-with-hint intervention (`0`, `1`, `2`); it is a screening arm,
 not a causal intervention claim. The resulting `screening-report.json` can be
-fed directly to `orbench pipeline run`. A completed task-local run is E3
-outcome-grounded evidence; Harbor quality checks and repeated checkpoint
-interventions are still required for acceptance and E4 claims.
+fed directly to `orbench pipeline run`. These local controls do not establish
+Harbor packaging. After real Harbor jobs finish, validate them separately:
+
+For two or more models, automatic `review-promising` screening uses only the
+equal-budget `hint-0` cells. It requires at least five completed trials per
+model and a positive conservative separation after 95% Wilson intervals. Hint
+arms are reported separately and never used to manufacture a base-model gap.
+
+```bash
+orbench harbor-receipt \
+  --task-dir examples/tasks/alphaevolve-scheduling \
+  --executed-task-dir artifacts/harbor/executed-tasks/alphaevolve-scheduling \
+  --oracle-job artifacts/harbor/alpha-oracle \
+  --nop-job artifacts/harbor/alpha-nop \
+  --out artifacts/harbor/alpha-receipt
+```
+
+The receipt command requires one clean trial per control, Oracle reward 1,
+NOP reward 0, consistent CTRF counts, and an artifact manifest. Its
+`harbor-control-screening.json` can be added to `orbench pipeline run` beside
+the model suite. The pipeline revalidates its checksum and internal evidence
+contract, but the receipt is not cryptographically signed; use a trusted local
+artifact store (or add signing before accepting third-party receipts).
+Completed verifier outcomes are E3; restart-with-hint cells
+are not live interventions, and E4 requires controlled same-checkpoint runs.
 
 ## Why this exists
 

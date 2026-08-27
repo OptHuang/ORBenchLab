@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -30,6 +32,8 @@ TASK_CARD_SCHEMA = "task_card.schema.json"
 PIPELINE_SCHEMA_VERSION = "orbenchlab.pipeline.v1"
 TASK_CARD_SCHEMA_VERSION = "orbenchlab.task-card.v1"
 _SUPPORTED_SUFFIXES = frozenset({".json", ".yaml", ".yml"})
+_EVIDENCE_LEVELS = frozenset({"E0", "E1", "E2", "E3", "E4", "E5"})
+_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class PipelineError(ORBenchError):
@@ -46,6 +50,82 @@ def _canonical(value: Any) -> bytes:
 
 def _sha256(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _value_digest(value: Any) -> str:
+    return "sha256:" + hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _validate_harbor_receipt(document: Mapping[str, Any], source: Path) -> None:
+    """Fail closed before a Harbor receipt can unlock task promotion.
+
+    The raw Harbor job is validated when the receipt is authored.  At intake we
+    revalidate the complete checksummed summary instead of trusting a marker field or
+    two user-controlled ``gate=pass`` strings.
+    """
+
+    if (
+        document.get("schema_version") != "orbenchlab.screening-report.v1"
+        or document.get("harbor_receipt_schema_version") != "orbenchlab.harbor-controls.v1"
+    ):
+        raise PipelineError(f"unsupported Harbor receipt schema in {source}")
+    supplied_digest = document.get("report_digest")
+    unsigned = {key: value for key, value in document.items() if key != "report_digest"}
+    if not isinstance(supplied_digest, str) or supplied_digest != _value_digest(unsigned):
+        raise PipelineError(f"Harbor receipt digest mismatch in {source}")
+    digests = [
+        document.get("task_tree_digest"),
+        document.get("authoring_task_tree_digest"),
+        document.get("executed_task_tree_digest"),
+    ]
+    if any(not isinstance(value, str) or not _DIGEST_RE.fullmatch(value) for value in digests):
+        raise PipelineError(f"Harbor receipt task-tree digest is missing or malformed in {source}")
+    if len(set(digests)) != 1:
+        raise PipelineError(f"Harbor receipt authoring/executed task digests differ in {source}")
+    tasks = document.get("tasks")
+    if not isinstance(tasks, list) or len(tasks) != 1 or not isinstance(tasks[0], Mapping):
+        raise PipelineError(f"Harbor receipt must contain exactly one task in {source}")
+    item = tasks[0]
+    task = item.get("task")
+    controls = item.get("control_gates")
+    if not isinstance(task, str) or not task or not isinstance(controls, Mapping):
+        raise PipelineError(f"Harbor receipt task/control identity is malformed in {source}")
+    if item.get("evidence_level") != "E3" or item.get("arms") not in ({}, None):
+        raise PipelineError(f"Harbor control receipt must be E3 and contain no model arms in {source}")
+    digest_fields = (
+        "job_result_digest",
+        "trial_result_digest",
+        "ctrf_digest",
+        "reward_digest",
+        "artifact_manifest_digest",
+    )
+    count_keys = ("tests", "passed", "failed", "skipped", "pending", "other")
+    for name, expected_reward in (("oracle", 1.0), ("nop", 0.0)):
+        control = controls.get(name)
+        if not isinstance(control, Mapping) or control.get("gate") != "pass":
+            raise PipelineError(f"Harbor {name} gate did not pass in {source}")
+        if control.get("control") != name or control.get("reward") != expected_reward:
+            raise PipelineError(f"Harbor {name} reward/control semantics are invalid in {source}")
+        if any(
+            not isinstance(control.get(field), str)
+            or not _DIGEST_RE.fullmatch(str(control[field]))
+            for field in digest_fields
+        ):
+            raise PipelineError(f"Harbor {name} evidence digests are missing in {source}")
+        counts = control.get("ctrf_summary")
+        if not isinstance(counts, Mapping) or any(
+            not isinstance(counts.get(key), int) or int(counts[key]) < 0 for key in count_keys
+        ):
+            raise PipelineError(f"Harbor {name} CTRF counts are malformed in {source}")
+        if counts["tests"] <= 0 or sum(counts[key] for key in count_keys[1:]) != counts["tests"]:
+            raise PipelineError(f"Harbor {name} CTRF counts are inconsistent in {source}")
+        if name == "oracle" and counts["passed"] != counts["tests"]:
+            raise PipelineError(f"Harbor oracle did not pass every test in {source}")
+        if name == "nop" and counts["failed"] <= 0:
+            raise PipelineError(f"Harbor NOP did not fail the verifier in {source}")
+        observed_task = str(control.get("task_name", "")).rsplit("/", 1)[-1].replace("-", "_")
+        if observed_task != task.replace("-", "_"):
+            raise PipelineError(f"Harbor {name} task identity mismatch in {source}")
 
 
 def _load(path: Path) -> Any:
@@ -138,7 +218,12 @@ def _purpose(genome: Mapping[str, Any], task: str) -> str:
 def _normalise_arm(arm: Mapping[str, Any]) -> dict[str, Any]:
     def number(key: str) -> float | None:
         value = arm.get(key)
-        return float(value) if isinstance(value, (int, float)) else None
+        if not isinstance(value, (int, float)):
+            return None
+        result = float(value)
+        if not math.isfinite(result) or result < 0 or result > 1:
+            raise PipelineError(f"invalid {key}: expected a finite rate in [0, 1]")
+        return result
 
     def integer(key: str) -> int:
         value = arm.get(key)
@@ -147,15 +232,30 @@ def _normalise_arm(arm: Mapping[str, Any]) -> dict[str, Any]:
     n = integer("n")
     complete = integer("complete")
     metric_n = integer("metric_n")
+    if min(n, complete, metric_n) < 0 or complete > n or metric_n > complete:
+        raise PipelineError("invalid screening counts: require 0 <= metric_n <= complete <= n")
+    solve_rate = number("solve_rate")
+    quality_rate = number("quality_pass_rate")
+    feasibility = number("mean_feasibility")
+    solve_n = integer("solve_n") if "solve_n" in arm else (metric_n if solve_rate is not None else 0)
+    quality_n = integer("quality_n") if "quality_n" in arm else (metric_n if quality_rate is not None else 0)
+    feasibility_n = integer("feasibility_n") if "feasibility_n" in arm else (metric_n if feasibility is not None else 0)
+    if any(value < 0 or value > complete for value in (solve_n, quality_n, feasibility_n)):
+        raise PipelineError("invalid per-metric denominator: require 0 <= metric_n <= complete")
     infra = list(arm.get("infra_exceptions") or []) if isinstance(arm.get("infra_exceptions"), list) else []
+    failures = list(arm.get("failure_modes") or []) if isinstance(arm.get("failure_modes"), list) else []
     return {
         "n": n,
         "complete": complete,
         "metric_n": metric_n,
-        "solve_rate": number("solve_rate"),
-        "quality_pass_rate": number("quality_pass_rate"),
-        "mean_feasibility": number("mean_feasibility"),
+        "solve_n": solve_n,
+        "quality_n": quality_n,
+        "feasibility_n": feasibility_n,
+        "solve_rate": solve_rate,
+        "quality_pass_rate": quality_rate,
+        "mean_feasibility": feasibility,
         "infra_exceptions": sorted(str(x) for x in infra),
+        "failure_modes": sorted(str(x) for x in failures),
     }
 
 
@@ -167,23 +267,43 @@ def _report_rows(document: Any, source: Path) -> list[dict[str, Any]]:
     # ORBenchLab screening report: one row per task, with model arms.
     tasks = document.get("tasks")
     if isinstance(tasks, list):
+        document_kind = (
+            "harbor-controls"
+            if document.get("harbor_receipt_schema_version")
+            else "model-screening"
+        )
+        if document_kind == "harbor-controls":
+            _validate_harbor_receipt(document, source)
         rows: list[dict[str, Any]] = []
         for item in tasks:
             if not isinstance(item, Mapping) or not item.get("task"):
                 continue
             arms = item.get("arms") if isinstance(item.get("arms"), Mapping) else {}
+            evidence_level = item.get("evidence_level")
+            if evidence_level is not None and str(evidence_level) not in _EVIDENCE_LEVELS:
+                raise PipelineError(f"unsupported evidence level in {source}: {evidence_level}")
+            observed_gap = item.get("discrimination_index_observed_gap")
+            if observed_gap is not None and (
+                not isinstance(observed_gap, (int, float))
+                or not math.isfinite(float(observed_gap))
+                or float(observed_gap) < 0
+                or float(observed_gap) > 1
+            ):
+                raise PipelineError(f"invalid observed model gap in {source}")
             rows.append(
                 {
                     "task": str(item["task"]),
                     "family": str(item.get("family") or item["task"]),
                     "arms": {str(name): _normalise_arm(value) for name, value in arms.items() if isinstance(value, Mapping)},
+                    "controls": dict(item.get("control_gates")) if isinstance(item.get("control_gates"), Mapping) else None,
                     "decision": item.get("decision"),
-                    "evidence_level": item.get("evidence_level"),
-                    "observed_gap": item.get("discrimination_index_observed_gap"),
+                    "evidence_level": evidence_level,
+                    "task_tree_digest": item.get("task_tree_digest") or document.get("task_tree_digest"),
+                    "observed_gap": observed_gap,
                     "limitations": [str(x) for x in item.get("limitations", []) if isinstance(x, str)],
                     "source_report": str(source),
                     "report_digest": _sha256(source),
-                    "kind": "model-screening",
+                    "kind": document_kind,
                 }
             )
         return rows
@@ -230,42 +350,55 @@ def _merge_performance(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
                     "n_observed": 0,
                     "n_complete": 0,
                     "metric_n": 0,
+                    "solve_n": 0,
+                    "quality_n": 0,
+                    "feasibility_n": 0,
                     "solve_successes": 0.0,
                     "quality_successes": 0.0,
                     "feasibility_weight": 0.0,
                     "infra_exceptions": set(),
+                    "failure_modes": set(),
                     "evidence_levels": set(),
                     "source_reports": set(),
                 },
             )
-            n = arm["metric_n"] or arm["complete"] or arm["n"]
             entry["n_observed"] += arm["n"]
             entry["n_complete"] += arm["complete"]
-            entry["metric_n"] += n
+            entry["metric_n"] += arm["metric_n"]
+            entry["solve_n"] += arm["solve_n"]
+            entry["quality_n"] += arm["quality_n"]
+            entry["feasibility_n"] += arm["feasibility_n"]
             if arm["solve_rate"] is not None:
-                entry["solve_successes"] += arm["solve_rate"] * n
+                entry["solve_successes"] += arm["solve_rate"] * arm["solve_n"]
             if arm["quality_pass_rate"] is not None:
-                entry["quality_successes"] += arm["quality_pass_rate"] * n
+                entry["quality_successes"] += arm["quality_pass_rate"] * arm["quality_n"]
             if arm["mean_feasibility"] is not None:
-                entry["feasibility_weight"] += arm["mean_feasibility"] * n
+                entry["feasibility_weight"] += arm["mean_feasibility"] * arm["feasibility_n"]
             entry["infra_exceptions"].update(arm["infra_exceptions"])
+            entry["failure_modes"].update(arm["failure_modes"])
             if row.get("evidence_level"):
                 entry["evidence_levels"].add(str(row["evidence_level"]))
             entry["source_reports"].add(str(row["source_report"]))
 
     result = []
     for model, entry in sorted(grouped.items()):
-        n = entry["metric_n"]
+        solve_n = entry["solve_n"]
+        quality_n = entry["quality_n"]
+        feasibility_n = entry["feasibility_n"]
         result.append(
             {
                 "model": model,
                 "n_observed": entry["n_observed"],
                 "n_complete": entry["n_complete"],
-                "metric_n": n,
-                "solve_rate": round(entry["solve_successes"] / n, 6) if n else None,
-                "quality_pass_rate": round(entry["quality_successes"] / n, 6) if n else None,
-                "mean_feasibility": round(entry["feasibility_weight"] / n, 6) if n else None,
+                "metric_n": entry["metric_n"],
+                "solve_n": solve_n,
+                "quality_n": quality_n,
+                "feasibility_n": feasibility_n,
+                "solve_rate": round(entry["solve_successes"] / solve_n, 6) if solve_n else None,
+                "quality_pass_rate": round(entry["quality_successes"] / quality_n, 6) if quality_n else None,
+                "mean_feasibility": round(entry["feasibility_weight"] / feasibility_n, 6) if feasibility_n else None,
                 "infra_exceptions": sorted(entry["infra_exceptions"]),
+                "failure_modes": sorted(entry["failure_modes"]),
                 "evidence_levels": sorted(entry["evidence_levels"]),
                 "source_reports": sorted(entry["source_reports"]),
             }
@@ -274,7 +407,8 @@ def _merge_performance(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _decision(rows: list[dict[str, Any]], performance: list[dict[str, Any]]) -> str:
-    decisions = {str(row["decision"]) for row in rows if row.get("decision")}
+    decision_rows = [row for row in rows if row.get("kind") != "harbor-controls"]
+    decisions = {str(row["decision"]) for row in decision_rows if row.get("decision")}
     if not decisions:
         return "quarantine"
     if "collect-more-evidence" in decisions:
@@ -282,17 +416,43 @@ def _decision(rows: list[dict[str, Any]], performance: list[dict[str, Any]]) -> 
     infra = any(model["infra_exceptions"] for model in performance)
     if infra:
         return "collect-more-evidence"
-    gaps = [row.get("observed_gap") for row in rows if isinstance(row.get("observed_gap"), (int, float))]
-    repeated = bool(performance) and min((m["metric_n"] for m in performance), default=0) >= 3
+    gaps = [
+        row.get("observed_gap")
+        for row in decision_rows
+        if isinstance(row.get("observed_gap"), (int, float))
+    ]
+    base_performance = [
+        row
+        for row in performance
+        if "@hint-" not in str(row["model"]) or str(row["model"]).endswith("@hint-0")
+    ]
+    repeated = len(base_performance) >= 2 and min(
+        (m["solve_n"] for m in base_performance), default=0
+    ) >= 5
+    base_models = {str(row["model"]).split("@hint-", 1)[0] for row in base_performance}
+    harbor_rows = [row for row in rows if row.get("kind") == "harbor-controls"]
+    harbor_ready = len(harbor_rows) == 1
+    harbor_digest = harbor_rows[0].get("task_tree_digest") if harbor_ready else None
+    model_rows = [row for row in rows if row.get("kind") == "model-screening" and row.get("arms")]
+    digest_ready = bool(model_rows) and isinstance(harbor_digest, str) and all(
+        row.get("task_tree_digest") == harbor_digest for row in model_rows
+    )
     # A later/contradictory revise-or-drop signal wins unless the aggregate
     # evidence independently meets the repeated positive-gap condition below.
     if "revise-or-drop" in decisions and not (
         repeated and gaps and all(float(gap) > 0 for gap in gaps)
     ):
         return "revise-or-drop"
-    if "review-promising" in decisions and any(float(gap) > 0 for gap in gaps) and repeated:
+    if (
+        "review-promising" in decisions
+        and any(float(gap) > 0 for gap in gaps)
+        and repeated
+        and len(base_models) >= 2
+        and harbor_ready
+        and digest_ready
+    ):
         return "review-promising"
-    if "keep" in decisions and not performance:
+    if "keep" in decisions and not performance and harbor_ready:
         return "keep"
     return "collect-more-evidence"
 
@@ -330,15 +490,36 @@ def _summary_markdown(card: Mapping[str, Any]) -> str:
     lines += ["## 模型表现", ""]
     models = card["performance"]["models"]
     if models:
-        lines += ["| 模型/route | n | 完成 | solve rate | quality pass | 平均 feasibility | 异常 |", "| --- | ---: | ---: | ---: | ---: | ---: | --- |"]
+        lines += ["| 模型/route | 尝试 | 完成 | solve (n) | quality (n) | feasibility (n) | 失败模式 | 基础设施异常 |", "| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |"]
         for model in models:
             fmt = lambda value: "n/a" if value is None else f"{value:.3f}"
             lines.append(
-                f"| `{model['model']}` | {model['metric_n']} | {model['n_complete']} | {fmt(model['solve_rate'])} | {fmt(model['quality_pass_rate'])} | {fmt(model['mean_feasibility'])} | {', '.join(model['infra_exceptions']) or '—'} |"
+                f"| `{model['model']}` | {model['n_observed']} | {model['n_complete']} | {fmt(model['solve_rate'])} ({model['solve_n']}) | {fmt(model['quality_pass_rate'])} ({model['quality_n']}) | {fmt(model['mean_feasibility'])} ({model['feasibility_n']}) | {', '.join(model['failure_modes']) or '—'} | {', '.join(model['infra_exceptions']) or '—'} |"
             )
     else:
         lines += ["当前只有 scripted/control screening，没有模型能力指标。"]
     lines.append("")
+    harbor_controls = [
+        controls
+        for controls in card["performance"]["control_screenings"]
+        if isinstance(controls, Mapping)
+        and all(
+            isinstance(controls.get(name), Mapping)
+            and isinstance(controls[name].get("reward"), (int, float))
+            for name in ("oracle", "nop")
+        )
+    ]
+    if len(harbor_controls) == 1:
+        controls = harbor_controls[0]
+        oracle = controls["oracle"]
+        nop = controls["nop"]
+        lines += [
+            "## Harbor 打包控制",
+            "",
+            f"- Oracle：reward `{oracle['reward']}`，{oracle['ctrf_summary']['passed']}/{oracle['ctrf_summary']['tests']} tests passed。",
+            f"- NOP：reward `{nop['reward']}`，{nop['ctrf_summary']['failed']}/{nop['ctrf_summary']['tests']} tests failed（按预期拒绝）。",
+            "",
+        ]
     lines += ["## 证据边界", "", f"evidence level: `{card['evidence']['level']}`", ""]
     for limitation in card["limitations"]:
         lines.append(f"- {limitation}")
@@ -379,11 +560,29 @@ def build_cards(
     for task in sorted(by_task):
         rows = by_task[task]
         family = str(rows[0].get("family") or task) if rows else task
-        genome = genome_docs.get(family, ({}, None))[0]
+        genome, genome_path = genome_docs.get(family, ({}, None))
         performance = _merge_performance(rows)
         control_rows = [row["controls"] for row in rows if row.get("controls")]
         evidence_levels = sorted({str(row["evidence_level"]) for row in rows if row.get("evidence_level")})
+        task_tree_digests = {
+            str(row["task_tree_digest"])
+            for row in rows
+            if isinstance(row.get("task_tree_digest"), str) and row["task_tree_digest"]
+        }
         limitations = sorted({lim for row in rows for lim in row.get("limitations", [])})
+        digest_conflict = len(task_tree_digests) > 1
+        harbor_rows = [row for row in rows if row.get("kind") == "harbor-controls"]
+        model_rows = [
+            row for row in rows if row.get("kind") == "model-screening" and row.get("arms")
+        ]
+        digest_incomplete = bool(harbor_rows and model_rows) and (
+            len(harbor_rows) != 1
+            or any(not isinstance(row.get("task_tree_digest"), str) for row in model_rows)
+        )
+        if digest_conflict:
+            limitations.append("screening/Harbor reports bind to different task-tree digests.")
+        if digest_incomplete:
+            limitations.append("model/Harbor evidence is missing a unique shared task-tree digest.")
         if not genome:
             limitations.append("没有匹配到 task genome；任务内容和难度旋钮未经过 task-authoring gate。")
         if not rows:
@@ -392,7 +591,20 @@ def build_cards(
             if not isinstance(intake, Mapping):
                 raise PipelineError("intake document must be an object")
             limitations.append("source intake 仅提供 metadata；论文正文、许可证和任务语义仍需自动 gate/人工复核。")
+        if harbor_rows:
+            limitations = [
+                value
+                for value in limitations
+                if value
+                not in {
+                    "Volc model screening only; no Harbor acceptance.",
+                    "Oracle/NOP controls are local verifier controls, not Harbor packaging acceptance.",
+                }
+            ]
+            limitations.append("Harbor receipt is a checksummed local artifact, not a cryptographic signature; pipeline inputs must come from a trusted artifact store.")
         decision = _decision(rows, performance)
+        if digest_conflict or digest_incomplete:
+            decision = "quarantine"
         source = _source_ref(genome)
         if source is None:
             source = {"status": "unbound"}
@@ -422,6 +634,8 @@ def build_cards(
             "decision": decision,
             "evidence": {
                 "level": max(evidence_levels) if evidence_levels else "E0",
+                "task_genome_path": str(genome_path) if genome_path else None,
+                "task_genome_digest": _sha256(genome_path) if genome_path else None,
                 "source_reports": sorted({str(row["source_report"]) for row in rows}),
                 "report_digests": sorted({str(row["report_digest"]) for row in rows}),
             },
