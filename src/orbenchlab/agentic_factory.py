@@ -111,7 +111,7 @@ def _safe_relative_path(value: Any) -> str:
 def _normalise_output(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise AgenticFactoryError("required_outputs entries must be objects")
-    unknown = sorted(set(value) - {"path", "kind", "max_bytes"})
+    unknown = sorted(set(value) - {"path", "kind", "max_bytes", "json_required_keys"})
     if unknown:
         raise AgenticFactoryError(f"required output has unsupported key(s): {unknown}")
     kind = str(value.get("kind", ""))
@@ -124,10 +124,20 @@ def _normalise_output(value: Any) -> dict[str, Any]:
         or not 1 <= max_bytes <= MAX_WORKSPACE_FILE_BYTES
     ):
         raise AgenticFactoryError("required output max_bytes must be in 1..268435456")
+    json_required_keys = value.get("json_required_keys", [])
+    if (
+        not isinstance(json_required_keys, list)
+        or any(not isinstance(key, str) or not key or len(key) > 128 for key in json_required_keys)
+        or len(json_required_keys) != len(set(json_required_keys))
+        or len(json_required_keys) > 64
+        or (json_required_keys and kind != "json")
+    ):
+        raise AgenticFactoryError("json_required_keys must be a unique bounded list for JSON outputs")
     return {
         "path": _safe_relative_path(value.get("path")),
         "kind": kind,
         "max_bytes": max_bytes,
+        "json_required_keys": list(json_required_keys),
     }
 
 
@@ -775,7 +785,12 @@ def _factory_lock(root: Path):
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def _artifact(path: Path, kind: str, max_bytes: int) -> dict[str, Any] | None:
+def _artifact(
+    path: Path,
+    kind: str,
+    max_bytes: int,
+    json_required_keys: Sequence[str] = (),
+) -> dict[str, Any] | None:
     if path.is_symlink():
         raise AgenticFactoryError(f"required output is a symlink: {path.name}")
     if kind in {"file", "json"}:
@@ -785,9 +800,15 @@ def _artifact(path: Path, kind: str, max_bytes: int) -> dict[str, Any] | None:
             raise AgenticFactoryError(f"required output exceeds its byte contract: {path.name}")
         if kind == "json":
             try:
-                json.loads(path.read_text(encoding="utf-8"))
+                document = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 raise AgenticFactoryError(f"required JSON output is malformed: {path.name}") from None
+            if not isinstance(document, Mapping) or any(
+                key not in document for key in json_required_keys
+            ):
+                raise AgenticFactoryError(
+                    f"required JSON output lacks its object schema keys: {path.name}"
+                )
         return {"content_digest": _file_digest(path), "file_count": 1}
     if not path.is_dir():
         return None
@@ -805,7 +826,10 @@ def _artifact(path: Path, kind: str, max_bytes: int) -> dict[str, Any] | None:
 def _snapshot_outputs(workdir: Path, stage: Mapping[str, Any]) -> dict[str, dict[str, Any] | None]:
     return {
         output["path"]: _artifact(
-            _artifact_path(workdir, output["path"]), output["kind"], output["max_bytes"]
+            _artifact_path(workdir, output["path"]),
+            output["kind"],
+            output["max_bytes"],
+            output["json_required_keys"],
         )
         for output in stage["required_outputs"]
     }
@@ -820,7 +844,10 @@ def _validate_outputs(
     for output in stage["required_outputs"]:
         relative = output["path"]
         after = _artifact(
-            _artifact_path(workdir, relative), output["kind"], output["max_bytes"]
+            _artifact_path(workdir, relative),
+            output["kind"],
+            output["max_bytes"],
+            output["json_required_keys"],
         )
         if after is None:
             raise AgenticFactoryError(f"stage {stage['id']} did not create required output {relative}")

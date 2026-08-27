@@ -302,10 +302,16 @@ def _stage(
     max_budget_usd: float = 1.0,
     max_output_bytes: int = 8 * 1024 * 1024,
     artifact_max_bytes: int = 256 * 1024 * 1024,
+    json_required_keys: Sequence[str] = (),
     additional_outputs: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     required_outputs = [
-        {"path": output, "kind": kind, "max_bytes": artifact_max_bytes}
+        {
+            "path": output,
+            "kind": kind,
+            "max_bytes": artifact_max_bytes,
+            "json_required_keys": list(json_required_keys),
+        }
     ]
     required_outputs.extend(dict(value) for value in additional_outputs)
     return {
@@ -360,14 +366,27 @@ def paper_to_benchmark_plan(
             "a structured evidence map with page/section anchors and no task design yet. For this "
             "stage, inspect only paper.txt, paper.pdf and paper-provenance.json: do not inspect seed-task, "
             "run solvers/tests, or evaluate an existing task. Do not re-extract the complete PDF: use "
-            "the page markers in paper.txt. Keep the JSON under 24000 UTF-8 bytes: prioritize executable "
+            "the page markers in paper.txt. Keep the JSON under 32000 UTF-8 bytes: prioritize executable "
             "claims, blockers and no more than six task-relevant interactions; omit narrative repetition. "
+            "Use exactly these top-level semantic sections (metadata keys are allowed): paper, "
+            "executable_scientific_core, assumptions, available_artifacts, candidate_terminal_interactions, "
+            "non_derivable_claims, blockers, explicit_unknowns. Each claim must include its source anchor. "
             "Write it promptly, validate it locally, and stop immediately after validation.",
             "factory/evidence/paper-derivation-primary.json",
             model=author_model,
             profile=profile,
             max_budget_usd=2.0,
-            artifact_max_bytes=24_000,
+            artifact_max_bytes=32_000,
+            json_required_keys=(
+                "paper",
+                "executable_scientific_core",
+                "assumptions",
+                "available_artifacts",
+                "candidate_terminal_interactions",
+                "non_derivable_claims",
+                "blockers",
+                "explicit_unknowns",
+            ),
         ),
         _stage(
             "paper-derive-critic",
@@ -380,7 +399,7 @@ def paper_to_benchmark_plan(
             profile=profile,
             depends_on=("paper-derive-primary",),
             max_budget_usd=2.0,
-            artifact_max_bytes=24_000,
+            artifact_max_bytes=32_000,
         ),
         _stage(
             "task-design-a",

@@ -209,6 +209,29 @@ def test_compile_plan_rejects_invalid_output_byte_contract():
         )
 
 
+def test_json_output_required_keys_are_enforced(tmp_path: Path):
+    executable = _fixture_cli(tmp_path)
+    stage = _stage("paper-derive")
+    stage["required_outputs"][0]["json_required_keys"] = ["claims", "anchors"]
+    plan = agentic_factory.compile_plan(
+        name="json schema keys",
+        source_binding_digest=DIGEST,
+        stages=[stage],
+    )
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    result = agentic_factory.run_factory(
+        plan,
+        workdir=workdir,
+        out=tmp_path / "run",
+        environments=_environments(),
+        executables={"codex": executable},
+    )
+    assert result["status"] == "quarantined"
+    attempt = json.loads((tmp_path / "run/stages/paper-derive/attempt-001.json").read_text())
+    assert "object schema keys" in attempt["failure_detail"]
+
+
 def test_failed_output_is_archived_and_cannot_contaminate_retry(tmp_path: Path):
     counter = tmp_path / "attempted-once"
     executable = tmp_path / "retry-agent"
