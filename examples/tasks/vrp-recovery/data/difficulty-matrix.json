@@ -1,0 +1,12 @@
+{
+  "axes": {
+    "customer_count": [4, 6, 8],
+    "vehicle_count": [2, 2, 3],
+    "event_rate": [1, 1, 1],
+    "intervention_scaffold": ["none", "invariant-checklist", "affected-event-and-vehicle"]
+  },
+  "seeds_per_cell": 3,
+  "agent_systems_required": 2,
+  "null_arm": true,
+  "calibration_status": "pending-runtime-measurement"
+}

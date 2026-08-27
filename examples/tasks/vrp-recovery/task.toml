@@ -1,0 +1,38 @@
+schema_version = "1.4"
+artifacts = ["/root/submission/solver.py", "/root/submission/initial_routes.json", "/root/submission/replans.jsonl", "/root/submission/event_audit.json"]
+
+[task]
+name = "terminal-bench-science/vrp-recovery"
+description = "Build deterministic multi-vehicle routes and replay a disruption while preserving frozen actions and recomputing the objective."
+authors = [{ name = "ORBenchLab", email = "orbenchlab@example.org" }]
+keywords = ["operations-research", "vehicle-routing", "multi-agent", "replanning"]
+version = "0.1.0"
+
+[metadata]
+author_name = "ORBenchLab"
+author_email = "orbenchlab@example.org"
+author_organization = "Independent Researcher"
+author_profile = "https://github.com/OptHuang"
+domain = "mathematical-sciences"
+field = "operations-research"
+subfield = "combinatorial-optimization"
+tags = ["vehicle-routing", "event-replay", "multi-agent"]
+expert_time_estimate_hours = 8.0
+
+[verifier]
+timeout_sec = 120.0
+environment_mode = "separate"
+
+[verifier.environment]
+network_mode = "no-network"
+
+[agent]
+timeout_sec = 1800.0
+
+[environment]
+build_timeout_sec = 600.0
+cpus = 2
+memory_mb = 2048
+storage_mb = 10240
+gpus = 0
+network_mode = "no-network"

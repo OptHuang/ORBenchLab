@@ -1,0 +1,9 @@
+{
+  "paper_concepts": ["multi-agent route construction", "event-driven recovery", "feasibility under constraints"],
+  "task_obligations": {
+    "multi-agent route construction": ["assignment closure", "vehicle capacity", "depot endpoints"],
+    "event-driven recovery": ["ordered event replay", "closed-edge avoidance", "frozen prefixes", "affected-vehicle scope"],
+    "feasibility under constraints": ["objective recomputation", "deterministic audit", "mutation rejection"]
+  },
+  "non_claims": ["not a reproduction of the paper", "no paper benchmark data or repository code redistributed", "no claim of optimality or paper-level performance"]
+}
