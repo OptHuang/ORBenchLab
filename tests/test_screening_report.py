@@ -122,4 +122,37 @@ def test_timeout_keeps_verifier_observation_but_is_not_complete(tmp_path: Path) 
     assert report["tasks"][0]["arms"]["model"]["infra_exceptions"] == [
         "AgentTimeoutError"
     ]
+    assert report["tasks"][0]["arms"]["model"]["metric_n"] == 0
+    assert report["tasks"][0]["arms"]["model"]["solve_rate"] is None
+    assert report["tasks"][0]["arms"]["model"]["mean_feasibility"] is None
     assert report["tasks"][0]["decision"] == "collect-more-evidence"
+
+
+def test_timeout_verifier_fact_is_excluded_from_rate_denominator(tmp_path: Path) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    (job / "result.json").write_text(json.dumps({"id": "j"}))
+    _write_trial(job, "complete__1", "model", 1.0, 2.0)
+    trial = job / "timeout__1"
+    (trial / "agent").mkdir(parents=True)
+    (trial / "result.json").write_text(
+        json.dumps(
+            {
+                "task_name": "oragentbench/demo",
+                "trial_name": "timeout__1",
+                "finished_at": "2026-08-27T00:01:00Z",
+                "config": {"agent": {"model_name": "model"}},
+                "exception_info": {"exception_type": "AgentTimeoutError"},
+                "verifier_result": {
+                    "rewards": {"feasibility": 0.0, "quality": 0.0}
+                },
+            }
+        )
+    )
+    report = build_report(job)
+    arm = report["tasks"][0]["arms"]["model"]
+    assert arm["n"] == 2
+    assert arm["complete"] == 1
+    assert arm["metric_n"] == 1
+    assert arm["solve_rate"] == 1.0
+    assert arm["quality_pass_rate"] == 1.0

@@ -202,6 +202,25 @@ def _rate(values: list[float | None], predicate) -> float | None:
     return sum(predicate(v) for v in usable) / len(usable)
 
 
+def _finite(values: list[float | None]) -> list[float]:
+    return [v for v in values if isinstance(v, (int, float)) and math.isfinite(v)]
+
+
+def _completed_values(rows: list[dict[str, Any]], field: str) -> list[float | None]:
+    """Return metric values from completed, non-exception trials only.
+
+    Harbor can write a verifier result while a trial is subsequently marked
+    timed out.  That result is useful as an observed fact, but treating it as
+    a successful/failed completed attempt would mix infrastructure failure
+    with model performance and bias the screening denominator.
+    """
+    return [
+        row.get(field)
+        for row in rows
+        if bool(row.get("complete")) and not row.get("exception")
+    ]
+
+
 def build_report(job_dir: Path) -> dict[str, Any]:
     aggregate = _read(job_dir / "result.json") or {}
     rows = collect(job_dir)
@@ -213,18 +232,21 @@ def build_report(job_dir: Path) -> dict[str, Any]:
     for task in sorted(groups):
         arms: dict[str, Any] = {}
         for model, arm_rows in sorted(groups[task].items()):
-            feas = [r["feasibility"] for r in arm_rows]
-            quality = [r["quality"] for r in arm_rows]
+            feas = _completed_values(arm_rows, "feasibility")
+            quality = _completed_values(arm_rows, "quality")
+            finite_feas = _finite(feas)
             complete = sum(bool(r["complete"]) for r in arm_rows)
             infra_errors = sorted({r["exception"] for r in arm_rows if r["exception"]})
             arms[model] = {
                 "n": len(arm_rows),
                 "complete": complete,
+                "metric_n": len(finite_feas),
                 "solve_rate": _rate(feas, lambda v: v >= 1.0 - 1e-12),
                 "quality_pass_rate": _rate(quality, lambda v: v >= 2.0 - 1e-9),
                 "mean_feasibility": (
-                    sum(v for v in feas if isinstance(v, (int, float)))
-                    / max(1, sum(isinstance(v, (int, float)) for v in feas))
+                    sum(finite_feas) / len(finite_feas)
+                    if finite_feas
+                    else None
                 ),
                 "infra_exceptions": infra_errors,
             }
