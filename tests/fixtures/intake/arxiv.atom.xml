@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>arXiv math.OC fixture</title>
+  <entry>
+    <id>http://export.arxiv.org/abs/2401.00001</id>
+    <title>Robust routing with coupled capacity constraints</title>
+    <summary>We study a small operations-research benchmark with a reproducible verifier.</summary>
+    <published>2024-01-02T00:00:00Z</published>
+    <updated>2024-01-03T00:00:00Z</updated>
+    <author><name>Example Author</name></author>
+    <link rel="alternate" href="https://arxiv.org/abs/2401.00001" />
+  </entry>
+</feed>

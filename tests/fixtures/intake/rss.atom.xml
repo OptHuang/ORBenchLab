@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>OR benchmark digest fixture</title>
+  <entry>
+    <id>https://arxiv.org/abs/2401.00001</id>
+    <title>Robust routing with coupled capacity constraints</title>
+    <summary>A duplicate occurrence from another public feed.</summary>
+    <published>2024-01-02T00:00:00Z</published>
+    <link rel="alternate" href="https://arxiv.org/abs/2401.00001" />
+  </entry>
+  <entry>
+    <id>tag:example.org,2024:bench-2</id>
+    <title>Open scheduling benchmark release</title>
+    <summary>Metadata-only release note for a benchmark package.</summary>
+    <updated>2024-02-01T00:00:00Z</updated>
+    <link rel="alternate" href="https://example.org/benchmarks/scheduling-2" />
+  </entry>
+</feed>

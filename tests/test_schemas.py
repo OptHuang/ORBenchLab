@@ -13,6 +13,7 @@ EXPECTED_SCHEMAS = {
     "normalized_rollout.schema.json",
     "inspection_report.schema.json",
     "plan_ledger.schema.json",
+    "source_intake.schema.json",
 }
 
 

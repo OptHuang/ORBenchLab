@@ -1,0 +1,27 @@
+# Public metadata feeds for `orbench intake collect`.
+#
+# This file contains no credentials.  Keep the output bundle outside raw/ and
+# review the queue before writing any task proposal.  The collector never
+# sends source text to a model and never publishes a task.
+version: 1
+feeds:
+  - id: arxiv-math-oc
+    kind: arxiv
+    url: "https://export.arxiv.org/api/query?search_query=cat:math.OC&sortBy=submittedDate&sortOrder=descending&max_results=50"
+    tags: [or, paper, arxiv]
+  - id: arxiv-cs-ai-or-agents
+    kind: arxiv
+    url: "https://export.arxiv.org/api/query?search_query=all:%22operations%20research%22%20AND%20all:agent&sortBy=submittedDate&sortOrder=descending&max_results=50"
+    tags: [or, paper, agents, arxiv]
+  - id: or-github-releases
+    kind: github
+    url: "https://api.github.com/repos/ORAgentBench/ORAgentBench/releases"
+    tags: [or, benchmark, github]
+  - id: or-github-search
+    kind: github
+    url: "https://api.github.com/search/repositories?q=operations+research+benchmark&sort=updated&order=desc&per_page=50"
+    tags: [or, benchmark, repository, github]
+  - id: or-rss
+    kind: rss
+    url: "https://www.informs.org/News-Room/INFORMS-Releases/RSS"
+    tags: [or, society, rss]

@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://orbenchlab.local/schemas/source_intake.schema.json",
+  "title": "ORBenchLab source intake snapshot",
+  "description": "Metadata-only public-feed snapshot and provenance record; it cannot author or publish a task.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "intake_id",
+    "created_at",
+    "config_digest",
+    "snapshot_digest",
+    "feeds",
+    "items",
+    "review_queue_count",
+    "review_queue_digest",
+    "network_policy"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "1.0"},
+    "intake_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "created_at": {"type": "string", "pattern": "^.+$"},
+    "config_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "snapshot_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "feeds": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "url", "enabled", "status", "fetched_at", "item_count", "warnings"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"},
+          "kind": {"type": "string", "enum": ["rss", "arxiv", "github"]},
+          "url": {"type": "string", "pattern": "^https://"},
+          "enabled": {"type": "boolean"},
+          "status": {"type": "string", "enum": ["ok", "error", "disabled"]},
+          "fetched_at": {"type": "string", "pattern": "^.+$"},
+          "http_status": {"type": "integer", "minimum": 100, "maximum": 599},
+          "content_type": {"type": "string"},
+          "response_digest": {"type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$"},
+          "etag": {"type": "string"},
+          "last_modified": {"type": "string"},
+          "item_count": {"type": "integer", "minimum": 0},
+          "warnings": {"type": "array", "items": {"type": "string"}},
+          "error_type": {"type": "string"},
+          "error": {"type": "string"}
+        }
+      }
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "item_uid",
+          "identity_key",
+          "source_kind",
+          "title",
+          "canonical_url",
+          "external_id",
+          "summary",
+          "authors",
+          "published_at",
+          "updated_at",
+          "tags",
+          "feed_ids",
+          "occurrence_count",
+          "content_digest",
+          "dedupe_status"
+        ],
+        "properties": {
+          "item_uid": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+          "identity_key": {"type": "string", "pattern": "^.+$"},
+          "source_kind": {"type": "string", "enum": ["rss", "arxiv", "github"]},
+          "title": {"type": "string", "pattern": "^.+$"},
+          "canonical_url": {"type": ["string", "null"]},
+          "external_id": {"type": ["string", "null"]},
+          "summary": {"type": "string"},
+          "authors": {"type": "array", "items": {"type": "string"}},
+          "published_at": {"type": ["string", "null"]},
+          "updated_at": {"type": ["string", "null"]},
+          "tags": {"type": "array", "items": {"type": "string"}},
+          "feed_ids": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+          "occurrence_count": {"type": "integer", "minimum": 1},
+          "content_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+          "dedupe_status": {"type": "string", "enum": ["new", "updated", "duplicate"]}
+        }
+      }
+    },
+    "review_queue_count": {"type": "integer", "minimum": 0},
+    "review_queue_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "network_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model_calls", "credentials_read", "raw_sources_written", "task_generation", "task_publishing", "metadata_only"],
+      "properties": {
+        "model_calls": {"type": "integer", "const": 0},
+        "credentials_read": {"type": "boolean", "const": false},
+        "raw_sources_written": {"type": "boolean", "const": false},
+        "task_generation": {"type": "string", "const": "disabled"},
+        "task_publishing": {"type": "string", "const": "disabled"},
+        "metadata_only": {"type": "boolean", "const": true}
+      }
+    }
+  }
+}

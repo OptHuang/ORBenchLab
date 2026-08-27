@@ -27,6 +27,7 @@ from .report.model import NormalizedRollout
 from . import workflow as workflow_mod
 from . import execution as execution_mod
 from . import export as export_mod
+from . import source_intake as intake_mod
 
 PROG = "orbench"
 
@@ -66,6 +67,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_doctor(sub)
     _add_run(sub)
     _add_export(sub)
+    _add_intake(sub)
     return parser
 
 
@@ -265,6 +267,90 @@ def _cmd_export(args: argparse.Namespace) -> int:
     result = export_mod.export_shareable_run(args.run_root, args.destination)
     _print_json(result.to_dict())
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# source intake -- public metadata to a human review queue
+# --------------------------------------------------------------------------- #
+
+
+def _add_intake(sub: argparse._SubParsersAction) -> None:
+    parser = sub.add_parser(
+        "intake",
+        help="collect public OR source metadata into an auditable review queue",
+        description=(
+            "Fetches configured RSS/arXiv/GitHub metadata, de-duplicates it and writes "
+            "a human-review queue. No model calls, task authoring, publication, or raw "
+            "source writes are performed."
+        ),
+    )
+    inner = parser.add_subparsers(dest="subcommand")
+
+    validate_parser = inner.add_parser(
+        "validate", help="validate a source-feed configuration without fetching it"
+    )
+    validate_parser.add_argument("--config", required=True)
+    validate_parser.set_defaults(handler=_cmd_intake_validate)
+
+    collect_parser = inner.add_parser(
+        "collect", help="fetch feeds and write intake.json plus review_queue.jsonl"
+    )
+    collect_parser.add_argument("--config", required=True)
+    collect_parser.add_argument("--out", required=True, help="new or idempotent bundle directory")
+    collect_parser.add_argument(
+        "--previous",
+        default="",
+        help="prior intake.json or bundle directory used for cross-day de-duplication",
+    )
+    collect_parser.add_argument("--timeout-sec", type=int, default=20)
+    collect_parser.add_argument("--max-bytes", type=int, default=2_000_000)
+    collect_parser.add_argument(
+        "--created-at",
+        default="",
+        help="optional ISO-8601 timestamp (otherwise current UTC time)",
+    )
+    collect_parser.set_defaults(handler=_cmd_intake_collect)
+
+
+def _cmd_intake_validate(args: argparse.Namespace) -> int:
+    feeds = intake_mod.load_feed_config(args.config)
+    _print_json(
+        {
+            "valid": True,
+            "config": str(Path(args.config)),
+            "feeds": [feed.to_dict() for feed in feeds],
+            "network_requests": 0,
+            "model_calls": 0,
+        }
+    )
+    return 0
+
+
+def _cmd_intake_collect(args: argparse.Namespace) -> int:
+    feeds = intake_mod.load_feed_config(args.config)
+    result = intake_mod.collect(
+        feeds,
+        previous=args.previous or None,
+        created_at=args.created_at or None,
+        timeout_sec=args.timeout_sec,
+        max_bytes=args.max_bytes,
+    )
+    paths = intake_mod.write_bundle(result, args.out)
+    _print_json(
+        {
+            "intake_id": result.intake_id,
+            "feeds": len(result.feeds),
+            "feed_errors": result.feed_errors,
+            "items": len(result.items),
+            "new_or_updated": len(result.review_queue),
+            "model_calls": 0,
+            "task_authoring": "disabled",
+            "written": {key: str(path) for key, path in paths.items()},
+        }
+    )
+    # A partial snapshot is useful and is left on disk, but CI/automation must
+    # notice that at least one configured source failed.
+    return 8 if result.has_errors else 0
 
 
 # --------------------------------------------------------------------------- #

@@ -1,0 +1,12 @@
+[
+  {
+    "id": 17,
+    "node_id": "MDU6UmVsZWFzZToxNw==",
+    "name": "v0.3.0",
+    "tag_name": "v0.3.0",
+    "html_url": "https://github.com/example/or-bench/releases/tag/v0.3.0",
+    "body": "Adds a verifier example and a reproducible seed manifest.",
+    "published_at": "2024-03-01T00:00:00Z",
+    "author": {"login": "maintainer"}
+  }
+]
