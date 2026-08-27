@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import stat
 from pathlib import Path
 
 import pytest
@@ -56,7 +57,10 @@ def test_prepare_workspace_is_bound_idempotent_and_tamper_evident(tmp_path: Path
     assert second == first
     assert first["source_binding_digest"] == provenance["binding_digest"]
     assert (workdir / "factory-input/seed-task/task.toml").is_file()
+    assert not (workdir / "factory-input/paper.pdf").stat().st_mode & stat.S_IWUSR
+    assert not (workdir / "factory-input/seed-task").stat().st_mode & stat.S_IWUSR
 
+    (workdir / "factory-input/paper-provenance.json").chmod(0o644)
     (workdir / "factory-input/paper-provenance.json").write_text("{}")
     with pytest.raises(agentic_factory.AgenticFactoryError, match="digest validation"):
         factory_blueprints.prepare_workspace(

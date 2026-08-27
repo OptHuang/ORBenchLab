@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import uuid
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -76,6 +77,18 @@ def _load_provenance(path: Path) -> dict[str, Any]:
     return value
 
 
+def _make_inputs_read_only(root: Path) -> None:
+    for path in sorted(root.rglob("*"), reverse=True):
+        if path.is_symlink():
+            raise AgenticFactoryError("factory input snapshot contains a symlink")
+        if path.is_file():
+            executable = bool(path.stat().st_mode & 0o111)
+            path.chmod(0o555 if executable else 0o444)
+        elif path.is_dir():
+            path.chmod(0o555)
+    root.chmod(0o555)
+
+
 def prepare_workspace(
     *,
     paper_file: str | Path,
@@ -133,6 +146,7 @@ def prepare_workspace(
             or _tree_digest(input_root / "seed-task") != seed_digest
         ):
             raise AgenticFactoryError("existing factory workspace inputs failed digest validation")
+        _make_inputs_read_only(input_root)
         return manifest
     if root.exists() and any(root.iterdir()):
         raise AgenticFactoryError("new factory workdir must be empty")
@@ -142,6 +156,7 @@ def prepare_workspace(
     shutil.copy2(provenance_path, input_root / "paper-provenance.json")
     shutil.copytree(seed, input_root / "seed-task", symlinks=False)
     _atomic_json(manifest_path, manifest)
+    _make_inputs_read_only(input_root)
     return manifest
 
 
@@ -207,7 +222,10 @@ def paper_to_benchmark_plan(
             common
             + " Read the complete paper. Extract its executable scientific core, assumptions, "
             "available code/data, candidate terminal interactions and non-derivable claims. Write "
-            "a structured evidence map with page/section anchors and no task design yet.",
+            "a structured evidence map with page/section anchors and no task design yet. For this "
+            "stage, inspect only paper.pdf and paper-provenance.json: do not inspect seed-task, run "
+            "solvers/tests, or evaluate an existing task. Extract the PDF text once, write the required "
+            "JSON promptly, validate that JSON locally, and stop.",
             "factory/evidence/paper-derivation-primary.json",
             model=author_model,
             profile=profile,
