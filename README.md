@@ -154,6 +154,9 @@ evidence. The derivation file is mandatory bounded evidence: provenance metadata
 alone is not treated as paper understanding. A checksummed copy is inserted into
 each staged task tree, so the independent reviewers see and bind to the same
 derivation evidence; author patches cannot modify that reserved file.
+The exact `{path, content}` single-file shorthand returned by some Volc coding
+endpoints is accepted only with those two fields: the runner supplies trusted
+round/CAS bindings locally and then applies the same path, secret and size gates.
 
 For a fast, task-local model screen on an execution host that already has the
 Volcengine environment and a pinned verifier image, use:

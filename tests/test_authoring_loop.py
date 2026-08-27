@@ -64,6 +64,51 @@ def test_author_patch_rejects_traversal_and_stale_digest():
         )
 
 
+def test_exact_single_file_author_response_gets_trusted_round_binding():
+    base = "sha256:" + "a" * 64
+    receipt = "sha256:" + "b" * 64
+    coerced, shape = authoring_loop._coerce_author_response(
+        {"path": "README.md", "content": "bounded edit"},
+        round_number=2,
+        base_digest=base,
+        input_receipt_digest=receipt,
+        previous_review_digest="sha256:" + "c" * 64,
+    )
+    patch = authoring_loop._normalise_patch(
+        coerced,
+        round_number=2,
+        base_digest=base,
+        input_receipt_digest=receipt,
+        previous_review_digest="sha256:" + "c" * 64,
+    )
+    assert shape == "single-file-shorthand"
+    assert patch["files"] == [{"path": "README.md", "content": "bounded edit"}]
+
+    with pytest.raises(authoring_loop.AuthoringLoopError, match="schema is unsupported"):
+        authoring_loop._coerce_author_response(
+            {"path": "README.md", "content": "edit", "untrusted_round": 9},
+            round_number=2,
+            base_digest=base,
+            input_receipt_digest=receipt,
+            previous_review_digest=None,
+        )
+    coerced_reserved, _ = authoring_loop._coerce_author_response(
+        {"path": authoring_loop.BOUND_DERIVATION_PATH, "content": "forged"},
+        round_number=2,
+        base_digest=base,
+        input_receipt_digest=receipt,
+        previous_review_digest=None,
+    )
+    with pytest.raises(authoring_loop.AuthoringLoopError, match="bound paper derivation"):
+        authoring_loop._normalise_patch(
+            coerced_reserved,
+            round_number=2,
+            base_digest=base,
+            input_receipt_digest=receipt,
+            previous_review_digest=None,
+        )
+
+
 def test_iterate_runs_two_rounds_without_mutating_seed(monkeypatch, tmp_path):
     seed = ROOT / "examples/tasks/alphaevolve-scheduling"
     paper = seed / "paper-provenance.json"

@@ -78,6 +78,40 @@ def _safe_patch_path(value: Any) -> str:
     return normalized
 
 
+def _coerce_author_response(
+    value: Mapping[str, Any],
+    *,
+    round_number: int,
+    base_digest: str,
+    input_receipt_digest: str,
+    previous_review_digest: str | None,
+) -> tuple[Mapping[str, Any], str]:
+    """Adapt the exact single-file shape emitted by some coding endpoints.
+
+    Binding fields come from the trusted local round state, never from model
+    output.  Any wider schema-less response still fails closed.
+    """
+
+    if value.get("schema_version") == "orbenchlab.author-patch.v1":
+        return value, "full-envelope"
+    if set(value) == {"path", "content"} and isinstance(value.get("path"), str) and isinstance(
+        value.get("content"), str
+    ):
+        return (
+            {
+                "schema_version": "orbenchlab.author-patch.v1",
+                "round": round_number,
+                "base_task_tree_digest": base_digest,
+                "input_receipt_digest": input_receipt_digest,
+                "previous_review_digest": previous_review_digest,
+                "files": [{"path": value["path"], "content": value["content"]}],
+                "rationale": ["provider returned exact single-file shorthand"],
+            },
+            "single-file-shorthand",
+        )
+    raise AuthoringLoopError("author patch schema is unsupported")
+
+
 def _normalise_patch(
     value: Mapping[str, Any],
     *,
@@ -400,8 +434,19 @@ def iterate(
                 max_tokens=max_author_tokens,
             )
             parsed = api.pop("parsed")
-            patch = _normalise_patch(
+            coerced, response_shape = _coerce_author_response(
                 parsed,
+                round_number=round_number,
+                base_digest=base_digest,
+                input_receipt_digest=str(input_receipt["receipt_digest"]),
+                previous_review_digest=(
+                    str(previous_review.get("review_digest"))
+                    if isinstance(previous_review, Mapping)
+                    else None
+                ),
+            )
+            patch = _normalise_patch(
+                coerced,
                 round_number=round_number,
                 base_digest=base_digest,
                 input_receipt_digest=str(input_receipt["receipt_digest"]),
@@ -431,6 +476,7 @@ def iterate(
             "request_digest": api.get("request_digest"),
             "response_digest": api.get("response_digest"),
             "usage": api.get("usage", {}),
+            "source_response_shape": response_shape,
         }
         _write_json(round_dir / "author-patch.json", patch_artifact)
         after_digest = _apply_patch(task_dir, patch)
