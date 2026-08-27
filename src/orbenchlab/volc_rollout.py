@@ -732,6 +732,14 @@ def run_rollout(
         "provider": config.public_dict(),
         "test_image": test_image,
         "hint_levels": selected_hints,
+        "run_contract": {
+            "models": selected,
+            "repetitions": repetitions,
+            "hint_levels": selected_hints,
+            "max_tokens": max_tokens,
+            "timeout_sec": timeout_sec,
+            "test_image": test_image,
+        },
         "task_tree_digest": _task_tree_digest(root),
     }
     report["report_digest"] = _digest(report)

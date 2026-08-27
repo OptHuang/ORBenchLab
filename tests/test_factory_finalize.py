@@ -104,15 +104,35 @@ def _evidence(tmp_path: Path, task: Path) -> tuple[Path, Path, Path, Path]:
         },
         "report_digest",
     )
-    arms = {
-        "frontier@hint-0": {"model_id": "frontier", "hint_level": 0, "solve_n": 5, "infra_exceptions": [], "solve_rate": 0.8},
-        "weak@hint-0": {"model_id": "weak", "hint_level": 0, "solve_n": 5, "infra_exceptions": [], "solve_rate": 0.0},
-    }
+    trials = []
+    for model, status in (("frontier", "pass"), ("weak", "fail")):
+        for trial in range(1, 6):
+            trials.append(
+                {
+                    "model": model,
+                    "trial": trial,
+                    "hint_level": 0,
+                    "status": status,
+                    "phase": "verifier",
+                    "request_digest": "sha256:" + "1" * 64,
+                    "response_digest": "sha256:" + "2" * 64,
+                    "solver_digest": "sha256:" + "3" * 64,
+                    "verifier": {"receipt_valid": True, "status": status},
+                    **({"failure_mode": "verifier_failed"} if status == "fail" else {}),
+                }
+            )
+    arms = volc_rollout._summarize_trials(trials)
+    discrimination = volc_rollout._discrimination_summary(
+        arms, ["frontier", "weak"], repetitions=5
+    )
     calibration = _signed(
         {
             "schema_version": "orbenchlab.screening-report.v1",
+            "task": task_id,
             "task_tree_digest": runtime_digest,
-            "tasks": [{"task": task_id, "family": task_id, "arms": arms, "discrimination": {"rectangular": True, "promising": True}, "decision": "review-promising", "evidence_level": "E3"}],
+            "tasks": [{"task": task_id, "family": task_id, "arms": arms, "discrimination": discrimination, "discrimination_index_observed_gap": discrimination["observed_gap"], "decision": "review-promising", "evidence_level": "E3"}],
+            "trials": trials,
+            "run_contract": {"models": ["frontier", "weak"], "repetitions": 5, "hint_levels": [0], "max_tokens": 2400, "timeout_sec": 120, "test_image": "fixture:test"},
         },
         "report_digest",
     )
@@ -187,6 +207,31 @@ def test_agent_summary_cannot_override_a_blocked_static_gate(tmp_path: Path):
     )
     assert receipt["promoted"] is False
     assert next(g for g in receipt["gates"] if g["name"] == "final_summary")["status"] == "pass"
+
+
+def test_calibration_summary_cannot_override_raw_trial_outcomes(tmp_path: Path):
+    plan, run, work, task = _factory(tmp_path)
+    static, harbor, calibration, summary = _evidence(tmp_path, task)
+    calibration_doc = json.loads(calibration.read_text())
+    calibration_doc["trials"][0]["status"] = "fail"
+    calibration_doc["trials"][0]["failure_mode"] = "verifier_failed"
+    calibration_doc["trials"][0]["verifier"]["status"] = "fail"
+    calibration_doc["report_digest"] = factory_finalize._value_digest(
+        {key: value for key, value in calibration_doc.items() if key != "report_digest"}
+    )
+    _write(calibration, calibration_doc)
+    receipt = factory_finalize.build_receipt(
+        plan_path=plan,
+        factory_run_path=run,
+        workdir=work,
+        task_dir=task,
+        static_receipt_path=static,
+        harbor_receipt_path=harbor,
+        calibration_receipt_path=calibration,
+        final_summary_path=summary,
+    )
+    assert receipt["promoted"] is False
+    assert next(g for g in receipt["gates"] if g["name"] == "model_calibration")["status"] == "fail"
 
 
 def test_static_gate_requires_real_passing_provenance_rows(tmp_path: Path):

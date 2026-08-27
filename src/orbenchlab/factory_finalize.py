@@ -23,6 +23,7 @@ class FactoryFinalizeError(ORBenchError):
 
 
 SCHEMA_VERSION = "orbenchlab.factory-finalization.v1"
+_DIGEST_PREFIX = "sha256:"
 
 
 def _canonical(value: Any) -> bytes:
@@ -39,6 +40,15 @@ def _file_digest(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return "sha256:" + digest.hexdigest()
+
+
+def _is_digest(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith(_DIGEST_PREFIX)
+        and len(value) == len(_DIGEST_PREFIX) + 64
+        and all(character in "0123456789abcdef" for character in value[len(_DIGEST_PREFIX) :])
+    )
 
 
 def _load(path: Path) -> Mapping[str, Any]:
@@ -135,24 +145,57 @@ def _calibration_validator(task_digest: str) -> Callable[[Mapping[str, Any]], di
         row = rows[0]
         arms = row.get("arms")
         discrimination = row.get("discrimination")
+        trials = document.get("trials")
+        contract = document.get("run_contract")
         if (
-            row.get("evidence_level") != "E3"
+            document.get("task") != row.get("task")
+            or row.get("evidence_level") != "E3"
             or row.get("decision") != "review-promising"
             or not isinstance(arms, Mapping)
             or not isinstance(discrimination, Mapping)
-            or discrimination.get("rectangular") is not True
-            or discrimination.get("promising") is not True
+            or not isinstance(trials, list)
+            or not isinstance(contract, Mapping)
         ):
-            raise FactoryFinalizeError("calibration is not promising rectangular E3 evidence")
+            raise FactoryFinalizeError("calibration is not a complete E3 rollout receipt")
         baseline = [
             arm
             for arm in arms.values()
             if isinstance(arm, Mapping) and arm.get("hint_level") == 0
         ]
         models = {str(arm.get("model_id")) for arm in baseline if arm.get("model_id")}
+        baseline_trials = [
+            trial
+            for trial in trials
+            if isinstance(trial, Mapping)
+            and trial.get("model") in models
+            and trial.get("hint_level") == 0
+        ]
+        trial_ids = {
+            (trial.get("model"), trial.get("hint_level"), trial.get("trial"))
+            for trial in baseline_trials
+        }
+        for trial in baseline_trials:
+            status = trial.get("status")
+            if (
+                status not in volc_rollout._OUTCOME_STATUSES
+                or not _is_digest(trial.get("request_digest"))
+                or not _is_digest(trial.get("response_digest"))
+            ):
+                raise FactoryFinalizeError("baseline trial lacks provider outcome evidence")
+            if status in {"pass", "fail"}:
+                verifier = trial.get("verifier")
+                if (
+                    trial.get("phase") != "verifier"
+                    or not _is_digest(trial.get("solver_digest"))
+                    or not isinstance(verifier, Mapping)
+                    or verifier.get("receipt_valid") is not True
+                    or verifier.get("status") != status
+                ):
+                    raise FactoryFinalizeError("baseline verifier outcome evidence is incomplete")
         if (
             len(models) < 2
             or len(baseline) < 2
+            or len(trial_ids) != len(baseline_trials)
             or any(
                 not isinstance(arm.get("solve_n"), int)
                 or arm["solve_n"] < 5
@@ -161,12 +204,39 @@ def _calibration_validator(task_digest: str) -> Callable[[Mapping[str, Any]], di
             )
         ):
             raise FactoryFinalizeError("calibration lacks two clean repeated baseline model arms")
+        repetitions = {int(arm["solve_n"]) for arm in baseline}
+        if (
+            len(repetitions) != 1
+            or set(contract.get("models") or []) != models
+            or int(contract.get("repetitions", 0)) != next(iter(repetitions))
+            or 0 not in (contract.get("hint_levels") or [])
+        ):
+            raise FactoryFinalizeError("calibration is not an equal-budget baseline rectangle")
+        recomputed_arms = volc_rollout._summarize_trials(
+            [trial for trial in trials if isinstance(trial, Mapping) and trial.get("model")]
+        )
+        if dict(arms) != recomputed_arms:
+            raise FactoryFinalizeError("calibration arms do not match raw trial outcomes")
+        recomputed = volc_rollout._discrimination_summary(
+            recomputed_arms,
+            sorted(models),
+            repetitions=next(iter(repetitions)),
+        )
+        if (
+            dict(discrimination) != recomputed
+            or recomputed.get("rectangular") is not True
+            or recomputed.get("promising") is not True
+            or row.get("discrimination_index_observed_gap") != recomputed.get("observed_gap")
+        ):
+            raise FactoryFinalizeError("calibration discrimination does not recompute as promising")
         return {
             "task_tree_digest": task_digest,
             "report_digest": supplied,
             "task_id": row.get("task"),
             "models": sorted(models),
-            "minimum_repetitions": min(int(arm["solve_n"]) for arm in baseline),
+            "minimum_repetitions": next(iter(repetitions)),
+            "observed_gap": recomputed["observed_gap"],
+            "gap_95_lower_bound": recomputed["gap_95_lower_bound"],
             "evidence_level": "E3",
         }
 
