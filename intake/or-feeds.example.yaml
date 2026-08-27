@@ -23,5 +23,5 @@ feeds:
     tags: [or, benchmark, repository, github]
   - id: or-rss
     kind: rss
-    url: "https://www.informs.org/News-Room/INFORMS-Releases/RSS"
-    tags: [or, society, rss]
+    url: "https://rss.arxiv.org/rss/math.OC"
+    tags: [or, paper, rss]
