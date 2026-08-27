@@ -38,6 +38,7 @@ from . import agent_sessions as agent_sessions_mod
 from . import agentic_factory as agentic_factory_mod
 from . import factory_blueprints as factory_blueprints_mod
 from . import factory_finalize as factory_finalize_mod
+from . import factory_supervisor as factory_supervisor_mod
 
 PROG = "orbench"
 
@@ -196,6 +197,19 @@ def _add_agent_factory(sub: argparse._SubParsersAction) -> None:
     finalize_parser.add_argument("--out", required=True)
     finalize_parser.set_defaults(handler=_cmd_agent_factory_finalize)
 
+    supervise = inner.add_parser("supervise", help="run or resume deterministic post-agent gates")
+    for flag in ("plan", "factory-run", "workdir", "task-dir", "paper-provenance", "out", "test-image"):
+        supervise.add_argument(f"--{flag}", required=True)
+    supervise.add_argument("--harbor-executable")
+    supervise.add_argument("--executed-task-dir", default="")
+    supervise.add_argument("--oracle-job", default="")
+    supervise.add_argument("--nop-job", default="")
+    supervise.add_argument("--calibration-executable")
+    supervise.add_argument("--model", action="append", required=True)
+    supervise.add_argument("--repetitions", type=int, default=5)
+    supervise.add_argument("--timeout-sec", type=float, default=600)
+    supervise.set_defaults(handler=_cmd_agent_factory_supervise)
+
 
 def _cmd_agent_factory_compile(args: argparse.Namespace) -> int:
     try:
@@ -328,6 +342,19 @@ def _cmd_agent_factory_finalize(args: argparse.Namespace) -> int:
         }
     )
     return 0 if receipt["promoted"] else 8
+
+
+def _cmd_agent_factory_supervise(args: argparse.Namespace) -> int:
+    result = factory_supervisor_mod.run(
+        plan_path=args.plan, factory_run_path=args.factory_run, workdir=args.workdir,
+        task_dir=args.task_dir, paper_provenance=args.paper_provenance, out=args.out,
+        harbor_executable=args.harbor_executable,
+        harbor_inputs={"executed_task_dir": args.executed_task_dir, "oracle_job": args.oracle_job, "nop_job": args.nop_job},
+        calibration_executable=args.calibration_executable, calibration_models=args.model,
+        test_image=args.test_image, repetitions=args.repetitions, timeout_sec=args.timeout_sec,
+    )
+    _print_json({"status": result["status"], "promoted": result["promoted"], "identity_digest": result["identity_digest"], "written": str(Path(args.out) / "supervisor-state.json")})
+    return 0 if result["promoted"] else 8
 
 
 # --------------------------------------------------------------------------- #
