@@ -147,7 +147,7 @@ Each author response is a compare-and-swap list of full text replacements with
 a path allowlist, 32-file/256-KiB cap and no deletion support. Every round lives
 in its own copied task tree, reruns the static gate, and calls both reviewer
 slots only when the static gate is not blocked. The loop stops on all-promising,
-provider/parse failure, a repeated or no-op patch, or the round cap; its strongest
+provider/parse failure, a repeated patch, or the round cap; its strongest
 state is `promising-needs-harbor`. Reviewer model IDs must be distinct, and
 every promising review must cover the seven proposal criteria with passing
 evidence. The derivation file is mandatory bounded evidence: provenance metadata
@@ -160,6 +160,9 @@ round/CAS bindings locally and then applies the same path, secret and size gates
 On a Volc `/api/coding` base URL, explicit reviewer model IDs are sent through
 that gateway's Anthropic-compatible messages endpoint rather than being moved
 to an unrelated chat-completions route.
+A first no-op author response is recorded as an abstention and still proceeds
+through the static and independent review gates; a repeated patch digest stops
+the loop so abstention cannot create an unbounded cycle.
 
 For a fast, task-local model screen on an execution host that already has the
 Volcengine environment and a pinned verifier image, use:

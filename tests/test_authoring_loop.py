@@ -209,6 +209,69 @@ def test_iterate_runs_two_rounds_without_mutating_seed(monkeypatch, tmp_path):
     assert manifest["run_digest"].startswith("sha256:")
 
 
+def test_iterate_reviews_one_author_no_op_instead_of_stopping(monkeypatch, tmp_path):
+    seed = ROOT / "examples/tasks/alphaevolve-scheduling"
+
+    def fake_author(config, *, model, system, user, max_tokens):
+        payload = json.loads(user.split("\n\n", 1)[1])
+        readme = next(row["preview"] for row in payload["task_files"] if row["path"] == "README.md")
+        return {
+            "model": model,
+            "protocol": "anthropic",
+            "request_digest": "sha256:" + "a" * 64,
+            "response_digest": "sha256:" + "b" * 64,
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "parsed": {"path": "README.md", "content": readme},
+        }
+
+    def fake_review(task_dir, *, paper_provenance, receipt, config, models, round_number, max_tokens):
+        review = {
+            "schema_version": "orbenchlab.volc-authoring-review.v1",
+            "round": round_number,
+            "models": list(models),
+            "review_count": len(models),
+            "task_tree_digest": receipt["task_tree_digest"],
+            "static_receipt_digest": receipt["receipt_digest"],
+            "paper_digest": paper_provenance["source_content_digest"],
+            "aggregate_decision": "promising-needs-harbor",
+            "evidence_level": "E1-model-review",
+            "reviewers": [
+                {
+                    "model": model,
+                    "review": {
+                        "decision": "promising",
+                        "shape_complete": True,
+                        "rubric_complete": True,
+                        "criteria": [
+                            {"name": name, "status": "pass", "evidence": "fixture"}
+                            for name in sorted(REQUIRED_REVIEW_CRITERIA)
+                        ],
+                    },
+                }
+                for model in models
+            ],
+        }
+        return review
+
+    monkeypatch.setattr(authoring_loop, "call_reviewer", fake_author)
+    monkeypatch.setattr(authoring_loop, "review_task", fake_review)
+    run = authoring_loop.iterate(
+        seed,
+        paper_provenance=seed / "paper-provenance.json",
+        paper_derivation=seed / "data/paper-task-derivation.json",
+        config=VolcConfig(
+            "https://ark.cn-beijing.volces.com/api/coding", "secret", "ark-code-latest"
+        ),
+        author_model="ark-code-latest",
+        review_models=["reviewer-a", "reviewer-b"],
+        max_rounds=1,
+        out=tmp_path / "run",
+    )
+    assert run["status"] == "promising-needs-harbor"
+    assert run["rounds"][0]["author_no_op"] is True
+    assert run["rounds"][0]["phase"] == "review"
+
+
 def test_iterate_requires_two_reviewer_slots(tmp_path):
     seed = ROOT / "examples/tasks/alphaevolve-scheduling"
     with pytest.raises(authoring_loop.AuthoringLoopError, match="two distinct reviewer"):

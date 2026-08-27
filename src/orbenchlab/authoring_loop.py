@@ -480,11 +480,7 @@ def iterate(
         }
         _write_json(round_dir / "author-patch.json", patch_artifact)
         after_digest = _apply_patch(task_dir, patch)
-        if after_digest == base_digest:
-            status = "incomplete"
-            stop_reason = "author patch was a no-op"
-            rounds.append({"round": round_number, "status": status, "phase": "author", "patch_digest": patch_digest})
-            break
+        author_no_op = after_digest == base_digest
         receipt = task_authoring.validate_task(
             task_dir,
             paper_provenance=paper_path,
@@ -498,6 +494,7 @@ def iterate(
             "task_tree_digest": receipt["task_tree_digest"],
             "receipt_digest": receipt["receipt_digest"],
             "static_decision": receipt["decision"],
+            "author_no_op": author_no_op,
         }
         final_task = task_dir
         previous_receipt_path = receipt_paths["json"]
