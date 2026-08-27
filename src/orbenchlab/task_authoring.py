@@ -238,6 +238,50 @@ def _paper_provenance(path: Path | None) -> tuple[dict[str, Any], list[Criterion
     return doc, [_criterion("paper_provenance", "pass", "paper title, URL, content digest and license status are recorded", path.name)]
 
 
+def _previous_receipt(
+    path: Path | None, *, task_dir: Path, round_number: int
+) -> tuple[str | None, list[Criterion]]:
+    """Validate the optional prior-round receipt before linking it."""
+
+    if path is None:
+        if round_number > 1:
+            return None, [
+                _criterion(
+                    "previous_receipt",
+                    "fail",
+                    "rounds after 1 must provide --previous",
+                )
+            ]
+        return None, []
+    if not path.is_file() or path.is_symlink():
+        return None, [_criterion("previous_receipt", "fail", "previous receipt is not a regular file", path.name)]
+    try:
+        previous = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None, [_criterion("previous_receipt", "fail", "previous receipt is not valid UTF-8 JSON", path.name)]
+    if not isinstance(previous, Mapping):
+        return None, [_criterion("previous_receipt", "fail", "previous receipt must be a JSON object", path.name)]
+    problems: list[str] = []
+    if previous.get("authoring_schema_version") != AUTHORING_SCHEMA_VERSION:
+        problems.append("schema version mismatch")
+    if previous.get("task_dir") != task_dir.name:
+        problems.append("task directory mismatch")
+    previous_round = previous.get("round")
+    if not isinstance(previous_round, int) or isinstance(previous_round, bool) or previous_round >= round_number:
+        problems.append("previous round must be an integer smaller than the current round")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(previous.get("task_tree_digest", ""))):
+        problems.append("previous task_tree_digest is missing or malformed")
+    recorded_digest = str(previous.get("receipt_digest", ""))
+    unsigned = {key: value for key, value in previous.items() if key != "receipt_digest"}
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", recorded_digest) or _digest(unsigned) != recorded_digest:
+        problems.append("previous receipt digest does not match its contents")
+    if problems:
+        return None, [_criterion("previous_receipt", "fail", "; ".join(problems), path.name)]
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(), [
+        _criterion("previous_receipt", "pass", "previous receipt is schema-, task-, round- and digest-valid", path.name)
+    ]
+
+
 def _security_criteria(task_dir: Path) -> list[Criterion]:
     findings: list[str] = []
     for path in _files_under(task_dir):
@@ -448,11 +492,12 @@ def validate_task(
         decision = "ready-for-human-review"
     else:
         decision = "ready-for-harbor-validation"
-    previous_digest = None
-    if previous_receipt:
-        previous = Path(previous_receipt)
-        if previous.is_file():
-            previous_digest = "sha256:" + hashlib.sha256(previous.read_bytes()).hexdigest()
+    previous_digest, previous_checks = _previous_receipt(
+        Path(previous_receipt) if previous_receipt else None,
+        task_dir=root,
+        round_number=int(round_number),
+    )
+    all_checks.extend(previous_checks)
     payload = {
         "authoring_schema_version": AUTHORING_SCHEMA_VERSION,
         # Keep the receipt digest independent of the checkout's absolute path.
@@ -469,7 +514,7 @@ def validate_task(
         "paper": paper_doc,
         "proposal_criteria": proposal,
         "implementation_criteria": [item.as_dict() for item in sorted(criteria, key=lambda item: item.name)],
-        "provenance_checks": [item.as_dict() for item in paper_checks],
+        "provenance_checks": [item.as_dict() for item in [*paper_checks, *previous_checks]],
         "counts": {"pass": sum(item.status == "pass" for item in all_checks), "fail": fail_count, "review": review_count},
         "decision": decision,
         "previous_receipt_digest": previous_digest,

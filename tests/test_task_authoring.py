@@ -168,3 +168,24 @@ def test_paper_source_digest_mismatch_is_blocked(tmp_path: Path):
     receipt = task_authoring.validate_task(task, paper_provenance=provenance)
     assert receipt["decision"] == "blocked"
     assert receipt["provenance_checks"][0]["status"] == "fail"
+
+
+def test_round_two_requires_a_valid_same_task_previous_receipt(tmp_path: Path):
+    task = _make_candidate(tmp_path / "jobshop-replan")
+    first = task_authoring.validate_task(task, round_number=1)
+    previous = task_authoring.write_receipt(first, tmp_path / "round-1")["json"]
+
+    tampered = json.loads(previous.read_text(encoding="utf-8"))
+    tampered["task_dir"] = "other-task"
+    tampered_path = tmp_path / "tampered.json"
+    tampered_path.write_text(json.dumps(tampered), encoding="utf-8")
+    receipt = task_authoring.validate_task(task, round_number=2, previous_receipt=tampered_path)
+    assert receipt["decision"] == "blocked"
+    assert any(item["name"] == "previous_receipt" and item["status"] == "fail" for item in receipt["provenance_checks"])
+
+
+def test_round_two_without_previous_receipt_is_blocked(tmp_path: Path):
+    task = _make_candidate(tmp_path / "jobshop-replan")
+    receipt = task_authoring.validate_task(task, round_number=2)
+    assert receipt["decision"] == "blocked"
+    assert any(item["name"] == "previous_receipt" and item["status"] == "fail" for item in receipt["provenance_checks"])
