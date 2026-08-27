@@ -34,6 +34,7 @@ from . import volc_review as volc_review_mod
 from . import volc_rollout as volc_rollout_mod
 from . import harbor_controls as harbor_controls_mod
 from . import authoring_loop as authoring_loop_mod
+from . import agent_sessions as agent_sessions_mod
 
 PROG = "orbench"
 
@@ -78,7 +79,45 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_task_author(sub)
     _add_task_screen(sub)
     _add_harbor_receipt(sub)
+    _add_agent_session(sub)
     return parser
+
+
+def _add_agent_session(sub: argparse._SubParsersAction) -> None:
+    parser = sub.add_parser("agent-session", help="run a bounded autonomous coding-agent session")
+    inner = parser.add_subparsers(dest="subcommand")
+    run = inner.add_parser("run", help="execute or reuse one evidence-bound session")
+    run.add_argument("--profile", choices=["codex", "claude-code"], required=True)
+    run.add_argument("--stage", required=True)
+    run.add_argument("--model", required=True)
+    run.add_argument("--prompt-file", required=True)
+    run.add_argument("--workdir", required=True)
+    run.add_argument("--out", required=True)
+    run.add_argument("--timeout-sec", type=float, required=True)
+    run.add_argument("--executable")
+    run.set_defaults(handler=_cmd_agent_session_run)
+
+
+def _cmd_agent_session_run(args: argparse.Namespace) -> int:
+    names = (
+        ("OPENAI_BASE_URL", "OPENAI_API_KEY")
+        if args.profile == "codex"
+        else ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+    )
+    supplied = {name: os.environ[name] for name in names if name in os.environ}
+    result = agent_sessions_mod.run_session(
+        profile=args.profile,
+        stage=args.stage,
+        model=args.model,
+        prompt=Path(args.prompt_file).read_text(encoding="utf-8"),
+        workdir=args.workdir,
+        out=args.out,
+        timeout_sec=args.timeout_sec,
+        environ=supplied,
+        executable=args.executable,
+    )
+    _print_json(result)
+    return 0 if result["status"] == "completed" else 9
 
 
 # --------------------------------------------------------------------------- #
