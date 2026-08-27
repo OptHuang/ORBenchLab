@@ -830,10 +830,22 @@ def collect(
         )
     queue.sort(key=lambda row: (row["source_kind"], row["title"].lower(), row["item_uid"]))
 
-    snapshot_payload = {
-        "feeds": feed_records,
-        "items": [item.to_dict() for item in items],
-    }
+    # The source snapshot digest describes the fetched material, not the
+    # caller's history.  In particular, ``dedupe_status`` changes from
+    # ``new`` to ``duplicate`` on the next day but must not make identical
+    # feed bytes look like different source content.  Fetch timestamps are
+    # likewise run metadata, while response/status/item fields are evidence.
+    snapshot_feeds = []
+    for record in feed_records:
+        snapshot_record = dict(record)
+        snapshot_record.pop("fetched_at", None)
+        snapshot_feeds.append(snapshot_record)
+    snapshot_items = []
+    for item in items:
+        snapshot_item = item.to_dict()
+        snapshot_item.pop("dedupe_status", None)
+        snapshot_items.append(snapshot_item)
+    snapshot_payload = {"feeds": snapshot_feeds, "items": snapshot_items}
     snapshot_digest = _digest(_canonical_json(snapshot_payload))
     intake_id = _digest(
         _canonical_json(

@@ -108,6 +108,13 @@ def test_previous_snapshot_marks_duplicates_and_changed_metadata_updated(repo_ro
     )
     assert all(item.dedupe_status == "duplicate" for item in second.items)
     assert second.review_queue == ()
+    # History-derived labels and fetch timestamps do not alter the source
+    # snapshot digest; the collection date still gives the intake its own id.
+    same_time = intake.collect(
+        _feeds(), fetcher=fetcher, previous=bundle, created_at="2026-08-27T00:00:00Z"
+    )
+    assert same_time.snapshot_digest == first.snapshot_digest
+    assert same_time.intake_id == first.intake_id
 
     changed_body = (repo_root / "tests/fixtures/intake/rss.atom.xml").read_bytes().replace(
         b"Open scheduling benchmark release", b"Updated scheduling benchmark release"
