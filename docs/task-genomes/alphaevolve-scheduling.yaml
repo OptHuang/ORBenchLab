@@ -1,0 +1,50 @@
+candidate_schema: orbenchlab.task-genome-candidate.v0
+status: strict-task-local-ready-for-human-review
+family: alphaevolve_scheduling
+title: AlphaEvolve-inspired seeded job-shop scheduling
+design_goal: >-
+  Test whether an agent can improve a deterministic scheduling heuristic while
+  satisfying precedence, machine non-overlap, objective recomputation and
+  artifact-only verification across controlled levels.
+source:
+  title: "AlphaEvolve: A coding agent for scientific and algorithmic discovery"
+  url: https://arxiv.org/abs/2506.13131
+  source_content_digest: sha256:f092c8cbd65da89951ee6496374da9a54963f9035758c25ac6e4625f506df9ad
+  source_packet: artifacts/source-packets/alphaevolve-2506.13131.pdf
+  usage: conceptual-inspiration-only
+task_contract:
+  package: examples/tasks/alphaevolve-scheduling
+  input: data/instance.json
+  output: submission/solver.py and submission/solution.json
+  verifier: separate no-network pytest with CTRF output
+  hard_checks: [operation coverage, precedence, machine non-overlap, makespan recomputation, seeded bounds]
+acceptance:
+  hard: [oracle smoke passes, mutation controls reject invalid schedules, static gate has no fail]
+  evidence:
+    minimum_seeds_per_cell: 3
+    minimum_difficulty_levels: 3
+    minimum_agent_systems: 2
+    required_evidence_level: E3
+difficulty_axes:
+  instance_scale:
+    levels: [tiny, small, medium]
+    meaning: jobs, operations and machine contention
+    expected_direction: harder_with_larger_value
+  precedence_depth:
+    levels: [shallow, medium, deep]
+    meaning: length of job operation chains
+    expected_direction: measure_not_assume
+  machine_coupling:
+    levels: [low, medium, high]
+    meaning: number of operations competing for one machine
+    expected_direction: measure_not_assume
+  hint_level:
+    levels: [0, 1, 2]
+    meaning: no scaffold, invariant checklist, generic scheduling template
+    expected_direction: easier_with_larger_value
+interventions:
+  adapter_shape: restart-with-hint
+  hint_ladder: [null-intervention, invariant-checklist, generic-scheduling-template]
+screening_decision_rule:
+  keep_if: [oracle smoke passes, mutation rejection rate is 1.0, model gap is replicated]
+  otherwise: revise-or-collect-more-evidence
