@@ -85,6 +85,27 @@ the gate does not trust a caller-provided hash as independent evidence. Each
 receipt also records a path-independent `task_tree_digest`, so changes to any
 task file are visible between rounds.
 
+When the static gate has produced a receipt, the semantic authoring pass can
+be delegated to Volcengine models on the execution host:
+
+```bash
+set -a; . ~/.config/claude/ark-volces.env; set +a
+orbench task-author review \
+  --task-dir path/to/task \
+  --paper-provenance path/to/paper-provenance.json \
+  --receipt artifacts/task-authoring/round-1/authoring-receipt.json \
+  --models ark-code-latest,deepseek-v4-flash \
+  --round 1 \
+  --out artifacts/task-authoring/round-1-volc
+```
+
+The command refuses non-Volc HTTPS hosts, sends only bounded public evidence,
+and writes a structured reviewer digest rather than raw prompts or model
+responses. It never upgrades a statically blocked receipt; its output is a
+revision proposal with task purpose, difficulty axes, rubric findings and
+next edits. The official automation still requires `harbor check` and runtime
+evidence before a task can be submitted.[TB-Science review automation](https://github.com/harbor-framework/terminal-bench-science/blob/main/TASK_REVIEW_AUTOMATION.md)
+
 ## Why this exists
 
 Benchmark tooling tends to fail in three ways, and each has a countermeasure

@@ -30,6 +30,7 @@ from . import export as export_mod
 from . import source_intake as intake_mod
 from . import pipeline as pipeline_mod
 from . import task_authoring as authoring_mod
+from . import volc_review as volc_review_mod
 
 PROG = "orbench"
 
@@ -463,6 +464,27 @@ def _add_task_author(sub: argparse._SubParsersAction) -> None:
     validate_parser.add_argument("--out", required=True, help="receipt output directory")
     validate_parser.set_defaults(handler=_cmd_task_author_validate)
 
+    review_parser = inner.add_parser(
+        "review",
+        help="ask independent Volcengine agents to review a static authoring receipt",
+        description=(
+            "Run structured, evidence-bounded authoring reviews through the Volcengine "
+            "Anthropic-compatible endpoint. Raw prompts, responses and credentials are not stored."
+        ),
+    )
+    review_parser.add_argument("--task-dir", required=True, help="candidate task directory")
+    review_parser.add_argument("--paper-provenance", required=True, help="JSON/YAML paper provenance")
+    review_parser.add_argument("--receipt", required=True, help="static authoring receipt JSON")
+    review_parser.add_argument("--round", type=int, default=1, help="authoring iteration number")
+    review_parser.add_argument(
+        "--models",
+        default="",
+        help="comma-separated Volc model ids (default: ANTHROPIC_MODEL)",
+    )
+    review_parser.add_argument("--timeout-sec", type=int, default=120, help="per-model HTTP timeout")
+    review_parser.add_argument("--out", required=True, help="review output directory")
+    review_parser.set_defaults(handler=_cmd_task_author_review)
+
 
 def _cmd_task_author_validate(args: argparse.Namespace) -> int:
     receipt = authoring_mod.validate_task(
@@ -482,6 +504,41 @@ def _cmd_task_author_validate(args: argparse.Namespace) -> int:
         }
     )
     return 8 if receipt["decision"] == "blocked" else 0
+
+
+def _cmd_task_author_review(args: argparse.Namespace) -> int:
+    paper = authoring_mod._load_document(Path(args.paper_provenance))
+    receipt_path = Path(args.receipt)
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise volc_review_mod.VolcReviewError("authoring receipt is not valid UTF-8 JSON") from None
+    if not isinstance(receipt, dict):
+        raise volc_review_mod.VolcReviewError("authoring receipt must be a JSON object")
+    config = volc_review_mod.VolcConfig.from_env(timeout_sec=args.timeout_sec)
+    models = [value.strip() for value in args.models.split(",") if value.strip()]
+    review = volc_review_mod.review_task(
+        args.task_dir,
+        paper_provenance=paper,
+        receipt=receipt,
+        config=config,
+        models=models,
+        round_number=args.round,
+    )
+    paths = volc_review_mod.write_review(review, args.out)
+    written = json.loads(paths["json"].read_text(encoding="utf-8"))
+    _print_json(
+        {
+            "aggregate_decision": written["aggregate_decision"],
+            "round": written["round"],
+            "models": written["models"],
+            "review_count": written["review_count"],
+            "evidence_level": written["evidence_level"],
+            "review_digest": written["review_digest"],
+            "written": {key: str(path) for key, path in paths.items()},
+        }
+    )
+    return 8 if written["aggregate_decision"] == "blocked-static-gate" else 0
 
 
 # --------------------------------------------------------------------------- #
