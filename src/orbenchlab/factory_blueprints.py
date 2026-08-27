@@ -366,16 +366,31 @@ def paper_to_benchmark_plan(
             "a structured evidence map with page/section anchors and no task design yet. For this "
             "stage, inspect only paper.txt, paper.pdf and paper-provenance.json: do not inspect seed-task, "
             "run solvers/tests, or evaluate an existing task. Do not re-extract the complete PDF: use "
-            "the page markers in paper.txt. Keep the JSON under 32000 UTF-8 bytes: prioritize executable "
-            "claims, blockers and no more than six task-relevant interactions; omit narrative repetition. "
-            "Use exactly these top-level semantic sections (metadata keys are allowed): paper, "
-            "executable_scientific_core, assumptions, available_artifacts, candidate_terminal_interactions, "
-            "non_derivable_claims, blockers, explicit_unknowns. Each claim must include its source anchor. "
-            "Write it promptly, validate it locally, and stop immediately after validation.",
-            "factory/evidence/paper-derivation-primary.json",
+            "the page markers in paper.txt. Produce a complete raw evidence map under 64000 UTF-8 bytes. "
+            "Prioritize executable claims and source anchors; do not spend time compressing into the release "
+            "schema because the next independent stage owns normalization. Write the raw JSON, validate it, "
+            "and stop immediately.",
+            "factory/evidence/paper-derivation-raw.json",
             model=author_model,
             profile=profile,
             max_budget_usd=2.0,
+            artifact_max_bytes=64_000,
+        ),
+        _stage(
+            "paper-derive-normalize",
+            "paper evidence contract normalizer",
+            common
+            + " Read only factory/evidence/paper-derivation-raw.json and paper-provenance.json; do not reopen "
+            "paper.txt or paper.pdf. Normalize the raw evidence into a concise JSON object under 32000 UTF-8 "
+            "bytes using exactly these semantic sections (metadata keys are allowed): paper, "
+            "executable_scientific_core, assumptions, available_artifacts, candidate_terminal_interactions, "
+            "non_derivable_claims, blockers, explicit_unknowns. Preserve source anchors, include no more than "
+            "six task-relevant interactions, validate the JSON and stop immediately.",
+            "factory/evidence/paper-derivation-primary.json",
+            model=author_model,
+            profile=profile,
+            depends_on=("paper-derive-primary",),
+            max_budget_usd=0.75,
             artifact_max_bytes=32_000,
             json_required_keys=(
                 "paper",
@@ -397,7 +412,7 @@ def paper_to_benchmark_plan(
             "factory/evidence/paper-derivation-critic.json",
             model=reviewers[0],
             profile=profile,
-            depends_on=("paper-derive-primary",),
+            depends_on=("paper-derive-normalize",),
             max_budget_usd=2.0,
             artifact_max_bytes=32_000,
         ),

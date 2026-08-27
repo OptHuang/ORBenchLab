@@ -155,6 +155,7 @@ def test_default_plan_assigns_all_semantic_stages_to_agent_sessions():
     ids = [stage["id"] for stage in plan["stages"]]
     assert ids == [
         "paper-derive-primary",
+        "paper-derive-normalize",
         "paper-derive-critic",
         "task-design-a",
         "task-design-b",
@@ -176,8 +177,10 @@ def test_default_plan_assigns_all_semantic_stages_to_agent_sessions():
     assert all(stage["profile"] == "claude-code" for stage in plan["stages"])
     assert all(stage["required_outputs"] for stage in plan["stages"])
     primary = next(stage for stage in plan["stages"] if stage["id"] == "paper-derive-primary")
-    assert primary["required_outputs"][0]["max_bytes"] == 32_000
-    assert set(primary["required_outputs"][0]["json_required_keys"]) == {
+    assert primary["required_outputs"][0]["max_bytes"] == 64_000
+    normalizer = next(stage for stage in plan["stages"] if stage["id"] == "paper-derive-normalize")
+    assert normalizer["required_outputs"][0]["max_bytes"] == 32_000
+    assert set(normalizer["required_outputs"][0]["json_required_keys"]) == {
         "paper",
         "executable_scientific_core",
         "assumptions",
@@ -192,7 +195,7 @@ def test_default_plan_assigns_all_semantic_stages_to_agent_sessions():
         "factory/final/task-review-summary.json",
         "factory/final/task-genome.json",
     ]
-    assert plan["maximum_model_liability_usd"] == 41.0
+    assert plan["maximum_model_liability_usd"] == 42.5
     assert agentic_factory.validate_plan(plan) == plan
 
 
@@ -207,7 +210,7 @@ def test_default_plan_requires_independent_reviewers():
         )
 
 
-def test_prepare_paper_cli_writes_eighteen_stage_plan(capsys, tmp_path: Path):
+def test_prepare_paper_cli_writes_nineteen_stage_plan(capsys, tmp_path: Path):
     paper, provenance_path, _ = _bound_paper(tmp_path)
     plan_path = tmp_path / "plan.json"
     workdir = tmp_path / "workspace"
@@ -238,7 +241,7 @@ def test_prepare_paper_cli_writes_eighteen_stage_plan(capsys, tmp_path: Path):
         ]
     ) == 0
     output = json.loads(capsys.readouterr().out)
-    assert output["stage_count"] == 18
+    assert output["stage_count"] == 19
     assert agentic_factory.load_plan(plan_path)["factory_id"] == output["factory_id"]
 
 
