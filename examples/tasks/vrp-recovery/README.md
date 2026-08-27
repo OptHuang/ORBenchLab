@@ -8,12 +8,12 @@ recorded in `data/paper-task-derivation.json`.
 ## Difficulty
 
 `customer_count` scales from 4 to 8 customers, while `vehicle_count` and route
-coupling increase at the same time. Every cell has seeds 1, 2, and 3. The event
-axis adds a closed edge after a frozen prefix, forcing a local repair without
-allowing a global rewrite. The hint axis is controlled by instruction variants:
-L0 gives only the contract, L1 names the frozen-prefix and closure invariants,
-and L2 names the affected event and vehicle set. Difficulty is not declared
-monotone until two independent agent systems are measured on all cells.
+coupling increase in the frozen fixtures. Every cell has seeds 1, 2, and 3.
+The event axis adds a closed edge after a frozen prefix, forcing a local repair
+without allowing a global rewrite. Hint variants and multiple-disruption arms
+are explicitly future extensions, not measured dimensions in this package.
+Difficulty is not declared monotone until two independent agent systems are
+measured on all cells.
 
 ## Reference solution
 
