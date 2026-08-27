@@ -9,18 +9,25 @@ from pathlib import Path
 
 ROOT = Path(os.environ.get("ORBENCH_TASK_ROOT", "/root"))
 INSTANCE = ROOT / "instance.json"
+REFERENCE_BOUNDS = ROOT / "data" / "reference-bounds.json"
 SUBMISSION = ROOT / "submission" / "solution.json"
 SOLVER = ROOT / "submission" / "solver.py"
 
 
 def _load() -> tuple[dict, dict]:
     assert INSTANCE.is_file(), "frozen instance.json is missing"
+    assert REFERENCE_BOUNDS.is_file(), "reference-bound provenance is missing"
     assert SOLVER.is_file(), "submission/solver.py is missing"
     subprocess.run([sys.executable, str(SOLVER), "--instance", str(INSTANCE), "--output", str(SUBMISSION)], cwd=ROOT, check=True, timeout=60)
     assert SUBMISSION.is_file(), "submission/solution.json is missing"
     instance = json.loads(INSTANCE.read_text(encoding="utf-8"))
     output = json.loads(SUBMISSION.read_text(encoding="utf-8"))
     assert output.get("schema_version") == "alphaevolve-scheduling.solution.v1"
+    bounds = json.loads(REFERENCE_BOUNDS.read_text(encoding="utf-8"))
+    assert bounds.get("schema_version") == "alphaevolve-scheduling.reference-bounds.v1"
+    assert bounds.get("provenance")
+    for level in instance["levels"]:
+        assert bounds["bounds"][level["id"]] == level["max_makespan"]
     return instance, output
 
 

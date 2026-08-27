@@ -483,7 +483,12 @@ def validate_task(
     # Proposal-level criteria are explicitly represented; this is useful when
     # the same receipt is attached to a paper review before implementation.
     proposal = [{"name": name, "status": "review", "reason": "proposal rubric requires TB-Science reviewer"} for name in PROPOSAL_CRITERIA]
-    all_checks = [*criteria, *paper_checks]
+    previous_digest, previous_checks = _previous_receipt(
+        Path(previous_receipt) if previous_receipt else None,
+        task_dir=root,
+        round_number=int(round_number),
+    )
+    all_checks = [*criteria, *paper_checks, *previous_checks]
     fail_count = sum(item.status == "fail" for item in all_checks)
     review_count = sum(item.status == "review" for item in all_checks)
     implementation_counts = {
@@ -502,12 +507,6 @@ def validate_task(
         decision = "ready-for-human-review"
     else:
         decision = "ready-for-harbor-validation"
-    previous_digest, previous_checks = _previous_receipt(
-        Path(previous_receipt) if previous_receipt else None,
-        task_dir=root,
-        round_number=int(round_number),
-    )
-    all_checks.extend(previous_checks)
     payload = {
         "authoring_schema_version": AUTHORING_SCHEMA_VERSION,
         # Keep the receipt digest independent of the checkout's absolute path.
