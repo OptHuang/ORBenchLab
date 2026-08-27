@@ -71,6 +71,31 @@ def test_session_writes_bound_receipt_and_reuses_success(tmp_path: Path, profile
     assert "fixture-secret" not in json.dumps(receipt)
 
 
+def test_claude_argv_enables_bounded_noninteractive_coding_tools(tmp_path: Path):
+    executable = _fixture_cli(tmp_path, 'printf \'fixture-output\'')
+    result = run_session(
+        profile="claude-code",
+        stage="repair",
+        model="fixture-model",
+        prompt="repair",
+        workdir=tmp_path,
+        out=tmp_path / "sessions",
+        timeout_sec=2,
+        environ=_env("claude-code"),
+        executable=executable,
+    )
+    argv = result["identity"]["argv_template"]
+    tools = "Read,Glob,Grep,Edit,Write,Bash"
+    assert argv[argv.index("--tools") + 1] == tools
+    assert argv[argv.index("--allowedTools") + 1] == tools
+    assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+    assert "--safe-mode" in argv
+    assert "--strict-mcp-config" in argv
+    assert "--no-session-persistence" in argv
+    assert "--add-dir" not in argv
+    assert any("not an OS filesystem sandbox" in row for row in result["limitations"])
+
+
 def test_timeout_is_hard_failure_with_atomic_receipt(tmp_path: Path):
     executable = _fixture_cli(tmp_path, "sleep 5")
     result = run_session(

@@ -71,18 +71,29 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
 def _argv(profile: str, executable: str, model: str) -> list[str]:
     if profile == "codex":
         return [executable, "exec", "--json", "--model", model, "-"]
+    coding_tools = "Read,Glob,Grep,Edit,Write,Bash"
     return [
         executable,
         "--print",
         "--verbose",
+        "--safe-mode",
+        "--disable-slash-commands",
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+        "--no-session-persistence",
+        "--permission-mode",
+        "dontAsk",
+        "--tools",
+        coding_tools,
+        "--allowedTools",
+        coding_tools,
         "--input-format",
         "stream-json",
         "--output-format",
         "stream-json",
         "--model",
         model,
-        "--tools",
-        "",
     ]
 
 
@@ -359,7 +370,15 @@ def run_session(
             ),
             "usage": {"input_tokens": None, "output_tokens": None, "cost_usd": None},
             "evidence_level": "E1-agent-session-process",
-            "limitations": ["Agent completion is not static-gate, verifier, or Harbor evidence."],
+            "limitations": [
+                "Agent completion is not static-gate, verifier, or Harbor evidence.",
+                (
+                    "The workdir is the process cwd and evidence boundary, not an OS filesystem "
+                    "sandbox; enabled coding tools, especially Bash, retain the host account's "
+                    "filesystem permissions. Run untrusted stages in an external container/worktree sandbox."
+                ),
+                "This process harness does not provide network isolation.",
+            ],
         }
         receipt["receipt_digest"] = _digest(receipt)
         _atomic_json(receipt_path, receipt)
