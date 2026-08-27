@@ -35,6 +35,8 @@ from . import volc_rollout as volc_rollout_mod
 from . import harbor_controls as harbor_controls_mod
 from . import authoring_loop as authoring_loop_mod
 from . import agent_sessions as agent_sessions_mod
+from . import agentic_factory as agentic_factory_mod
+from . import factory_blueprints as factory_blueprints_mod
 
 PROG = "orbench"
 
@@ -80,6 +82,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_task_screen(sub)
     _add_harbor_receipt(sub)
     _add_agent_session(sub)
+    _add_agent_factory(sub)
     return parser
 
 
@@ -132,6 +135,152 @@ def _cmd_agent_session_run(args: argparse.Namespace) -> int:
     )
     _print_json(result)
     return 0 if result["status"] == "completed" else 9
+
+
+def _add_agent_factory(sub: argparse._SubParsersAction) -> None:
+    parser = sub.add_parser(
+        "agent-factory",
+        help="compile or resume a hash-bound DAG of autonomous agent sessions",
+    )
+    inner = parser.add_subparsers(dest="subcommand")
+    compile_parser = inner.add_parser("compile", help="validate a factory blueprint into a signed plan")
+    compile_parser.add_argument("--blueprint", required=True)
+    compile_parser.add_argument("--out", required=True)
+    compile_parser.set_defaults(handler=_cmd_agent_factory_compile)
+
+    prepare_parser = inner.add_parser(
+        "prepare-paper",
+        help="bind a paper and strict seed task into the default autonomous factory DAG",
+    )
+    prepare_parser.add_argument("--paper-file", required=True)
+    prepare_parser.add_argument("--paper-provenance", required=True)
+    prepare_parser.add_argument("--seed-task", required=True)
+    prepare_parser.add_argument("--workdir", required=True)
+    prepare_parser.add_argument("--plan-out", required=True)
+    prepare_parser.add_argument("--author-model", required=True)
+    prepare_parser.add_argument("--reviewer-model", action="append", required=True)
+    prepare_parser.add_argument("--frontier-model", required=True)
+    prepare_parser.add_argument("--weak-model", required=True)
+    prepare_parser.add_argument(
+        "--profile", choices=["codex", "claude-code"], default="claude-code"
+    )
+    prepare_parser.set_defaults(handler=_cmd_agent_factory_prepare_paper)
+
+    run_parser = inner.add_parser("run", help="execute or resume ready stages")
+    run_parser.add_argument("--plan", required=True)
+    run_parser.add_argument("--workdir", required=True)
+    run_parser.add_argument("--out", required=True)
+    run_parser.add_argument("--max-new-stages", type=int)
+    run_parser.add_argument("--codex-executable")
+    run_parser.add_argument("--claude-executable")
+    run_parser.set_defaults(handler=_cmd_agent_factory_run)
+
+
+def _cmd_agent_factory_compile(args: argparse.Namespace) -> int:
+    try:
+        blueprint = json.loads(Path(args.blueprint).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise agentic_factory_mod.AgenticFactoryError(
+            "factory blueprint is not valid UTF-8 JSON"
+        ) from None
+    if not isinstance(blueprint, dict) or set(blueprint) != {
+        "name",
+        "source_binding_digest",
+        "stages",
+    }:
+        raise agentic_factory_mod.AgenticFactoryError(
+            "factory blueprint requires exactly name, source_binding_digest and stages"
+        )
+    plan = agentic_factory_mod.compile_plan(
+        name=blueprint["name"],
+        source_binding_digest=blueprint["source_binding_digest"],
+        stages=blueprint["stages"],
+    )
+    path = agentic_factory_mod.write_plan(plan, args.out)
+    _print_json(
+        {
+            "factory_id": plan["factory_id"],
+            "plan_digest": plan["plan_digest"],
+            "stage_count": len(plan["stages"]),
+            "maximum_model_liability_usd": plan["maximum_model_liability_usd"],
+            "written": str(path),
+        }
+    )
+    return 0
+
+
+def _cmd_agent_factory_prepare_paper(args: argparse.Namespace) -> int:
+    manifest = factory_blueprints_mod.prepare_workspace(
+        paper_file=args.paper_file,
+        paper_provenance=args.paper_provenance,
+        seed_task=args.seed_task,
+        workdir=args.workdir,
+    )
+    plan = factory_blueprints_mod.paper_to_benchmark_plan(
+        source_binding_digest=manifest["workspace_binding_digest"],
+        author_model=args.author_model,
+        reviewer_models=args.reviewer_model,
+        frontier_model=args.frontier_model,
+        weak_model=args.weak_model,
+        profile=args.profile,
+    )
+    path = agentic_factory_mod.write_plan(plan, args.plan_out)
+    _print_json(
+        {
+            "factory_id": plan["factory_id"],
+            "plan_digest": plan["plan_digest"],
+            "stage_count": len(plan["stages"]),
+            "maximum_model_liability_usd": plan["maximum_model_liability_usd"],
+            "source_binding_digest": manifest["source_binding_digest"],
+            "workspace_binding_digest": manifest["workspace_binding_digest"],
+            "workdir": str(Path(args.workdir).resolve()),
+            "written": str(path),
+        }
+    )
+    return 0
+
+
+def _cmd_agent_factory_run(args: argparse.Namespace) -> int:
+    plan = agentic_factory_mod.load_plan(args.plan)
+    environments = {
+        "codex": {
+            name: os.environ[name]
+            for name in ("OPENAI_BASE_URL", "OPENAI_API_KEY")
+            if name in os.environ
+        },
+        "claude-code": {
+            name: os.environ[name]
+            for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+            if name in os.environ
+        },
+    }
+    executables = {
+        key: value
+        for key, value in {
+            "codex": args.codex_executable,
+            "claude-code": args.claude_executable,
+        }.items()
+        if value
+    }
+    result = agentic_factory_mod.run_factory(
+        plan,
+        workdir=args.workdir,
+        out=args.out,
+        environments=environments,
+        executables=executables,
+        max_new_stages=args.max_new_stages,
+    )
+    _print_json(
+        {
+            "factory_id": result["factory_id"],
+            "status": result["status"],
+            "resumed": result["resumed"],
+            "new_stage_attempts": result.get("new_stage_attempts", 0),
+            "run_path": result["run_path"],
+            "quarantine": result.get("quarantine"),
+        }
+    )
+    return 0 if result["status"] in {"active", "semantic-complete-e1"} else 8
 
 
 # --------------------------------------------------------------------------- #

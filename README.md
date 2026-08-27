@@ -58,6 +58,13 @@ injection is not inferred from this report.
 
 ## Paper to Terminal-Bench Science task
 
+For the autonomous Codex/Claude Code DAG—paper evidence, two task-design
+agents, strict author/review/repair, Harbor pilots, trajectory diagnosis,
+interventions, difficulty variants and calibration—see
+[`docs/agentic-factory.md`](docs/agentic-factory.md). Its terminal state is
+deliberately `semantic-complete-e1`; deterministic and Harbor gates still own
+acceptance and promotion.
+
 For a paper-backed candidate, run the authoring gate before packaging anything
 for Harbor:
 
