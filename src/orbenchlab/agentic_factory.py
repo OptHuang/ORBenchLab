@@ -46,7 +46,7 @@ ATTEMPT_SCHEMA_VERSION = "orbenchlab.agentic-factory-attempt.v1"
 _STAGE_ID = re.compile(r"[a-z][a-z0-9-]{0,63}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _PROFILES = frozenset({"codex", "claude-code"})
-_OUTPUT_KINDS = frozenset({"file", "json", "directory"})
+_OUTPUT_KINDS = frozenset({"file", "text", "json", "directory"})
 _JSON_TYPES = frozenset(
     {"array", "boolean", "integer", "null", "number", "object", "string"}
 )
@@ -524,7 +524,10 @@ def _validate_session_receipt(
         or identity.get("profile") != stage["profile"]
         or identity.get("model") != stage["model"]
         or identity.get("prompt_digest")
-        != "sha256:" + hashlib.sha256(_stage_prompt(plan, stage).encode("utf-8")).hexdigest()
+        != "sha256:"
+        + hashlib.sha256(
+            _stage_prompt(plan, stage, workspace=workspace).encode("utf-8")
+        ).hexdigest()
         or identity.get("timeout_sec") != stage["timeout_sec"]
         or identity.get("max_output_bytes") != stage["max_output_bytes"]
         or identity.get("max_budget_usd") != stage["max_budget_usd"]
@@ -640,7 +643,9 @@ def _validate_run_chain(
             raise AgenticFactoryError(f"failed stage has no failed receipt: {stage_id}")
 
 
-def _load_run(path: Path, plan: Mapping[str, Any]) -> dict[str, Any]:
+def _load_run(
+    path: Path, plan: Mapping[str, Any], *, workspace: Path | None = None
+) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -702,7 +707,7 @@ def _load_run(path: Path, plan: Mapping[str, Any]) -> dict[str, Any]:
         or "quarantine" in value
     ):
         raise AgenticFactoryError("active factory run violates state invariants")
-    _validate_run_chain(path.parent, plan, value)
+    _validate_run_chain(path.parent, plan, value, workspace=workspace)
     return value
 
 
@@ -710,6 +715,8 @@ def _reconcile_orphan_attempts(
     root: Path,
     plan: Mapping[str, Any],
     run: Mapping[str, Any],
+    *,
+    workspace: Path | None = None,
 ) -> dict[str, Any]:
     """Attach an attempt receipt written just before a process interruption."""
 
@@ -756,11 +763,13 @@ def _reconcile_orphan_attempts(
                 state["status"] = "pending"
         else:
             raise AgenticFactoryError(f"orphan attempt has invalid status for {stage_id}")
-    _validate_run_chain(root, plan, recovered)
+    _validate_run_chain(root, plan, recovered, workspace=workspace)
     return recovered
 
 
-def initialise(plan: Mapping[str, Any], out: str | Path) -> tuple[dict[str, Any], bool]:
+def initialise(
+    plan: Mapping[str, Any], out: str | Path, *, workspace: Path | None = None
+) -> tuple[dict[str, Any], bool]:
     checked = validate_plan(plan)
     root = Path(out)
     root.mkdir(parents=True, exist_ok=True)
@@ -768,8 +777,10 @@ def initialise(plan: Mapping[str, Any], out: str | Path) -> tuple[dict[str, Any]
     run_path = root / "factory-run.json"
     write_plan(checked, plan_path)
     if run_path.exists():
-        run = _load_run(run_path, checked)
-        run = _reconcile_orphan_attempts(root, checked, run)
+        run = _load_run(run_path, checked, workspace=workspace)
+        run = _reconcile_orphan_attempts(
+            root, checked, run, workspace=workspace
+        )
         run = _write_run(run_path, run)
         return run, True
     run = _new_run(checked)
@@ -952,11 +963,20 @@ def _artifact(
 ) -> dict[str, Any] | None:
     if path.is_symlink():
         raise AgenticFactoryError(f"required output is a symlink: {path.name}")
-    if kind in {"file", "json"}:
+    if kind in {"file", "text", "json"}:
         if not path.is_file():
             return None
         if path.stat().st_size > max_bytes:
             raise AgenticFactoryError(f"required output exceeds its byte contract: {path.name}")
+        if kind == "text":
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                raise AgenticFactoryError(
+                    f"required text output is not valid UTF-8: {path.name}"
+                ) from None
+            if not text.strip():
+                raise AgenticFactoryError(f"required text output is empty: {path.name}")
         if kind == "json":
             try:
                 document = json.loads(path.read_text(encoding="utf-8"))
@@ -1121,7 +1141,12 @@ def _quarantine_failed_outputs(
     return snapshots
 
 
-def _stage_prompt(plan: Mapping[str, Any], stage: Mapping[str, Any]) -> str:
+def _stage_prompt(
+    plan: Mapping[str, Any],
+    stage: Mapping[str, Any],
+    *,
+    workspace: Path | None = None,
+) -> str:
     contract = {
         "factory_id": plan["factory_id"],
         "plan_digest": plan["plan_digest"],
@@ -1135,6 +1160,27 @@ def _stage_prompt(plan: Mapping[str, Any], stage: Mapping[str, Any]) -> str:
             "factory disables Bash; use Read/Glob/Grep/Edit/Write and leave command execution to trusted gates."
         ),
     }
+    digest_targets = {
+        output["path"]: dict(output.get("json_digest_bindings", {}))
+        for output in stage["required_outputs"]
+        if output.get("json_digest_bindings")
+    }
+    if digest_targets:
+        if workspace is None:
+            raise AgenticFactoryError(
+                "workspace is required to bind trusted digest values into a stage prompt"
+            )
+        contract["trusted_json_digest_values"] = {
+            output_path: {
+                key: _file_digest(_artifact_path(workspace, relative))
+                for key, relative in sorted(bindings.items())
+            }
+            for output_path, bindings in sorted(digest_targets.items())
+        }
+        contract["trusted_json_digest_rule"] = (
+            "Copy these exact harness-computed values into the same-named JSON keys; "
+            "do not compute, alter, or omit them."
+        )
     return stage["prompt"] + "\n\nORBENCH_FACTORY_CONTRACT\n" + json.dumps(
         contract,
         indent=2,
@@ -1188,7 +1234,7 @@ def _run_factory_locked(
         raise AgenticFactoryError("agent workdir must be outside the factory evidence output")
     _validate_workspace_binding(workspace, checked)
     _validate_workspace_limits(workspace, max_bytes=checked["max_workspace_bytes"])
-    run, resumed = initialise(checked, root)
+    run, resumed = initialise(checked, root, workspace=workspace)
     _validate_run_chain(root, checked, run, workspace=workspace)
     if run["status"] in {"semantic-complete-e1", "quarantined"}:
         return {**run, "resumed": True, "run_path": str(root / "factory-run.json")}
@@ -1235,7 +1281,7 @@ def _run_factory_locked(
                 profile=stage["profile"],
                 stage=f"{checked['factory_id']}/{stage_id}/attempt-{attempt_number}",
                 model=stage["model"],
-                prompt=_stage_prompt(checked, stage),
+                prompt=_stage_prompt(checked, stage, workspace=workspace),
                 workdir=workspace,
                 out=root / "sessions",
                 timeout_sec=stage["timeout_sec"],

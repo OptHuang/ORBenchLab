@@ -144,7 +144,7 @@ def test_bounded_pdf_extraction_fails_closed_on_output_limit(tmp_path: Path):
         _REAL_EXTRACT_PAPER_TEXT(paper, executable=executable, max_output_bytes=4)
 
 
-def test_default_plan_assigns_all_semantic_stages_to_agent_sessions():
+def test_default_plan_assigns_all_semantic_stages_to_agent_sessions(tmp_path: Path):
     plan = factory_blueprints.paper_to_benchmark_plan(
         source_binding_digest="sha256:" + "a" * 64,
         author_model="ark-code-latest",
@@ -177,7 +177,11 @@ def test_default_plan_assigns_all_semantic_stages_to_agent_sessions():
     assert all(stage["profile"] == "claude-code" for stage in plan["stages"])
     assert all(stage["required_outputs"] for stage in plan["stages"])
     primary = next(stage for stage in plan["stages"] if stage["id"] == "paper-derive-primary")
+    assert primary["required_outputs"][0]["path"] == "factory/evidence/paper-derivation-raw.md"
+    assert primary["required_outputs"][0]["kind"] == "text"
     assert primary["required_outputs"][0]["max_bytes"] == 64_000
+    assert "clear Markdown" in primary["prompt"]
+    assert "raw JSON" not in primary["prompt"]
     normalizer = next(stage for stage in plan["stages"] if stage["id"] == "paper-derive-normalize")
     assert normalizer["required_outputs"][0]["max_bytes"] == 32_000
     assert set(normalizer["required_outputs"][0]["json_required_keys"]) == {
@@ -196,8 +200,21 @@ def test_default_plan_assigns_all_semantic_stages_to_agent_sessions():
     assert normalizer["required_outputs"][0]["json_key_types"]["assumptions"] == "array"
     assert normalizer["required_outputs"][0]["json_digest_bindings"] == {
         "paper_provenance_digest": "factory-input/paper-provenance.json",
-        "raw_evidence_digest": "factory/evidence/paper-derivation-raw.json",
+        "raw_evidence_digest": "factory/evidence/paper-derivation-raw.md",
     }
+    assert "paper-derivation-raw.md" in normalizer["prompt"]
+    assert "copy those strings" in normalizer["prompt"]
+    raw = tmp_path / "factory/evidence/paper-derivation-raw.md"
+    provenance = tmp_path / "factory-input/paper-provenance.json"
+    raw.parent.mkdir(parents=True)
+    provenance.parent.mkdir(parents=True)
+    raw.write_text("# Raw evidence\n\n- page 1: bounded claim\n", encoding="utf-8")
+    provenance.write_text('{"title":"Fixture"}\n', encoding="utf-8")
+    runtime_prompt = agentic_factory._stage_prompt(plan, normalizer, workspace=tmp_path)
+    assert agentic_factory._file_digest(raw) in runtime_prompt
+    assert agentic_factory._file_digest(provenance) in runtime_prompt
+    assert "trusted_json_digest_values" in runtime_prompt
+    assert "do not compute, alter, or omit" in runtime_prompt
     final = next(stage for stage in plan["stages"] if stage["id"] == "final-synthesis")
     assert [output["path"] for output in final["required_outputs"]] == [
         "factory/final/task-review-summary.json",

@@ -142,7 +142,7 @@ def test_autopilot_injects_each_runtime_barrier_once_and_resumes(
     cursor = {"value": 0}
     calls = {"baseline": 0, "difficulty": 0, "factory": 0}
 
-    def fake_initialise(plan_value, out):
+    def fake_initialise(plan_value, out, **kwargs):
         status = "semantic-complete-e1" if cursor["value"] == len(order) else "active"
         return {
             "status": status,

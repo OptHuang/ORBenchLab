@@ -188,7 +188,9 @@ def _bind_factory_outputs(
 
     plan = agentic_factory.load_plan(plan_path)
     agentic_factory._require_hard_budget_profiles(plan)
-    run = agentic_factory._load_run(factory_run_path, plan)
+    run = agentic_factory._load_run(
+        factory_run_path, plan, workspace=workspace.resolve()
+    )
     if run.get("status") != "semantic-complete-e1":
         raise FactorySupervisorError("factory run is not semantic-complete-e1")
     agentic_factory._validate_run_chain(

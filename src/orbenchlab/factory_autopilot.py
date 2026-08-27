@@ -726,7 +726,9 @@ def run(
         executables = {"claude-code": str(claude_binding["path"])}
         for _ in range(128):
             _validate_barriers(state, workspace)
-            factory_run, _ = agentic_factory.initialise(checked, factory_root)
+            factory_run, _ = agentic_factory.initialise(
+                checked, factory_root, workspace=workspace
+            )
             if factory_run["status"] in {"semantic-complete-e1", "quarantined"}:
                 if factory_run["status"] == "semantic-complete-e1" and set(
                     state["barriers"]

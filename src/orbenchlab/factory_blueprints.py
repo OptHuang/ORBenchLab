@@ -376,13 +376,15 @@ def paper_to_benchmark_plan(
             "run solvers/tests, execute numerical probes, search for counterexamples, derive new results, or "
             "evaluate an existing task. This is source extraction, not claim verification; preserve uncertainty "
             "for the independent critic. Do not re-extract the complete PDF: use "
-            "the page markers in paper.txt. Produce a complete raw evidence map under 64000 UTF-8 bytes. "
+            "the page markers in paper.txt. Produce a complete raw evidence memo under 64000 UTF-8 bytes. "
             "Prioritize executable claims and source anchors; do not spend time compressing into the release "
-            "schema because the next independent stage owns normalization. Write the raw JSON, validate it, "
-            "and stop immediately.",
-            "factory/evidence/paper-derivation-raw.json",
+            "schema because the next independent stage owns normalization. Write clear Markdown with explicit "
+            "headings, source anchors and unknowns; do not wrap it in JSON or a code fence. Stop immediately "
+            "after writing the memo.",
+            "factory/evidence/paper-derivation-raw.md",
             model=author_model,
             profile=profile,
+            kind="text",
             max_budget_usd=2.0,
             artifact_max_bytes=64_000,
         ),
@@ -390,16 +392,17 @@ def paper_to_benchmark_plan(
             "paper-derive-normalize",
             "paper evidence contract normalizer",
             common
-            + " Read only factory/evidence/paper-derivation-raw.json and factory-input/paper-provenance.json; do not reopen "
+            + " Read only factory/evidence/paper-derivation-raw.md and factory-input/paper-provenance.json; do not reopen "
             "paper.txt or paper.pdf. Normalize the raw evidence into a concise JSON object under 32000 UTF-8 "
             "bytes using exactly these semantic sections (metadata keys are allowed): paper, "
             "executable_scientific_core, assumptions, available_artifacts, candidate_terminal_interactions, "
             "non_derivable_claims, blockers, explicit_unknowns. paper and executable_scientific_core must be "
             "non-empty objects; the remaining semantic sections must be arrays, with assumptions and "
-            "candidate_terminal_interactions non-empty. Also include raw_evidence_digest and "
-            "paper_provenance_digest as lowercase sha256:<64 hex> digests of the exact two input files. "
+            "candidate_terminal_interactions non-empty. The trusted factory contract appended to this prompt "
+            "provides exact raw_evidence_digest and paper_provenance_digest values; copy those strings into "
+            "the same-named JSON keys rather than computing or changing them. "
             "Preserve source anchors, include no more than six task-relevant interactions, validate the JSON "
-            "and stop immediately.",
+            "by carefully checking its syntax while writing it, and stop immediately. Do not invent digest values.",
             "factory/evidence/paper-derivation-primary.json",
             model=author_model,
             profile=profile,
@@ -439,7 +442,7 @@ def paper_to_benchmark_plan(
                 "paper_provenance_digest",
             ),
             json_digest_bindings={
-                "raw_evidence_digest": "factory/evidence/paper-derivation-raw.json",
+                "raw_evidence_digest": "factory/evidence/paper-derivation-raw.md",
                 "paper_provenance_digest": "factory-input/paper-provenance.json",
             },
         ),

@@ -294,6 +294,69 @@ def test_json_digest_binding_rejects_wrong_source_digest(tmp_path: Path):
         )
 
 
+@pytest.mark.parametrize("payload", [b"", b"   \n", b"\xff\xfe"])
+def test_text_output_requires_nonempty_utf8(tmp_path: Path, payload: bytes):
+    path = tmp_path / "raw.md"
+    path.write_bytes(payload)
+    with pytest.raises(agentic_factory.AgenticFactoryError, match="text output"):
+        agentic_factory._artifact(path, "text", 4096)
+
+
+def test_runtime_prompt_supplies_trusted_digest_and_resume_recomputes_it(tmp_path: Path):
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    source = workdir / "source.json"
+    source.write_text('{"bound":true}\n', encoding="utf-8")
+    expected = agentic_factory._file_digest(source)
+    executable = tmp_path / "bound-agent"
+    executable.write_text(
+        "#!/bin/sh\ncat >/dev/null\nmkdir -p factory\n"
+        f"printf '%s\\n' '{{\"claims\":[\"bounded\"],\"source_digest\":\"{expected}\"}}' "
+        "> factory/paper-derive.json\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    stage = _stage("paper-derive")
+    stage["required_outputs"][0].update(
+        {
+            "json_required_keys": ["claims", "source_digest"],
+            "json_key_types": {"claims": "array", "source_digest": "string"},
+            "json_nonempty_keys": ["claims", "source_digest"],
+            "json_digest_bindings": {"source_digest": "source.json"},
+        }
+    )
+    plan = agentic_factory.compile_plan(
+        name="runtime prompt binding", source_binding_digest=DIGEST, stages=[stage]
+    )
+    prompt = agentic_factory._stage_prompt(plan, plan["stages"][0], workspace=workdir)
+    assert expected in prompt
+    first = agentic_factory.run_factory(
+        plan,
+        workdir=workdir,
+        out=tmp_path / "run",
+        environments=_environments(),
+        executables={"claude-code": executable},
+    )
+    assert first["status"] == "semantic-complete-e1"
+    resumed = agentic_factory.run_factory(
+        plan,
+        workdir=workdir,
+        out=tmp_path / "run",
+        environments=_environments(),
+        executables={"claude-code": executable},
+    )
+    assert resumed["resumed"] is True
+    source.write_text('{"bound":false}\n', encoding="utf-8")
+    with pytest.raises(agentic_factory.AgenticFactoryError, match="signed binding"):
+        agentic_factory.run_factory(
+            plan,
+            workdir=workdir,
+            out=tmp_path / "run",
+            environments=_environments(),
+            executables={"claude-code": executable},
+        )
+
+
 def test_failed_output_is_archived_and_cannot_contaminate_retry(tmp_path: Path):
     counter = tmp_path / "attempted-once"
     executable = tmp_path / "retry-agent"

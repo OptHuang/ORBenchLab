@@ -337,7 +337,9 @@ def build_receipt(
     try:
         plan = agentic_factory.load_plan(plan_file)
         agentic_factory._require_hard_budget_profiles(plan)
-        run = agentic_factory._load_run(run_file, plan)
+        run = agentic_factory._load_run(
+            run_file, plan, workspace=workspace.resolve()
+        )
         agentic_factory._validate_workspace_binding(workspace.resolve(), plan)
         agentic_factory._validate_run_chain(run_file.parent, plan, run, workspace=workspace.resolve())
         if run.get("status") != "semantic-complete-e1":
