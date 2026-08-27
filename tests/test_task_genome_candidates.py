@@ -30,6 +30,7 @@ def test_candidate_genomes_are_source_bound_and_not_packable():
         assert "hooks" not in genome
         source = genome["source"]
         assert source["intake_snapshot_id"] == shortlist["intake_snapshot_id"]
+        assert source["intake_snapshot_digest"] == shortlist["intake_snapshot_digest"]
         assert source["intake_item_uid"] in by_uid
         assert source["source_content_digest"] == by_uid[source["intake_item_uid"]][
             "source_content_digest"

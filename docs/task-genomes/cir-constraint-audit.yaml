@@ -9,6 +9,7 @@ design_goal: >-
   audit the cross-file constraints rather than trusting its own final claim.
 source:
   intake_snapshot_id: sha256:b4e8889fd63c7228a21a2283f62a33bafe9160b7681e8ba980e854001e9a06c5
+  intake_snapshot_digest: sha256:1c9cba1708611a2514060eb6820e8f4b295db3d388adc5f2e11a58935754b566
   intake_item_uid: sha256:9ee943edbb4e0d72cf99b8818facdd1a621d4e9aecfcecba2e27ad384f622b90
   source_content_digest: sha256:63aa05cba89feaff5d4c5dc163ed94d0c039e037ab87bbaa567d97fc9533dd3e
   title: Canonical Intermediate Representation for LLM-based optimization problem formulation and code generation

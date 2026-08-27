@@ -9,6 +9,7 @@ design_goal: >-
   only the causally affected neighborhood.
 source:
   intake_snapshot_id: sha256:b4e8889fd63c7228a21a2283f62a33bafe9160b7681e8ba980e854001e9a06c5
+  intake_snapshot_digest: sha256:1c9cba1708611a2514060eb6820e8f4b295db3d388adc5f2e11a58935754b566
   intake_item_uid: sha256:677ba473534b8a5fc37b4581beb393788562183f6f721f3f99c48ead73853cb9
   source_content_digest: sha256:b64ad4f19fd9020cb9d0819ae827e03d55ec4310129d281c5532fd4ba2de9ed8
   title: Multi-Agent Environments for Vehicle Routing Problems
