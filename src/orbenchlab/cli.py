@@ -31,6 +31,7 @@ from . import source_intake as intake_mod
 from . import pipeline as pipeline_mod
 from . import task_authoring as authoring_mod
 from . import volc_review as volc_review_mod
+from . import volc_rollout as volc_rollout_mod
 
 PROG = "orbench"
 
@@ -73,6 +74,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_intake(sub)
     _add_pipeline(sub)
     _add_task_author(sub)
+    _add_task_screen(sub)
     return parser
 
 
@@ -541,6 +543,60 @@ def _cmd_task_author_review(args: argparse.Namespace) -> int:
         }
     )
     return 8 if written["aggregate_decision"] == "blocked-static-gate" else 0
+
+
+# --------------------------------------------------------------------------- #
+# Volcengine task-local model screening
+# --------------------------------------------------------------------------- #
+
+
+def _add_task_screen(sub: argparse._SubParsersAction) -> None:
+    parser = sub.add_parser(
+        "task-screen",
+        help="run a strict task candidate with Volcengine models in a no-network container",
+        description=(
+            "Ask Volcengine models for a bounded solver.py, execute it in the task's "
+            "pinned test image, and write an outcome-grounded screening report. "
+            "This is not Harbor acceptance."
+        ),
+    )
+    parser.add_argument("--task-dir", required=True, help="strict task directory")
+    parser.add_argument("--test-image", required=True, help="Docker image containing pytest and CTRF")
+    parser.add_argument("--out", required=True, help="screening output directory")
+    parser.add_argument("--models", default="", help="comma-separated Volc model ids")
+    parser.add_argument("--repetitions", type=int, default=1)
+    parser.add_argument("--hint-level", type=int, default=0, help="contract reminder level (0=none, 1=exact output reminder)")
+    parser.add_argument("--timeout-sec", type=int, default=120)
+    parser.add_argument("--max-tokens", type=int, default=2400)
+    parser.set_defaults(handler=_cmd_task_screen)
+
+
+def _cmd_task_screen(args: argparse.Namespace) -> int:
+    config = volc_review_mod.VolcConfig.from_env(timeout_sec=args.timeout_sec)
+    models = [value.strip() for value in args.models.split(",") if value.strip()]
+    report = volc_rollout_mod.run_rollout(
+        args.task_dir,
+        config=config,
+        models=models,
+        test_image=args.test_image,
+        out=args.out,
+        repetitions=args.repetitions,
+        hint_level=args.hint_level,
+        timeout_sec=args.timeout_sec,
+        max_tokens=args.max_tokens,
+    )
+    arms = report["tasks"][0]["arms"]
+    _print_json(
+        {
+            "task": report["task"],
+            "decision": report["tasks"][0]["decision"],
+            "evidence_level": report["tasks"][0]["evidence_level"],
+            "arms": arms,
+            "report_digest": report["report_digest"],
+            "written": {"json": str(Path(args.out) / "screening-report.json"), "markdown": str(Path(args.out) / "screening-report.md")},
+        }
+    )
+    return 0
 
 
 # --------------------------------------------------------------------------- #

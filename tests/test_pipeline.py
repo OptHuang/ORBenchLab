@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 import yaml
@@ -104,3 +105,9 @@ def test_pipeline_run_writes_deterministic_manifest_and_quarantines_unknown(tmp_
     pipeline.run(out=out, task_inputs=[tmp_path / "tasks"], screening_inputs=[report])
     second = {path.name: path.read_bytes() for path in out.iterdir()}
     assert first == second
+    manifest = json.loads((out / "pipeline-manifest.json").read_text())
+    for name, digest in manifest["files"].items():
+        actual = "sha256:" + hashlib.sha256((out / name).read_bytes()).hexdigest()
+        assert digest == actual
+    summary = json.loads((out / "pipeline-summary.json").read_text())
+    assert summary["task_cards_digest"] == manifest["files"]["task-cards.json"]

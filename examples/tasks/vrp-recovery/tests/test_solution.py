@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 
@@ -14,6 +16,17 @@ SUBMISSION = ROOT / "submission"
 def _load() -> tuple[dict, list[dict], dict, list[dict], dict]:
     assert INSTANCE.is_file() and EVENTS.is_file()
     assert (SUBMISSION / "solver.py").is_file()
+    # Bind the graded artifacts to the submitted solver.  Reading a stale
+    # pre-generated artifact would let a candidate pass without executing its
+    # code, which is not a valid task-authoring contract.
+    subprocess.run(
+        [sys.executable, str(SUBMISSION / "solver.py")],
+        cwd=ROOT,
+        check=True,
+        timeout=60,
+    )
+    for name in ("initial_routes.json", "replans.jsonl", "event_audit.json"):
+        assert (SUBMISSION / name).is_file(), f"solver did not write {name}"
     initial = json.loads((SUBMISSION / "initial_routes.json").read_text())
     replans = [json.loads(x) for x in (SUBMISSION / "replans.jsonl").read_text().splitlines() if x.strip()]
     audit = json.loads((SUBMISSION / "event_audit.json").read_text())
@@ -70,4 +83,3 @@ def test_replay_is_feasible_and_objective_is_recomputed():
                 assert rec["objective"] == expected <= level["max_objective"]
                 ar = audit_records[(lid, seed, event["event_id"])]
                 assert ar["frozen_prefix_ok"] and ar["closure_ok"] and ar["objective_recomputed"]
-

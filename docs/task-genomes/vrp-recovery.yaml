@@ -40,7 +40,7 @@ difficulty_axes:
     expected_direction: measure_stability
 interventions:
   adapter_shape: restart-with-hint
-  hint_ladder: [null-intervention]
+  hint_ladder: [0, 1, 2]
 screening_decision_rule:
   keep_if: [oracle smoke passes, mutation rejection rate is 1.0, event or scale gap is replicated]
   otherwise: revise-or-collect-more-evidence

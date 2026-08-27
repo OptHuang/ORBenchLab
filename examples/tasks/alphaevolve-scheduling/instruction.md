@@ -6,6 +6,10 @@ You are given `instance.json`, which contains three frozen job-shop levels:
 ignore a seed. Each job has an ordered list of operations; each operation names
 one machine and a positive processing duration.
 
+For a base duration `d`, the verifier uses the deterministic seeded duration
+`d + ((seed + operation_index) % 2)`, where `operation_index` is zero-based
+within the job. Use this rule exactly for every `(level, seed)` pair.
+
 Create exactly these two files under `submission/`:
 
 1. `submission/solver.py`: a self-contained Python 3 program that accepts
@@ -17,5 +21,8 @@ The JSON output must contain one schedule for every `(level, seed)` pair. Every
 operation must occur exactly once, job precedence and machine non-overlap must
 hold, and the reported makespan must equal the verifier's recomputed value. The
 makespan for each seed must not exceed its level's published feasibility bound.
+Use schema version `alphaevolve-scheduling.solution.v1` and encode schedules as
+an object: `schedules[level_id][str(seed)]`. Each operation row must contain
+`operation_id`, `job_id`, `operation_index`, `machine`, `start`, and `end`.
 Keep the input files unchanged and do not download packages or contact the
 network. Run a local smoke test before finishing.

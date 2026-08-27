@@ -324,6 +324,9 @@ def _summary_markdown(card: Mapping[str, Any]) -> str:
     else:
         lines += ["未提供可执行的难度轴；任务自动进入 quarantine。"]
     lines.append("")
+    interventions = card["difficulty"].get("interventions")
+    if interventions:
+        lines += ["## 可控干预", "", f"`{json.dumps(interventions, ensure_ascii=False, sort_keys=True)}`", ""]
     lines += ["## 模型表现", ""]
     models = card["performance"]["models"]
     if models:
@@ -461,7 +464,10 @@ def run(
         "quarantined_count": sum(card["decision"] == "quarantine" for card in cards),
         "input_reports": [str(path) for path in report_paths],
         "input_report_digests": {str(path): _sha256(path) for path in report_paths},
-        "task_cards_digest": "sha256:" + hashlib.sha256(_canonical(cards_payload)).hexdigest(),
+        # Filled with the digest of the exact bytes written below.  Hashing the
+        # canonical in-memory object here used to make the summary/manifest
+        # disagree with the pretty-printed JSON artifact on disk.
+        "task_cards_digest": None,
         "limitations": [
             "This command summarizes existing evidence; it does not call a model or author a task.",
             "E4 live intervention is not inferred from E2/E3 reports.",
@@ -470,16 +476,30 @@ def run(
     markdown = ["# ORBenchLab 自动任务总览", "", f"任务数：{len(cards)}", ""]
     for card in cards:
         markdown += [f"## {card['task_id']} — `{card['decision']}`", "", card["summary_markdown"], ""]
+    cards_path = output / "task-cards.json"
+    summary_path = output / "pipeline-summary.json"
+    markdown_path = output / "task-cards.md"
+    cards_path.write_text(
+        json.dumps(cards_payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    summary["task_cards_digest"] = _sha256(cards_path)
+    summary_path.write_text(
+        json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    markdown_path.write_text("\n".join(markdown) + "\n", encoding="utf-8")
+    # The manifest is a byte-level ledger of the artifacts actually handed to
+    # the reviewer, including indentation and the final newline.
     manifest = {
         "pipeline_schema_version": PIPELINE_SCHEMA_VERSION,
         "files": {
-            "task-cards.json": "sha256:" + hashlib.sha256(_canonical(cards_payload)).hexdigest(),
-            "pipeline-summary.json": "sha256:" + hashlib.sha256(_canonical(summary)).hexdigest(),
-            "task-cards.md": "sha256:" + hashlib.sha256(("\n".join(markdown) + "\n").encode()).hexdigest(),
+            path.name: _sha256(path)
+            for path in (cards_path, summary_path, markdown_path)
         },
     }
-    (output / "task-cards.json").write_text(json.dumps(cards_payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
-    (output / "pipeline-summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
-    (output / "task-cards.md").write_text("\n".join(markdown) + "\n", encoding="utf-8")
-    (output / "pipeline-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    (output / "pipeline-manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
     return {"out": str(output), "task_count": len(cards), "decision_counts": summary["decision_counts"], "written": sorted(str(path) for path in output.iterdir())}

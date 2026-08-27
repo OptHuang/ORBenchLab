@@ -108,6 +108,28 @@ revision proposal with task purpose, difficulty axes, rubric findings and
 next edits. The official automation still requires `harbor check` and runtime
 evidence before a task can be submitted.[TB-Science review automation](https://github.com/harbor-framework/terminal-bench-science/blob/main/TASK_REVIEW_AUTOMATION.md)
 
+For a fast, task-local model screen on an execution host that already has the
+Volcengine environment and a pinned verifier image, use:
+
+```bash
+set -a; . ~/.config/claude/ark-volces.env; set +a
+orbench task-screen \
+  --task-dir examples/tasks/alphaevolve-scheduling \
+  --test-image orbenchlab-alpha-tests:9b02e26 \
+  --models ark-code-latest \
+  --repetitions 3 --hint-level 0 \
+  --out artifacts/screening/alphaevolve-volc
+```
+
+`task-screen` exposes only the task contract and input data to the model,
+accepts a bounded `solver.py`, executes it with `--network none`, reruns the
+task's verifier, and records digests plus CTRF aggregates. `hint-level` is an
+explicit restart-with-hint intervention (`0`, `1`, `2`); it is a screening arm,
+not a causal intervention claim. The resulting `screening-report.json` can be
+fed directly to `orbench pipeline run`. A completed task-local run is E3
+outcome-grounded evidence; Harbor quality checks and repeated checkpoint
+interventions are still required for acceptance and E4 claims.
+
 ## Why this exists
 
 Benchmark tooling tends to fail in three ways, and each has a countermeasure
