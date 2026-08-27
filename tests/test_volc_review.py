@@ -9,6 +9,7 @@ from orbenchlab.volc_review import (
     VolcConfig,
     VolcReviewError,
     _digest,
+    _normalize_review,
     _task_tree_digest,
     call_reviewer,
     review_task,
@@ -90,6 +91,21 @@ def test_call_reviewer_routes_explicit_ark_model_id_through_openai_compat(monkey
     assert "secret-token" not in json.dumps(result)
 
 
+def test_promising_review_without_complete_rubric_is_downgraded():
+    review = _normalize_review(
+        {
+            "decision": "promising",
+            "task_summary": "summary",
+            "blocking_findings": [],
+            "difficulty_axes": [],
+            "criteria": [],
+            "suggested_edits": [],
+        }
+    )
+    assert review["decision"] == "needs-human"
+    assert review["rubric_complete"] is False
+
+
 def test_review_task_is_blocked_by_static_receipt_and_writes_summary(tmp_path: Path, monkeypatch):
     task = tmp_path / "task"
     task.mkdir()
@@ -159,17 +175,17 @@ def test_review_rejects_stale_receipt_before_provider_call(tmp_path: Path, monke
             paper_provenance={"source_content_digest": paper_digest},
             receipt=receipt,
             config=VolcConfig("https://ark.cn-beijing.volces.com/api/coding", "secret", "ark-code-latest"),
-            models=["ark-code-latest"],
+            models=["reviewer-a", "reviewer-b"],
             round_number=1,
         )
     assert called == []
 
 
-def test_review_snapshot_rejects_secret_like_file_before_provider(tmp_path: Path):
+def test_review_snapshot_rejects_api_key_file_before_provider(tmp_path: Path):
     task = tmp_path / "task"
     task.mkdir()
     (task / "instruction.md").write_text("public")
-    (task / ".env").write_text("TOKEN=do-not-send")
+    (task / "api_key.json").write_text('{"api_key":"LIVE-SECRET-123"}')
     paper_digest = "sha256:" + "c" * 64
     receipt = {
         "authoring_schema_version": "orbenchlab.tbscience-authoring.v1",
@@ -186,6 +202,36 @@ def test_review_snapshot_rejects_secret_like_file_before_provider(tmp_path: Path
             paper_provenance={"source_content_digest": paper_digest},
             receipt=receipt,
             config=VolcConfig("https://ark.cn-beijing.volces.com/api/coding", "secret", "ark-code-latest"),
-            models=["ark-code-latest"],
+            models=["reviewer-a", "reviewer-b"],
             round_number=1,
         )
+
+
+def test_review_requires_two_distinct_models_before_provider(tmp_path: Path, monkeypatch):
+    task = tmp_path / "task"
+    task.mkdir()
+    (task / "instruction.md").write_text("public")
+    paper_digest = "sha256:" + "c" * 64
+    receipt = {
+        "authoring_schema_version": "orbenchlab.tbscience-authoring.v1",
+        "task_dir": task.name,
+        "decision": "ready-for-human-review",
+        "round": 1,
+        "task_tree_digest": _task_tree_digest(task),
+        "paper": {"source_content_digest": paper_digest},
+    }
+    receipt["receipt_digest"] = _digest(receipt)
+    called = []
+    monkeypatch.setattr("orbenchlab.volc_review.call_reviewer", lambda *a, **k: called.append(True))
+    with pytest.raises(VolcReviewError, match="two distinct"):
+        review_task(
+            task,
+            paper_provenance={"source_content_digest": paper_digest},
+            receipt=receipt,
+            config=VolcConfig(
+                "https://ark.cn-beijing.volces.com/api/coding", "secret", "ark-code-latest"
+            ),
+            models=["ark-code-latest", "ark-code-latest"],
+            round_number=1,
+        )
+    assert called == []

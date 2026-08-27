@@ -128,6 +128,33 @@ current task tree, round number and paper digest, and refuses hidden or
 credential-like task files. The official automation still requires `harbor check` and runtime
 evidence before a task can be submitted.[TB-Science review automation](https://github.com/harbor-framework/terminal-bench-science/blob/main/TASK_REVIEW_AUTOMATION.md)
 
+To let Volc author and reviewer slots iterate over an existing strict skeleton
+without modifying the seed task, use:
+
+```bash
+orbench task-author iterate \
+  --seed-task examples/tasks/alphaevolve-scheduling \
+  --paper-provenance artifacts/paper-bindings/alpha/paper-provenance.json \
+  --paper-derivation examples/tasks/alphaevolve-scheduling/data/paper-task-derivation.json \
+  --author-model ark-code-latest \
+  --review-model ark-code-latest \
+  --review-model another-accessible-volc-model \
+  --max-rounds 3 \
+  --out artifacts/authoring-loops/alpha
+```
+
+Each author response is a compare-and-swap list of full text replacements with
+a path allowlist, 32-file/256-KiB cap and no deletion support. Every round lives
+in its own copied task tree, reruns the static gate, and calls both reviewer
+slots only when the static gate is not blocked. The loop stops on all-promising,
+provider/parse failure, a repeated or no-op patch, or the round cap; its strongest
+state is `promising-needs-harbor`. Reviewer model IDs must be distinct, and
+every promising review must cover the seven proposal criteria with passing
+evidence. The derivation file is mandatory bounded evidence: provenance metadata
+alone is not treated as paper understanding. A checksummed copy is inserted into
+each staged task tree, so the independent reviewers see and bind to the same
+derivation evidence; author patches cannot modify that reserved file.
+
 For a fast, task-local model screen on an execution host that already has the
 Volcengine environment and a pinned verifier image, use:
 

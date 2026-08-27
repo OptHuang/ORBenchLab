@@ -33,6 +33,7 @@ from . import task_authoring as authoring_mod
 from . import volc_review as volc_review_mod
 from . import volc_rollout as volc_rollout_mod
 from . import harbor_controls as harbor_controls_mod
+from . import authoring_loop as authoring_loop_mod
 
 PROG = "orbench"
 
@@ -520,12 +521,32 @@ def _add_task_author(sub: argparse._SubParsersAction) -> None:
     review_parser.add_argument(
         "--models",
         default="",
-        help="comma-separated Volc model ids (default: ANTHROPIC_MODEL)",
+        help="at least two distinct comma-separated Volc reviewer model ids",
     )
     review_parser.add_argument("--timeout-sec", type=int, default=120, help="per-model HTTP timeout")
     review_parser.add_argument("--max-tokens", type=int, default=1200, help="per-model output token cap")
     review_parser.add_argument("--out", required=True, help="review output directory")
     review_parser.set_defaults(handler=_cmd_task_author_review)
+
+    iterate_parser = inner.add_parser(
+        "iterate",
+        help="run bounded Volc author/reviewer rounds over a copied strict skeleton",
+    )
+    iterate_parser.add_argument("--seed-task", required=True)
+    iterate_parser.add_argument("--paper-provenance", required=True)
+    iterate_parser.add_argument(
+        "--paper-derivation",
+        required=True,
+        help="bounded audited UTF-8 paper-to-task derivation evidence",
+    )
+    iterate_parser.add_argument("--author-model", default="ark-code-latest")
+    iterate_parser.add_argument("--review-model", action="append", required=True)
+    iterate_parser.add_argument("--max-rounds", type=int, default=3)
+    iterate_parser.add_argument("--max-author-tokens", type=int, default=2400)
+    iterate_parser.add_argument("--max-review-tokens", type=int, default=1200)
+    iterate_parser.add_argument("--timeout-sec", type=int, default=120)
+    iterate_parser.add_argument("--out", required=True)
+    iterate_parser.set_defaults(handler=_cmd_task_author_iterate)
 
 
 def _cmd_task_author_validate(args: argparse.Namespace) -> int:
@@ -582,6 +603,37 @@ def _cmd_task_author_review(args: argparse.Namespace) -> int:
         }
     )
     return 8 if written["aggregate_decision"] == "blocked-static-gate" else 0
+
+
+def _cmd_task_author_iterate(args: argparse.Namespace) -> int:
+    config = volc_review_mod.VolcConfig.from_env(timeout_sec=args.timeout_sec)
+    run = authoring_loop_mod.iterate(
+        args.seed_task,
+        paper_provenance=args.paper_provenance,
+        paper_derivation=args.paper_derivation,
+        config=config,
+        author_model=args.author_model,
+        review_models=args.review_model,
+        max_rounds=args.max_rounds,
+        max_author_tokens=args.max_author_tokens,
+        max_review_tokens=args.max_review_tokens,
+        out=args.out,
+    )
+    _print_json(
+        {
+            "status": run["status"],
+            "stop_reason": run["stop_reason"],
+            "rounds": len(run["rounds"]),
+            "seed_unchanged": run["seed_unchanged"],
+            "final_task": run["final_task"],
+            "run_digest": run["run_digest"],
+            "written": {
+                "run": str(Path(args.out) / "run.json"),
+                "manifest": str(Path(args.out) / "run-manifest.json"),
+            },
+        }
+    )
+    return 0 if run["status"] == "promising-needs-harbor" else 8
 
 
 # --------------------------------------------------------------------------- #

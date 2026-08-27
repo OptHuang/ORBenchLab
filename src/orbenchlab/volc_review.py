@@ -19,7 +19,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
@@ -37,6 +37,31 @@ DEFAULT_TIMEOUT_SEC = 120
 MAX_FILE_BYTES = 64_000
 MAX_SNAPSHOT_BYTES = 256_000
 VOLC_HOST_SUFFIXES = ("volces.com", "volcengine.com")
+REQUIRED_REVIEW_CRITERIA = frozenset(
+    {
+        "verifiable",
+        "well_specified",
+        "solvable",
+        "difficult",
+        "scientifically_grounded",
+        "scope",
+        "outcome_verified",
+    }
+)
+_SECRET_FILENAME = re.compile(
+    r"(?:api[_-]?key|apikey|password|passwd|bearer|token|secret|credential|auth|"
+    r"private[_-]?key|id_rsa|id_dsa|id_ed25519)",
+    re.I,
+)
+_SECRET_CONTENT = (
+    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----", re.I),
+    re.compile(
+        r"(?:api[_-]?key|apikey|password|passwd|token|secret|authorization|bearer|"
+        r"aws_access_key_id|aws_secret_access_key|github_token)\s*[:=]\s*"
+        r"[\"']?[A-Za-z0-9_./+=:-]{8,}",
+        re.I,
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -97,6 +122,19 @@ def _file_digest(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _assert_public_text(path: str, text: str | None = None) -> None:
+    name = PurePath(path).name
+    lower = name.lower()
+    if (
+        name.startswith(".")
+        or _SECRET_FILENAME.search(name)
+        or lower.endswith((".pem", ".key", ".p12", ".pfx", ".keystore"))
+    ):
+        raise VolcReviewError(f"task snapshot refuses hidden or credential-like file: {path}")
+    if text is not None and any(pattern.search(text) for pattern in _SECRET_CONTENT):
+        raise VolcReviewError(f"task snapshot refuses credential-like content: {path}")
+
+
 def _bounded_task_snapshot(task_dir: Path) -> list[dict[str, Any]]:
     files: list[dict[str, Any]] = []
     preview_bytes = 0
@@ -106,12 +144,9 @@ def _bounded_task_snapshot(task_dir: Path) -> list[dict[str, Any]]:
     ):
         relative = path.relative_to(task_dir).as_posix()
         parts = path.relative_to(task_dir).parts
-        filename = path.name.lower()
-        if any(part.startswith(".") for part in parts) or re.search(
-            r"(?:^|[._-])(env|token|secret|credential|auth|private[_-]?key)(?:$|[._-])",
-            filename,
-        ):
+        if any(part.startswith(".") for part in parts):
             raise VolcReviewError(f"task snapshot refuses hidden or credential-like file: {relative}")
+        _assert_public_text(relative)
         entry: dict[str, Any] = {"path": relative, "bytes": path.stat().st_size, "digest": _file_digest(path)}
         if path.stat().st_size <= MAX_FILE_BYTES and path.suffix.lower() in {".md", ".toml", ".yaml", ".yml", ".json", ".jsonl", ".py", ".sh"}:
             try:
@@ -122,6 +157,7 @@ def _bounded_task_snapshot(task_dir: Path) -> list[dict[str, Any]]:
             # include files in common secret/data locations even if present.
             if not any(part.lower() in {"secret", "secrets", ".ssh", ".aws", ".config"} for part in path.parts):
                 preview = text[:MAX_FILE_BYTES]
+                _assert_public_text(relative, preview)
                 preview_bytes += len(preview.encode("utf-8"))
                 if preview_bytes > MAX_SNAPSHOT_BYTES:
                     raise VolcReviewError("task snapshot previews exceed 256000 UTF-8 bytes")
@@ -274,7 +310,48 @@ def _normalize_review(value: Mapping[str, Any]) -> dict[str, Any]:
             if isinstance(candidate, str) and candidate.strip():
                 return [candidate]
         return []
-    criteria = value.get("criteria") if isinstance(value.get("criteria"), list) else []
+    raw_criteria = value.get("criteria") if isinstance(value.get("criteria"), list) else []
+    criteria: list[dict[str, Any]] = []
+    names: list[str] = []
+    for item in raw_criteria:
+        if not isinstance(item, Mapping):
+            continue
+        name = str(item.get("name") or "")
+        status = str(item.get("status") or "review")
+        evidence = item.get("evidence")
+        if name not in REQUIRED_REVIEW_CRITERIA or status not in {"pass", "fail", "review"}:
+            continue
+        criteria.append(
+            {
+                "name": name,
+                "status": status,
+                "evidence": str(evidence or ""),
+                "next_action": str(item.get("next_action") or ""),
+            }
+        )
+        names.append(name)
+    rubric_complete = (
+        len(names) == len(set(names))
+        and set(names) == REQUIRED_REVIEW_CRITERIA
+        and all(row["evidence"].strip() for row in criteria)
+    )
+    shape_complete = all(
+        key in value
+        for key in (
+            "decision",
+            "task_summary",
+            "blocking_findings",
+            "difficulty_axes",
+            "criteria",
+            "suggested_edits",
+        )
+    )
+    if decision == "promising" and (
+        not shape_complete
+        or not rubric_complete
+        or any(row["status"] != "pass" for row in criteria)
+    ):
+        decision = "needs-human"
     return {
         "decision": decision,
         "task_summary": str(value.get("task_summary") or value.get("summary") or ""),
@@ -282,7 +359,8 @@ def _normalize_review(value: Mapping[str, Any]) -> dict[str, Any]:
         "difficulty_axes": axes,
         "criteria": criteria,
         "suggested_edits": _strings("suggested_edits", "recommendations", "next_actions"),
-        "shape_complete": all(key in value for key in ("decision", "task_summary", "blocking_findings", "difficulty_axes", "criteria", "suggested_edits")),
+        "shape_complete": shape_complete,
+        "rubric_complete": rubric_complete,
         "source_keys": sorted(str(key) for key in value.keys()),
     }
 
@@ -382,7 +460,10 @@ def _review_prompt(task_dir: Path, paper: Mapping[str, Any], receipt: Mapping[st
         "task_summary (string), blocking_findings (array of strings), "
         "difficulty_axes (array of objects with name, levels, evidence, risk), "
         "criteria (array of objects with name, status pass|fail|review, evidence, next_action), "
-        "suggested_edits (array of strings). A static blocked receipt cannot become accepted.\n\n"
+        "suggested_edits (array of strings). Criteria must contain each of these names exactly once: "
+        + ", ".join(sorted(REQUIRED_REVIEW_CRITERIA))
+        + ". A promising decision requires non-empty evidence and pass status for every criterion. "
+        "A static blocked receipt cannot become accepted.\n\n"
         + json.dumps(payload, ensure_ascii=False, sort_keys=True)
     )
 
@@ -405,6 +486,8 @@ def review_task(
     selected = [str(model).strip() for model in models if str(model).strip()]
     if not selected:
         selected = [config.default_model]
+    if len(selected) < 2 or len(set(selected)) != len(selected):
+        raise VolcReviewError("authoring review requires at least two distinct reviewer model ids")
     _validate_review_inputs(
         root,
         paper_provenance,
