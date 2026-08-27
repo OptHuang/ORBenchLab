@@ -19,7 +19,7 @@ def _load() -> tuple[dict, dict]:
     return instance, output
 
 
-def _check_level(level: dict, schedule: dict) -> None:
+def _check_level(level: dict, schedule: dict, seed: int) -> None:
     jobs = {job["id"]: job for job in level["jobs"]}
     rows = schedule.get("operations")
     assert isinstance(rows, list)
@@ -34,8 +34,13 @@ def _check_level(level: dict, schedule: dict) -> None:
     by_job: dict[str, list[dict]] = {job_id: [] for job_id in jobs}
     by_machine: dict[str, list[dict]] = {}
     for row in rows:
+        operation = next(
+            op for job in level["jobs"] for op in job["operations"] if op["id"] == row["operation_id"]
+        )
+        expected_duration = operation["duration"] + ((seed + row["operation_index"]) % 2)
         assert isinstance(row.get("start"), int) and isinstance(row.get("end"), int)
         assert row["start"] >= 0 and row["end"] > row["start"]
+        assert row["end"] - row["start"] == expected_duration
         by_job[row["job_id"]].append(row)
         by_machine.setdefault(row["machine"], []).append(row)
     for job in level["jobs"]:
@@ -59,4 +64,6 @@ def test_all_levels_are_feasible_and_objective_is_recomputed():
     levels = {level["id"]: level for level in instance["levels"]}
     assert set(schedules) == set(levels)
     for level_id, level in levels.items():
-        _check_level(level, schedules[level_id])
+        assert set(schedules[level_id]) == {str(seed) for seed in level["seeds"]}
+        for seed in level["seeds"]:
+            _check_level(level, schedules[level_id][str(seed)], seed)

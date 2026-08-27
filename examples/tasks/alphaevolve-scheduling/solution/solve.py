@@ -6,14 +6,15 @@ from itertools import permutations
 from pathlib import Path
 
 
-def _schedule_for_order(jobs: list[dict]) -> dict:
+def _schedule_for_order(jobs: list[dict], seed: int) -> dict:
     machine_ready: dict[str, int] = {}
     schedule = {"operations": [], "makespan": 0}
     for job in jobs:
         job_ready = 0
         for index, operation in enumerate(job["operations"]):
+            duration = operation["duration"] + ((seed + index) % 2)
             start = max(job_ready, machine_ready.get(operation["machine"], 0))
-            end = start + operation["duration"]
+            end = start + duration
             schedule["operations"].append(
                 {
                     "operation_id": operation["id"],
@@ -33,11 +34,16 @@ def _schedule_for_order(jobs: list[dict]) -> dict:
 def solve(instance: dict) -> dict:
     schedules = {}
     for level in instance["levels"]:
-        # A bounded permutation search is sufficient for this small control
-        # fixture and gives the agent a meaningful, reproducible objective to
-        # improve against without importing a solver package.
-        candidates = (_schedule_for_order(list(order)) for order in permutations(level["jobs"]))
-        schedules[level["id"]] = min(candidates, key=lambda value: value["makespan"])
+        schedules[level["id"]] = {}
+        for seed in level["seeds"]:
+            # A bounded permutation search is sufficient for this small control
+            # fixture and gives the agent a meaningful, reproducible objective
+            # to improve against without importing a solver package.
+            candidates = (
+                _schedule_for_order(list(order), seed)
+                for order in permutations(level["jobs"])
+            )
+            schedules[level["id"]][str(seed)] = min(candidates, key=lambda value: value["makespan"])
     return {"schema_version": "alphaevolve-scheduling.solution.v1", "schedules": schedules}
 
 

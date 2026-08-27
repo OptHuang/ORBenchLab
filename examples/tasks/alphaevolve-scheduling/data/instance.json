@@ -4,7 +4,8 @@
   "levels": [
     {
       "id": "tiny",
-      "max_makespan": 6,
+      "max_makespan": 8,
+      "seeds": [1, 2, 3],
       "jobs": [
         {"id": "J1", "operations": [{"id": "J1-O1", "machine": "M1", "duration": 2}, {"id": "J1-O2", "machine": "M2", "duration": 1}]},
         {"id": "J2", "operations": [{"id": "J2-O1", "machine": "M2", "duration": 2}, {"id": "J2-O2", "machine": "M1", "duration": 1}]}
@@ -12,7 +13,8 @@
     },
     {
       "id": "small",
-      "max_makespan": 10,
+      "max_makespan": 14,
+      "seeds": [1, 2, 3],
       "jobs": [
         {"id": "J1", "operations": [{"id": "J1-O1", "machine": "M1", "duration": 2}, {"id": "J1-O2", "machine": "M2", "duration": 3}]},
         {"id": "J2", "operations": [{"id": "J2-O1", "machine": "M2", "duration": 1}, {"id": "J2-O2", "machine": "M1", "duration": 3}]},
@@ -21,7 +23,8 @@
     },
     {
       "id": "medium",
-      "max_makespan": 16,
+      "max_makespan": 22,
+      "seeds": [1, 2, 3],
       "jobs": [
         {"id": "J1", "operations": [{"id": "J1-O1", "machine": "M1", "duration": 3}, {"id": "J1-O2", "machine": "M2", "duration": 2}, {"id": "J1-O3", "machine": "M3", "duration": 2}]},
         {"id": "J2", "operations": [{"id": "J2-O1", "machine": "M2", "duration": 2}, {"id": "J2-O2", "machine": "M3", "duration": 3}, {"id": "J2-O3", "machine": "M1", "duration": 1}]},

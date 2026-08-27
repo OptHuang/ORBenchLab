@@ -10,7 +10,9 @@ paper-to-task mapping and the non-redistribution boundary are recorded in
 
 The primary axis is `instance_scale`: `tiny`, `small`, and `medium` increase the
 number of jobs, operations, machine contention, and the size of the search
-space. Secondary axes are precedence depth and machine coupling. A future hint
+space. Each level has three explicit deterministic seeds, so a result can be
+replicated without pretending that one fixture is a seed study. Secondary axes
+are precedence depth and machine coupling. A future hint
 ladder can expose no scaffold, an invariant checklist, or a generic scheduling
 template; it must never reveal a schedule or objective. Difficulty is a
 measured property only after repeated seeds and independent model systems, not
