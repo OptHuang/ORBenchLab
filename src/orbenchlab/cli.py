@@ -94,6 +94,12 @@ def _add_agent_session(sub: argparse._SubParsersAction) -> None:
     run.add_argument("--workdir", required=True)
     run.add_argument("--out", required=True)
     run.add_argument("--timeout-sec", type=float, required=True)
+    run.add_argument(
+        "--max-output-bytes",
+        type=int,
+        default=agent_sessions_mod.DEFAULT_MAX_OUTPUT_BYTES,
+        help="combined stdout/stderr hard cap",
+    )
     run.add_argument("--executable")
     run.set_defaults(handler=_cmd_agent_session_run)
 
@@ -113,6 +119,7 @@ def _cmd_agent_session_run(args: argparse.Namespace) -> int:
         workdir=args.workdir,
         out=args.out,
         timeout_sec=args.timeout_sec,
+        max_output_bytes=args.max_output_bytes,
         environ=supplied,
         executable=args.executable,
     )

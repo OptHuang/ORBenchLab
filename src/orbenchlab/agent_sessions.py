@@ -8,8 +8,10 @@ and a fail-closed receipt.  A completed receipt is not verifier evidence.
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
+import selectors
 import shutil
 import signal
 import subprocess
@@ -40,6 +42,7 @@ _PROFILES = {
     },
 }
 _SAFE_HOST_ENV = ("HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR")
+DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024
 
 
 def _digest_bytes(value: bytes) -> str:
@@ -151,6 +154,108 @@ def _tree_digest(root: Path, *, exclude: Path | None = None) -> str:
     return _digest(rows)
 
 
+def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _bounded_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    stdin: bytes,
+    timeout_sec: float,
+    max_output_bytes: int,
+) -> tuple[bytes, bytes, int | None, str | None]:
+    """Drain both pipes incrementally and kill the group at either hard bound."""
+
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=dict(env),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError:
+        return b"", b"", None, "launch_error"
+    assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+    streams = selectors.DefaultSelector()
+    for stream in (process.stdin, process.stdout, process.stderr):
+        os.set_blocking(stream.fileno(), False)
+    streams.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+    streams.register(process.stdout, selectors.EVENT_READ, "stdout")
+    streams.register(process.stderr, selectors.EVENT_READ, "stderr")
+    chunks: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
+    input_offset = 0
+    captured = 0
+    failure: str | None = None
+    deadline = time.monotonic() + timeout_sec
+    try:
+        while streams.get_map():
+            remaining_time = deadline - time.monotonic()
+            if remaining_time <= 0:
+                failure = "wall_clock_timeout"
+                break
+            for key, _ in streams.select(min(remaining_time, 0.1)):
+                stream = key.fileobj
+                if key.data == "stdin":
+                    try:
+                        written = os.write(stream.fileno(), stdin[input_offset : input_offset + 65_536])
+                    except BrokenPipeError:
+                        written = 0
+                        input_offset = len(stdin)
+                    input_offset += written
+                    if input_offset >= len(stdin):
+                        streams.unregister(stream)
+                        stream.close()
+                    continue
+                try:
+                    chunk = os.read(stream.fileno(), min(65_536, max_output_bytes - captured + 1))
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    streams.unregister(stream)
+                    stream.close()
+                    continue
+                room = max_output_bytes - captured
+                if len(chunk) > room:
+                    if room:
+                        chunks[key.data].append(chunk[:room])
+                        captured += room
+                    failure = "output_limit_exceeded"
+                    break
+                chunks[key.data].append(chunk)
+                captured += len(chunk)
+            if failure is not None:
+                break
+        if failure is not None:
+            _kill_process_group(process)
+        try:
+            process.wait(timeout=max(0.1, deadline - time.monotonic()) if failure is None else 5)
+        except subprocess.TimeoutExpired:
+            failure = failure or "wall_clock_timeout"
+            _kill_process_group(process)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+    finally:
+        streams.close()
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if not stream.closed:
+                stream.close()
+    exit_code = process.returncode
+    if failure is None and exit_code != 0:
+        failure = "agent_exit_nonzero"
+    return b"".join(chunks["stdout"]), b"".join(chunks["stderr"]), exit_code, failure
+
+
 def run_session(
     *,
     profile: str,
@@ -162,12 +267,21 @@ def run_session(
     timeout_sec: float,
     environ: Mapping[str, str],
     executable: str | Path | None = None,
+    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
 ) -> dict[str, Any]:
     """Run or safely reuse one deterministic autonomous-agent session."""
 
     if profile not in _PROFILES:
         raise AgentSessionError("profile must be codex or claude-code")
-    if not stage.strip() or not model.strip() or not prompt or timeout_sec <= 0:
+    if (
+        not stage.strip()
+        or not model.strip()
+        or not prompt
+        or timeout_sec <= 0
+        or not isinstance(max_output_bytes, int)
+        or isinstance(max_output_bytes, bool)
+        or not 1 <= max_output_bytes <= 256 * 1024 * 1024
+    ):
         raise AgentSessionError("stage, model, prompt and timeout must be positive")
     cwd = Path(workdir).resolve()
     if not cwd.is_dir() or cwd.is_symlink():
@@ -190,77 +304,66 @@ def run_session(
         "argv_template": command[1:],
         "workdir_binding": _digest(str(cwd)),
         "executable_digest": _digest_bytes(Path(resolved).read_bytes()),
+        "timeout_sec": timeout_sec,
+        "max_output_bytes": max_output_bytes,
     }
     session_id = _digest(identity).removeprefix("sha256:")[:32]
     session_dir = output_root / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
     receipt_path = session_dir / "receipt.json"
-    reused = _valid_reuse(receipt_path, session_id)
-    if reused is not None:
-        return {**reused, "receipt_path": str(receipt_path), "reused": True}
+    lock_path = session_dir / "session.lock"
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        reused = _valid_reuse(receipt_path, session_id)
+        if reused is not None:
+            return {**reused, "receipt_path": str(receipt_path), "reused": True}
 
-    started = time.monotonic()
-    stdout = b""
-    stderr = b""
-    exit_code: int | None = None
-    failure_class: str | None = None
-    try:
-        process = subprocess.Popen(
+        started = time.monotonic()
+        stdout, stderr, exit_code, failure_class = _bounded_process(
             command,
             cwd=cwd,
             env=child_env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
+            stdin=_stdin(profile, prompt),
+            timeout_sec=timeout_sec,
+            max_output_bytes=max_output_bytes,
         )
-        try:
-            stdout, stderr = process.communicate(_stdin(profile, prompt), timeout=timeout_sec)
-            exit_code = process.returncode
-            if exit_code != 0:
-                failure_class = "agent_exit_nonzero"
-        except subprocess.TimeoutExpired:
-            failure_class = "wall_clock_timeout"
-            os.killpg(process.pid, signal.SIGKILL)
-            stdout, stderr = process.communicate()
-            exit_code = process.returncode
-    except OSError:
-        failure_class = "launch_error"
 
-    _atomic_bytes(session_dir / "stdout.bin", stdout)
-    _atomic_bytes(session_dir / "stderr.bin", stderr)
-    receipt: dict[str, Any] = {
-        "schema_version": "orbenchlab.agent-session.receipt.v1",
-        "session_id": session_id,
-        "identity": identity,
-        # Runtime-only local path supports safe reuse checks. Downstream public
-        # exporters must continue to omit host paths, as they do for run roots.
-        "workdir_runtime_path": str(cwd),
-        "output_runtime_path": str(output_root),
-        "input_tree_digest": input_tree_digest,
-        "result_tree_digest": _tree_digest(cwd, exclude=output_root),
-        "status": "completed" if failure_class is None else "failed",
-        "failure_class": failure_class,
-        "exit_code": exit_code,
-        "elapsed_sec": round(time.monotonic() - started, 3),
-        "stdout_digest": _digest_bytes(stdout),
-        "stderr_digest": _digest_bytes(stderr),
-        "trace_digest": _digest(
-            {
-                "session_id": session_id,
-                "stdout": _digest_bytes(stdout),
-                "stderr": _digest_bytes(stderr),
-                "exit_code": exit_code,
-                "failure_class": failure_class,
-            }
-        ),
-        "usage": {"input_tokens": None, "output_tokens": None, "cost_usd": None},
-        "evidence_level": "E1-agent-session-process",
-        "limitations": ["Agent completion is not static-gate, verifier, or Harbor evidence."],
-    }
-    receipt["receipt_digest"] = _digest(receipt)
-    _atomic_json(receipt_path, receipt)
-    return {**receipt, "receipt_path": str(receipt_path), "reused": False}
+        _atomic_bytes(session_dir / "stdout.bin", stdout)
+        _atomic_bytes(session_dir / "stderr.bin", stderr)
+        receipt: dict[str, Any] = {
+            "schema_version": "orbenchlab.agent-session.receipt.v1",
+            "session_id": session_id,
+            "identity": identity,
+            # Runtime-only paths support safe reuse checks. Public exporters
+            # must continue to omit them, as they do for benchmark run roots.
+            "workdir_runtime_path": str(cwd),
+            "output_runtime_path": str(output_root),
+            "input_tree_digest": input_tree_digest,
+            "result_tree_digest": _tree_digest(cwd, exclude=output_root),
+            "status": "completed" if failure_class is None else "failed",
+            "failure_class": failure_class,
+            "exit_code": exit_code,
+            "elapsed_sec": round(time.monotonic() - started, 3),
+            "max_output_bytes": max_output_bytes,
+            "captured_output_bytes": len(stdout) + len(stderr),
+            "stdout_digest": _digest_bytes(stdout),
+            "stderr_digest": _digest_bytes(stderr),
+            "trace_digest": _digest(
+                {
+                    "session_id": session_id,
+                    "stdout": _digest_bytes(stdout),
+                    "stderr": _digest_bytes(stderr),
+                    "exit_code": exit_code,
+                    "failure_class": failure_class,
+                }
+            ),
+            "usage": {"input_tokens": None, "output_tokens": None, "cost_usd": None},
+            "evidence_level": "E1-agent-session-process",
+            "limitations": ["Agent completion is not static-gate, verifier, or Harbor evidence."],
+        }
+        receipt["receipt_digest"] = _digest(receipt)
+        _atomic_json(receipt_path, receipt)
+        return {**receipt, "receipt_path": str(receipt_path), "reused": False}
 
 
-__all__ = ["AgentSessionError", "run_session"]
+__all__ = ["AgentSessionError", "DEFAULT_MAX_OUTPUT_BYTES", "run_session"]

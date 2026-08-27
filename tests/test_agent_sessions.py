@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 from pathlib import Path
 
@@ -11,6 +12,10 @@ from orbenchlab.cli import main
 
 
 VOLC = "https://ark.cn-beijing.volces.com/api/coding"
+
+
+def _concurrent_session(kwargs: dict, queue) -> None:
+    queue.put(run_session(**kwargs))
 
 
 def _fixture_cli(tmp_path: Path, body: str) -> Path:
@@ -82,6 +87,56 @@ def test_timeout_is_hard_failure_with_atomic_receipt(tmp_path: Path):
     assert result["status"] == "failed"
     assert result["failure_class"] == "wall_clock_timeout"
     assert Path(result["receipt_path"]).is_file()
+
+
+def test_output_limit_kills_process_group_without_unbounded_capture(tmp_path: Path):
+    result = run_session(
+        profile="codex",
+        stage="scaffold",
+        model="fixture-model",
+        prompt="bounded",
+        workdir=tmp_path,
+        out=tmp_path / "sessions",
+        timeout_sec=5,
+        max_output_bytes=2048,
+        environ=_env("codex"),
+        executable="/usr/bin/yes",
+    )
+    assert result["status"] == "failed"
+    assert result["failure_class"] == "output_limit_exceeded"
+    assert result["captured_output_bytes"] <= 2048
+    session = Path(result["receipt_path"]).parent
+    assert (session / "stdout.bin").stat().st_size + (session / "stderr.bin").stat().st_size <= 2048
+
+
+def test_same_session_is_serialised_across_processes_and_reused(tmp_path: Path):
+    marker = tmp_path / "executions"
+    executable = _fixture_cli(
+        tmp_path,
+        f"printf x >> {marker}\nsleep 0.25\nprintf done",
+    )
+    kwargs = {
+        "profile": "codex",
+        "stage": "paper-derive",
+        "model": "fixture-model",
+        "prompt": "derive",
+        "workdir": tmp_path,
+        "out": tmp_path / "sessions",
+        "timeout_sec": 3,
+        "environ": _env("codex"),
+        "executable": executable,
+    }
+    context = multiprocessing.get_context("fork")
+    queue = context.Queue()
+    processes = [context.Process(target=_concurrent_session, args=(kwargs, queue)) for _ in range(2)]
+    for process in processes:
+        process.start()
+    results = [queue.get(timeout=5) for _ in processes]
+    for process in processes:
+        process.join(timeout=5)
+        assert process.exitcode == 0
+    assert marker.read_text(encoding="utf-8") == "x"
+    assert sorted(result["reused"] for result in results) == [False, True]
 
 
 def test_route_and_environment_fail_closed(tmp_path: Path):
