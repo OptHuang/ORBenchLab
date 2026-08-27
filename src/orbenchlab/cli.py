@@ -37,6 +37,7 @@ from . import authoring_loop as authoring_loop_mod
 from . import agent_sessions as agent_sessions_mod
 from . import agentic_factory as agentic_factory_mod
 from . import factory_blueprints as factory_blueprints_mod
+from . import factory_finalize as factory_finalize_mod
 
 PROG = "orbench"
 
@@ -177,6 +178,20 @@ def _add_agent_factory(sub: argparse._SubParsersAction) -> None:
     run_parser.add_argument("--claude-executable")
     run_parser.set_defaults(handler=_cmd_agent_factory_run)
 
+    finalize_parser = inner.add_parser(
+        "finalize", help="independently gate an E1 factory run into an E3 release candidate"
+    )
+    finalize_parser.add_argument("--plan", required=True)
+    finalize_parser.add_argument("--factory-run", required=True)
+    finalize_parser.add_argument("--workdir", required=True)
+    finalize_parser.add_argument("--task-dir", required=True)
+    finalize_parser.add_argument("--static-receipt", required=True)
+    finalize_parser.add_argument("--harbor-receipt", required=True)
+    finalize_parser.add_argument("--calibration-receipt", required=True)
+    finalize_parser.add_argument("--final-summary", required=True)
+    finalize_parser.add_argument("--out", required=True)
+    finalize_parser.set_defaults(handler=_cmd_agent_factory_finalize)
+
 
 def _cmd_agent_factory_compile(args: argparse.Namespace) -> int:
     try:
@@ -285,6 +300,30 @@ def _cmd_agent_factory_run(args: argparse.Namespace) -> int:
         }
     )
     return 0 if result["status"] in {"active", "semantic-complete-e1"} else 8
+
+
+def _cmd_agent_factory_finalize(args: argparse.Namespace) -> int:
+    receipt = factory_finalize_mod.build_receipt(
+        plan_path=args.plan,
+        factory_run_path=args.factory_run,
+        workdir=args.workdir,
+        task_dir=args.task_dir,
+        static_receipt_path=args.static_receipt,
+        harbor_receipt_path=args.harbor_receipt,
+        calibration_receipt_path=args.calibration_receipt,
+        final_summary_path=args.final_summary,
+    )
+    path = factory_finalize_mod.write_receipt(receipt, args.out)
+    _print_json(
+        {
+            "decision": receipt["decision"],
+            "promoted": receipt["promoted"],
+            "evidence_level": receipt["evidence_level"],
+            "receipt_digest": receipt["receipt_digest"],
+            "written": str(path),
+        }
+    )
+    return 0 if receipt["promoted"] else 8
 
 
 # --------------------------------------------------------------------------- #
