@@ -331,7 +331,7 @@ def iterate(
     max_rounds: int,
     out: str | Path,
     max_author_tokens: int = 2400,
-    max_review_tokens: int = 1200,
+    max_review_tokens: int = 2400,
 ) -> dict[str, Any]:
     """Run bounded author/review rounds without mutating the seed task."""
 

@@ -163,6 +163,10 @@ to an unrelated chat-completions route.
 A first no-op author response is recorded as an abstention and still proceeds
 through the static and independent review gates; a repeated patch digest stops
 the loop so abstention cannot create an unbounded cycle.
+The reviewer contract is repeated after the bounded task snapshot as a complete
+top-level JSON template, with a 2400-token default, so coding endpoints cannot
+silently substitute one difficulty-axis object for the required seven-criterion
+review envelope; partial shapes remain `needs-human`.
 
 For a fast, task-local model screen on an execution host that already has the
 Volcengine environment and a pinned verifier image, use:

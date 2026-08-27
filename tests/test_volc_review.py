@@ -6,10 +6,12 @@ from pathlib import Path
 import pytest
 
 from orbenchlab.volc_review import (
+    REQUIRED_REVIEW_CRITERIA,
     VolcConfig,
     VolcReviewError,
     _digest,
     _normalize_review,
+    _review_prompt,
     _task_tree_digest,
     call_reviewer,
     review_task,
@@ -105,6 +107,27 @@ def test_promising_review_without_complete_rubric_is_downgraded():
     )
     assert review["decision"] == "needs-human"
     assert review["rubric_complete"] is False
+
+
+def test_review_prompt_ends_with_full_top_level_contract(tmp_path: Path):
+    task = tmp_path / "task"
+    task.mkdir()
+    (task / "instruction.md").write_text("public instruction", encoding="utf-8")
+    prompt = _review_prompt(
+        task,
+        {"source_content_digest": "sha256:" + "c" * 64},
+        {"decision": "ready-for-human-review", "round": 1},
+    )
+    contract = json.loads(prompt.rsplit("\n", 1)[1])
+    assert set(contract) == {
+        "decision",
+        "task_summary",
+        "blocking_findings",
+        "difficulty_axes",
+        "criteria",
+        "suggested_edits",
+    }
+    assert {row["name"] for row in contract["criteria"]} == REQUIRED_REVIEW_CRITERIA
 
 
 def test_review_task_is_blocked_by_static_receipt_and_writes_summary(tmp_path: Path, monkeypatch):

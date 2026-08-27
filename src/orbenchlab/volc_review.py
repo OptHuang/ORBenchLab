@@ -1,8 +1,8 @@
 """Volcengine-backed authoring review for paper-derived TB-Science tasks.
 
 The client uses only Volcengine routes: the Anthropic-compatible Coding Plan
-endpoint for its configured alias and the same host's OpenAI-compatible Ark
-endpoint for explicit model ids.  It is not a generic provider router:
+endpoint for configured and explicit model ids, with the same host's
+OpenAI-compatible Ark endpoint retained for non-coding bases. It is not a generic provider router:
 refusing non-Volc hosts keeps the user's requirement that all agent work in
 this pipeline uses the Volc route auditable.  Prompts contain
 only public paper metadata, a bounded task-tree snapshot, and the static
@@ -32,7 +32,7 @@ class VolcReviewError(ORBenchError):
     exit_code = 8
 
 
-DEFAULT_MAX_TOKENS = 1600
+DEFAULT_MAX_TOKENS = 2400
 DEFAULT_TIMEOUT_SEC = 120
 MAX_FILE_BYTES = 64_000
 MAX_SNAPSHOT_BYTES = 256_000
@@ -462,6 +462,29 @@ def _review_prompt(task_dir: Path, paper: Mapping[str, Any], receipt: Mapping[st
         "provenance_checks": receipt.get("provenance_checks", []),
     }
     payload = {"paper": safe_paper, "receipt": safe_receipt, "task_files": _bounded_task_snapshot(task_dir)}
+    contract = {
+        "decision": "needs-human",
+        "task_summary": "replace with a concise evidence-grounded summary",
+        "blocking_findings": [],
+        "difficulty_axes": [
+            {
+                "name": "replace with one controlled axis",
+                "levels": ["replace with explicit levels"],
+                "evidence": "cite supplied task or receipt evidence",
+                "risk": "state any calibration risk",
+            }
+        ],
+        "criteria": [
+            {
+                "name": name,
+                "status": "review",
+                "evidence": "cite supplied evidence or state what is missing",
+                "next_action": "state the smallest action needed",
+            }
+            for name in sorted(REQUIRED_REVIEW_CRITERIA)
+        ],
+        "suggested_edits": [],
+    }
     return (
         "You are reviewing a paper-derived Terminal-Bench Science task. "
         "Use only the supplied evidence; do not invent paper claims or hidden tests. "
@@ -474,6 +497,10 @@ def _review_prompt(task_dir: Path, paper: Mapping[str, Any], receipt: Mapping[st
         + ". A promising decision requires non-empty evidence and pass status for every criterion. "
         "A static blocked receipt cannot become accepted.\n\n"
         + json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        + "\n\nOUTPUT CONTRACT: Return exactly one top-level JSON object matching the full "
+        "shape below. Do not return a single difficulty-axis object, an array, Markdown, "
+        "or prose. Keep all seven criterion rows even when evidence is missing.\n"
+        + json.dumps(contract, ensure_ascii=False, sort_keys=True)
     )
 
 

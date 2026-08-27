@@ -524,7 +524,7 @@ def _add_task_author(sub: argparse._SubParsersAction) -> None:
         help="at least two distinct comma-separated Volc reviewer model ids",
     )
     review_parser.add_argument("--timeout-sec", type=int, default=120, help="per-model HTTP timeout")
-    review_parser.add_argument("--max-tokens", type=int, default=1200, help="per-model output token cap")
+    review_parser.add_argument("--max-tokens", type=int, default=2400, help="per-model output token cap")
     review_parser.add_argument("--out", required=True, help="review output directory")
     review_parser.set_defaults(handler=_cmd_task_author_review)
 
@@ -543,7 +543,7 @@ def _add_task_author(sub: argparse._SubParsersAction) -> None:
     iterate_parser.add_argument("--review-model", action="append", required=True)
     iterate_parser.add_argument("--max-rounds", type=int, default=3)
     iterate_parser.add_argument("--max-author-tokens", type=int, default=2400)
-    iterate_parser.add_argument("--max-review-tokens", type=int, default=1200)
+    iterate_parser.add_argument("--max-review-tokens", type=int, default=2400)
     iterate_parser.add_argument("--timeout-sec", type=int, default=120)
     iterate_parser.add_argument("--out", required=True)
     iterate_parser.set_defaults(handler=_cmd_task_author_iterate)
