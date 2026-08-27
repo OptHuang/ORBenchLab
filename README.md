@@ -23,6 +23,12 @@ The benchmark itself stays where it belongs. ORAgentBench's task packages,
 verifiers and metrics are consumed unchanged; FrontierOR's trusted harness,
 checkers and scoring formula are invoked, never copied.
 
+For the discovery loop, `orbench intake` provides a separate metadata-only
+path: it collects configured public RSS/arXiv/GitHub feeds, records response
+digests, de-duplicates entries, and writes a human-review queue. It makes no
+model calls, reads no credentials, touches no `raw/` files, and cannot author or
+publish a task. See [`docs/source-intake.md`](docs/source-intake.md).
+
 ## Why this exists
 
 Benchmark tooling tends to fail in three ways, and each has a countermeasure
