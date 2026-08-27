@@ -233,6 +233,7 @@ def review_task(
     config: VolcConfig,
     models: Sequence[str],
     round_number: int,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> dict[str, Any]:
     """Run independent Volc reviews and aggregate a conservative round report."""
 
@@ -249,7 +250,7 @@ def review_task(
     reports: list[dict[str, Any]] = []
     prompt = _review_prompt(root, paper_provenance, receipt)
     for model in selected:
-        result = call_reviewer(config, model=model, system=system, user=prompt)
+        result = call_reviewer(config, model=model, system=system, user=prompt, max_tokens=max_tokens)
         parsed = result.pop("parsed")
         result["review"] = parsed
         reports.append(result)
@@ -271,6 +272,7 @@ def review_task(
         "paper_digest": paper_provenance.get("source_content_digest"),
         "static_receipt_digest": receipt.get("receipt_digest"),
         "models": selected,
+        "max_tokens": max_tokens,
         "review_count": len(reports),
         "aggregate_decision": aggregate,
         "evidence_level": "E1-model-review",

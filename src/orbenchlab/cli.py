@@ -482,6 +482,7 @@ def _add_task_author(sub: argparse._SubParsersAction) -> None:
         help="comma-separated Volc model ids (default: ANTHROPIC_MODEL)",
     )
     review_parser.add_argument("--timeout-sec", type=int, default=120, help="per-model HTTP timeout")
+    review_parser.add_argument("--max-tokens", type=int, default=1200, help="per-model output token cap")
     review_parser.add_argument("--out", required=True, help="review output directory")
     review_parser.set_defaults(handler=_cmd_task_author_review)
 
@@ -524,6 +525,7 @@ def _cmd_task_author_review(args: argparse.Namespace) -> int:
         config=config,
         models=models,
         round_number=args.round,
+        max_tokens=args.max_tokens,
     )
     paths = volc_review_mod.write_review(review, args.out)
     written = json.loads(paths["json"].read_text(encoding="utf-8"))
