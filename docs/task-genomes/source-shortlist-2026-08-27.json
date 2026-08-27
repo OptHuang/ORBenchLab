@@ -1,0 +1,24 @@
+{
+  "schema_version": "orbenchlab.task-genome-source-binding.v1",
+  "intake_snapshot_id": "sha256:b4e8889fd63c7228a21a2283f62a33bafe9160b7681e8ba980e854001e9a06c5",
+  "intake_snapshot_digest": "sha256:1c9cba1708611a2514060eb6820e8f4b295db3d388adc5f2e11a58935754b566",
+  "retrieved_at": "2026-08-27",
+  "policy": "metadata-only; source packet and rights still require human review",
+  "items": [
+    {
+      "intake_item_uid": "sha256:9ee943edbb4e0d72cf99b8818facdd1a621d4e9aecfcecba2e27ad384f622b90",
+      "source_content_digest": "sha256:63aa05cba89feaff5d4c5dc163ed94d0c039e037ab87bbaa567d97fc9533dd3e",
+      "title": "Canonical Intermediate Representation for LLM-based optimization problem formulation and code generation",
+      "url": "https://arxiv.org/abs/2602.02029v1",
+      "kind": "arxiv"
+    },
+    {
+      "intake_item_uid": "sha256:677ba473534b8a5fc37b4581beb393788562183f6f721f3f99c48ead73853cb9",
+      "source_content_digest": "sha256:b64ad4f19fd9020cb9d0819ae827e03d55ec4310129d281c5532fd4ba2de9ed8",
+      "title": "Multi-Agent Environments for Vehicle Routing Problems",
+      "url": "https://arxiv.org/abs/2411.14411v2",
+      "related_code_url": "https://github.com/ricgama/maenvs4vrp",
+      "kind": "arxiv"
+    }
+  ]
+}

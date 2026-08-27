@@ -1,0 +1,147 @@
+# Candidate only.  Deliberately not consumable by ORWorkbench task pack.
+candidate_schema: orbenchlab.task-genome-candidate.v0
+status: candidate-not-packable
+family: multi_agent_vrp_recovery
+title: Multi-agent vehicle-routing recovery under streaming disruptions
+design_goal: >-
+  Test whether an agent can construct and replay feasible multi-vehicle routes,
+  then replan after disruptions while preserving frozen actions and changing
+  only the causally affected neighborhood.
+source:
+  intake_snapshot_id: sha256:b4e8889fd63c7228a21a2283f62a33bafe9160b7681e8ba980e854001e9a06c5
+  intake_item_uid: sha256:677ba473534b8a5fc37b4581beb393788562183f6f721f3f99c48ead73853cb9
+  source_content_digest: sha256:b64ad4f19fd9020cb9d0819ae827e03d55ec4310129d281c5532fd4ba2de9ed8
+  title: Multi-Agent Environments for Vehicle Routing Problems
+  url: https://arxiv.org/abs/2411.14411v2
+  related_code_url: https://github.com/ricgama/maenvs4vrp
+  intake_status: metadata_only
+  human_checks_required:
+    - retrieve and read the source packet and inspect the related repository
+    - verify license and data redistribution boundaries
+    - implement a clean task-local simulator rather than copying source code
+task_contract:
+  slice: replan-and-replay
+  network_policy: control-local
+  input:
+    - instance.json
+    - events.jsonl
+    - communication_policy.json
+  output:
+    - submission/initial_routes.json
+    - submission/replans.jsonl
+    - submission/event_audit.json
+  semantic_requirements:
+    - every customer is assigned at most once per event state
+    - vehicle capacity, time windows, depot and shift limits hold after every event
+    - actions frozen before an event are unchanged in later states
+    - a route change has an event_id and a causal obligation
+    - replaying the same event log produces the same digest
+  verifier:
+    independent: true
+    checks:
+      - route_schema_and_assignment_closure
+      - capacity_time_window_and_shift_feasibility
+      - event_order_and_frozen_action_invariants
+      - causal_change_scope
+      - deterministic_replay_and_objective_recomputation
+  objective:
+    direction: minimize
+    score: distance + lateness_cost + unserved_penalty + replanning_churn
+    quality_threshold: ">0.0"
+  controls:
+    oracle:
+      expected: feasible_replay_with_pinned_objective_bound
+      purpose: validate simulator/verifier closure
+    nop:
+      expected: rejected_for_missing_or_empty_plan
+      purpose: validate the failure gate
+    mutations:
+      - id: capacity-overflow
+        change: overload one vehicle while all customer ids remain unique
+        expected_rejection: capacity
+      - id: closed-road-use
+        change: traverse an edge closed by event k
+        expected_rejection: event_invariant
+      - id: frozen-customer-move
+        change: alter a completed prefix after event k
+        expected_rejection: frozen_action
+      - id: noncausal-route-change
+        change: alter an unaffected vehicle after an unrelated event
+        expected_rejection: causal_scope
+      - id: duplicate-service
+        change: serve one customer twice and omit another
+        expected_rejection: assignment_closure
+      - id: objective-fabrication
+        change: edit reported objective only
+        expected_rejection: objective_recomputed
+  acceptance:
+    hard:
+      - verifier exits zero only for a feasible replay at every event
+      - every mutation above is rejected with its declared obligation
+      - oracle passes all hard checks on every smoke seed
+      - event_audit covers every route change and frozen prefix
+    soft:
+      - objective is within the pinned tolerance of oracle on solvable levels
+      - churn is no worse than the declared replan budget permits
+    evidence:
+      minimum_seeds_per_cell: 3
+      minimum_difficulty_levels: 3
+      minimum_agent_systems: 2
+      required_evidence_level: E3
+difficulty_axes:
+  customer_count:
+    levels: [4, 8, 16, 32]
+    meaning: number of service requests in the horizon
+    expected_direction: harder_with_larger_value
+  vehicle_count:
+    levels: [1, 2, 4]
+    meaning: number of agents with heterogeneous capacity/shift limits
+    expected_direction: measure_not_assume
+  event_rate:
+    levels: [1, 2, 4, 8]
+    meaning: disruptions per episode, including closures and new requests
+    expected_direction: harder_with_larger_value
+  coupling_degree:
+    levels: [low, medium, high]
+    meaning: shared edges, depots, time windows and communication conflicts
+    expected_direction: harder_with_larger_value
+  time_window_tightness:
+    levels: [loose, medium, tight]
+    meaning: slack between feasible arrival windows and nominal travel time
+    expected_direction: harder_with_larger_value
+  communication_delay:
+    levels: [0, 1, 2]
+    meaning: event steps before all agents observe a change
+    expected_direction: harder_with_larger_value
+  replan_budget_sec:
+    levels: [120, 60, 20]
+    meaning: wall-clock budget for each replan
+    expected_direction: easier_with_larger_value
+  intervention_scaffold:
+    levels: [none, invariant-checklist, affected-vehicle-and-event]
+    meaning: hint support without prescribing a route or expected objective
+    expected_direction: easier_with_larger_value
+interventions:
+  adapter_shape: restart-with-hint
+  checkpoint: immediately_after_event_k_and_before_the_next_replan
+  hint_ladder:
+    - level: 0
+      text_policy: null-intervention
+    - level: 1
+      text_policy: remind-that-frozen-prefix-and-closure-invariants-are-binding
+    - level: 2
+      text_policy: name-the-affected-event-and-vehicle-set-only
+    - level: 3
+      text_policy: provide-a-generic-local-repair-checklist
+  no_leak: hints may not contain an oracle route, hidden objective, or future events
+screening_decision_rule:
+  keep_if:
+    - oracle_and_nop_gates_pass
+    - mutation_rejection_rate_is_1.0
+    - at_least_one_event_or_scale_axis_is_monotone
+    - replan_failures_are_reproducible_across_two_agent_systems
+  otherwise: revise-verifier-or-collect-more-evidence
+open_questions:
+  - whether the related repository can be used only as inspiration or as a licensed dependency
+  - which event semantics are sufficiently domain-grounded for an OR task rather than generic routing
+  - how to define causal-change scope without unfairly rejecting beneficial global reoptimization

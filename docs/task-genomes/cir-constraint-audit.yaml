@@ -1,0 +1,128 @@
+# Candidate only.  Deliberately not consumable by ORWorkbench task pack.
+candidate_schema: orbenchlab.task-genome-candidate.v0
+status: candidate-not-packable
+family: cir_constraint_audit
+title: Canonical intermediate representation with coupled-constraint audit
+design_goal: >-
+  Test whether an agent can translate operational rules into a canonical,
+  machine-checkable representation, compile a solver model, and independently
+  audit the cross-file constraints rather than trusting its own final claim.
+source:
+  intake_snapshot_id: sha256:b4e8889fd63c7228a21a2283f62a33bafe9160b7681e8ba980e854001e9a06c5
+  intake_item_uid: sha256:9ee943edbb4e0d72cf99b8818facdd1a621d4e9aecfcecba2e27ad384f622b90
+  source_content_digest: sha256:63aa05cba89feaff5d4c5dc163ed94d0c039e037ab87bbaa567d97fc9533dd3e
+  title: Canonical Intermediate Representation for LLM-based optimization problem formulation and code generation
+  url: https://arxiv.org/abs/2602.02029v1
+  intake_status: metadata_only
+  human_checks_required:
+    - retrieve and read the source packet
+    - verify license and whether any benchmark data may be redistributed
+    - separate source claims from this newly authored task contract
+task_contract:
+  slice: solve-and-audit
+  network_policy: control-local
+  input:
+    - instance.json
+    - data/*.csv
+    - rules/*.md
+  output:
+    - submission/cir.json
+    - submission/solve.py
+    - submission/solution.json
+    - submission/audit.json
+  semantic_requirements:
+    - every rule has a stable rule_id and a typed relation in cir.json
+    - every variable/domain/unit reference resolves to an input entity
+    - solver output is independently replayable from the frozen instance
+    - audit.json maps each rule_id to an executable check and observed result
+  verifier:
+    independent: true
+    checks:
+      - cir_schema_and_reference_closure
+      - solution_feasibility_under_all_rules
+      - objective_against_pinned_oracle_bound
+      - audit_coverage_for_every_rule
+      - deterministic_replay_and_output_digest
+  objective:
+    direction: minimize
+    score: fixed_cost + lateness + violation_penalty
+    quality_threshold: ">0.0"
+  controls:
+    oracle:
+      expected: feasible_and_audit_complete
+      purpose: validate generator/verifier closure, not model capability
+    nop:
+      expected: rejected_for_missing_submission
+      purpose: validate the failure gate
+    mutations:
+      - id: active-product-cap
+        change: exceed a product-month cap while preserving local row checks
+        expected_rejection: coupled_constraint
+      - id: hygiene-supply-join
+        change: satisfy plant capacity but violate the plant-month hygiene supply join
+        expected_rejection: cross_file_join
+      - id: unit-mismatch
+        change: report kilograms as tonnes in one relation
+        expected_rejection: unit_or_domain_mismatch
+      - id: objective-fabrication
+        change: alter reported objective without changing the solution
+        expected_rejection: objective_recomputed
+  acceptance:
+    hard:
+      - verifier exits zero only for a feasible, replayable solution
+      - every mutation above is rejected with its declared obligation
+      - oracle passes all hard checks on every smoke seed
+      - no hidden verifier/reference file is copied into submission
+    soft:
+      - objective is within the pinned tolerance of oracle on solvable levels
+      - audit coverage is complete and independently executable
+    evidence:
+      minimum_seeds_per_cell: 3
+      minimum_difficulty_levels: 3
+      minimum_agent_systems: 2
+      required_evidence_level: E3
+difficulty_axes:
+  n_coupled_rules:
+    levels: [1, 3, 6, 10]
+    meaning: number of constraints whose operands span two or more input tables
+    expected_direction: harder_with_larger_value
+  join_depth:
+    levels: [0, 1, 2, 3]
+    meaning: number of table/entity hops needed to validate one rule
+    expected_direction: harder_with_larger_value
+  rule_surface_form:
+    levels: [explicit, paraphrased, ambiguous-but-resolvable]
+    meaning: linguistic distance from a formal relation; all required facts remain present
+    expected_direction: measure_not_assume
+  instance_scale:
+    levels: [tiny, small, medium]
+    meaning: number of entities, periods and candidate assignments
+    expected_direction: harder_with_larger_value
+  audit_scaffold:
+    levels: [none, rule-checklist, typed-cir-skeleton]
+    meaning: instruction support; never reveals an expected solution or hidden value
+    expected_direction: easier_with_larger_value
+interventions:
+  adapter_shape: restart-with-hint
+  checkpoint: after_first_verifier_visible_failure_and_before_final_repair
+  hint_ladder:
+    - level: 0
+      text_policy: null-intervention
+    - level: 1
+      text_policy: restate-that-cross-file-and-unit-joins-must-be-audited
+    - level: 2
+      text_policy: identify-the-rule-family-only-without-the-expected-value
+    - level: 3
+      text_policy: provide-a-generic-rule-to-checklist-mapping-template
+  no_leak: hints may not contain oracle output, hidden reference values, or copied semantic files
+screening_decision_rule:
+  keep_if:
+    - oracle_and_nop_gates_pass
+    - mutation_rejection_rate_is_1.0
+    - at_least_one_measured_axis_is_monotone
+    - agent_gap_is_replicated_without_infrastructure_failure
+  otherwise: revise-verifier-or-collect-more-evidence
+open_questions:
+  - which source rules/data are redistributable after human license review
+  - whether a typed CIR should be JSON Schema or a smaller task-local DSL
+  - whether objective quality should be exact, bounded, or feasibility-only at medium scale
