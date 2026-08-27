@@ -1,5 +1,5 @@
 {
   "schema_version": "alphaevolve-scheduling.reference-bounds.v1",
-  "provenance": "derived by solution/solve.py and independently checked by tests/test_solution.py; values are feasibility bounds, not optimality claims",
+  "provenance": "derived by solution/solver.py (the shipped graded entry point) and independently checked by tests/test_solution.py; values are feasibility bounds, not optimality claims",
   "bounds": {"tiny": 8, "small": 14, "medium": 22}
 }
