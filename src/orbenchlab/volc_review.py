@@ -154,6 +154,52 @@ def _safe_response(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _normalize_review(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize heterogeneous model JSON into the review contract.
+
+    Some Volc models answer a constrained prompt with one difficulty-axis
+    object rather than the requested envelope.  Preserve that evidence as a
+    partial, human-review result instead of treating a parser success as a
+    complete review.
+    """
+
+    allowed_decisions = {"revise", "promising", "needs-human"}
+    decision = str(value.get("decision") or value.get("verdict") or "needs-human").lower()
+    if decision not in allowed_decisions:
+        decision = "needs-human"
+    axes = value.get("difficulty_axes")
+    if not isinstance(axes, list):
+        axes = []
+    if value.get("name") is not None and value.get("levels") is not None:
+        axes = [
+            {
+                "name": value.get("name"),
+                "levels": value.get("levels"),
+                "evidence": value.get("evidence", ""),
+                "risk": value.get("risk", ""),
+            }
+        ]
+    def _strings(*keys: str) -> list[str]:
+        for key in keys:
+            candidate = value.get(key)
+            if isinstance(candidate, list):
+                return [str(item) for item in candidate]
+            if isinstance(candidate, str) and candidate.strip():
+                return [candidate]
+        return []
+    criteria = value.get("criteria") if isinstance(value.get("criteria"), list) else []
+    return {
+        "decision": decision,
+        "task_summary": str(value.get("task_summary") or value.get("summary") or ""),
+        "blocking_findings": _strings("blocking_findings", "blocking_issues", "findings"),
+        "difficulty_axes": axes,
+        "criteria": criteria,
+        "suggested_edits": _strings("suggested_edits", "recommendations", "next_actions"),
+        "shape_complete": all(key in value for key in ("decision", "task_summary", "blocking_findings", "difficulty_axes", "criteria", "suggested_edits")),
+        "source_keys": sorted(str(key) for key in value.keys()),
+    }
+
+
 def call_reviewer(
     config: VolcConfig,
     *,
@@ -258,7 +304,7 @@ def review_task(
     for model in selected:
         result = call_reviewer(config, model=model, system=system, user=prompt, max_tokens=max_tokens)
         parsed = result.pop("parsed")
-        result["review"] = parsed
+        result["review"] = _normalize_review(parsed)
         reports.append(result)
     decisions = [str((item.get("review") or {}).get("decision", "needs-human")) for item in reports]
     if receipt.get("decision") == "blocked":
