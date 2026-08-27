@@ -118,6 +118,31 @@ def _snapshot_task(task: Path, destination: Path) -> Path:
     return destination
 
 
+def _valid_completed_job(jobs: Path, *, task_id: str, control: str) -> Path | None:
+    candidates = sorted(jobs.glob(f"{task_id}-{control}-attempt-*"), reverse=True)
+    for job in candidates:
+        if not (job / "result.json").is_file():
+            continue
+        try:
+            harbor_controls._validate_job(job, control=control)
+        except harbor_controls.HarborControlError:
+            continue
+        return job
+    return None
+
+
+def _next_job(jobs: Path, *, task_id: str, control: str) -> tuple[str, int]:
+    prefix = f"{task_id}-{control}-attempt-"
+    numbers = []
+    for path in jobs.glob(prefix + "*"):
+        try:
+            numbers.append(int(path.name.removeprefix(prefix)))
+        except ValueError:
+            continue
+    attempt = max(numbers, default=0) + 1
+    return f"{prefix}{attempt:03d}", attempt
+
+
 def launch_controls(
     task_dir: str | Path,
     *,
@@ -141,13 +166,13 @@ def launch_controls(
     task_id = _task_id(task)
     snapshot = _snapshot_task(task, root / "executed-task" / task.name)
     jobs = root / "jobs"
+    selected_jobs: dict[str, Path] = {}
     for control in ("oracle", "nop"):
-        job_name = f"{task_id}-{control}"
-        job = jobs / job_name
-        if (job / "result.json").is_file():
+        completed = _valid_completed_job(jobs, task_id=task_id, control=control)
+        if completed is not None:
+            selected_jobs[control] = completed
             continue
-        if job.exists():
-            raise HarborLauncherError(f"incomplete Harbor job already exists: {job_name}")
+        job_name, attempt = _next_job(jobs, task_id=task_id, control=control)
         _bounded_command(
             [
                 str(executable),
@@ -167,15 +192,23 @@ def launch_controls(
                 "--yes",
             ],
             cwd=root,
-            log_root=root / "commands" / control,
+            log_root=root / "commands" / f"{control}-attempt-{attempt:03d}",
             timeout_sec=timeout_sec,
             max_output_bytes=max_output_bytes,
         )
+        job = jobs / job_name
+        try:
+            harbor_controls._validate_job(job, control=control)
+        except harbor_controls.HarborControlError as exc:
+            raise HarborLauncherError(
+                f"Harbor {control} attempt did not produce a valid control job: {exc}"
+            ) from None
+        selected_jobs[control] = job
     receipt = harbor_controls.build_receipt(
         task,
         executed_task_dir=snapshot,
-        oracle_job=jobs / f"{task_id}-oracle",
-        nop_job=jobs / f"{task_id}-nop",
+        oracle_job=selected_jobs["oracle"],
+        nop_job=selected_jobs["nop"],
     )
     harbor_controls.write_receipt(receipt, root)
     return receipt

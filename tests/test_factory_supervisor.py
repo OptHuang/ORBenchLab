@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import time
 from pathlib import Path
 
 from orbenchlab import agentic_factory, factory_supervisor
@@ -201,6 +202,15 @@ def test_external_adapter_output_is_hard_bounded(tmp_path: Path):
     assert result["failure_class"] == "output_limit_exceeded"
 
 
+def test_builtin_provider_workload_has_whole_stage_deadline():
+    failure = factory_supervisor._run_builtin_process(
+        time.sleep,
+        (2,),
+        timeout_sec=0.05,
+    )
+    assert failure == "whole_stage_timeout"
+
+
 def test_failed_external_stage_stops_after_attempt_cap(tmp_path: Path, monkeypatch):
     plan, run, work, task, paper, genome = _fixture(tmp_path)
     monkeypatch.setattr(
@@ -246,3 +256,59 @@ def test_failed_external_stage_stops_after_attempt_cap(tmp_path: Path, monkeypat
     assert counter.read_text() == "xx"
     assert third["stages"]["semantic_review"]["failure_class"] == "attempts_exhausted"
     assert third["stages"]["semantic_review"]["attempt_count"] == 2
+
+
+def test_crashed_paid_stage_consumes_reserved_attempt(tmp_path: Path, monkeypatch):
+    plan, run, work, task, paper, genome = _fixture(tmp_path)
+    monkeypatch.setattr(
+        factory_supervisor.task_authoring,
+        "validate_task",
+        lambda *args, **kwargs: {"decision": "ready-for-human-review"},
+    )
+    def write_static(receipt, out):
+        path = Path(out) / "authoring-receipt.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(receipt), encoding="utf-8")
+        return {"json": path}
+    monkeypatch.setattr(factory_supervisor.task_authoring, "write_receipt", write_static)
+    calls = []
+    def crash(*args, **kwargs):
+        calls.append("called")
+        raise KeyboardInterrupt("simulated process loss during paid request")
+    monkeypatch.setattr(factory_supervisor, "_command", crash)
+    kwargs = dict(
+        plan_path=plan,
+        factory_run_path=run,
+        workdir=work,
+        task_dir=task,
+        task_genome=genome,
+        paper_provenance=paper,
+        out=tmp_path / "supervised",
+        harbor_executable=None,
+        semantic_review_executable=str(tmp_path / "review"),
+        semantic_review_models=["review-a", "review-b"],
+        harbor_inputs={},
+        calibration_executable=None,
+        calibration_models=["frontier", "weak"],
+        test_image="image",
+        repetitions=5,
+        provider_env=PROVIDER,
+        max_external_attempts=1,
+    )
+    try:
+        factory_supervisor.run(**kwargs)
+    except KeyboardInterrupt:
+        pass
+    else:
+        raise AssertionError("simulated paid-stage crash did not escape")
+    reserved = json.loads((Path(kwargs["out"]) / "supervisor-state.json").read_text())
+    attempt = reserved["stages"]["semantic_review"]["attempts"][0]
+    assert attempt["status"] == "running"
+    assert attempt["attempt_id"].startswith("sha256:")
+
+    def should_not_run(*args, **kwargs):
+        raise AssertionError("crashed paid stage was invoked beyond its cap")
+    monkeypatch.setattr(factory_supervisor, "_command", should_not_run)
+    resumed = factory_supervisor.run(**kwargs)
+    assert calls == ["called"]
+    assert resumed["stages"]["semantic_review"]["failure_class"] == "attempts_exhausted"

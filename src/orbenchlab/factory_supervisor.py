@@ -11,6 +11,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import multiprocessing
 import os
 import time
 import uuid
@@ -35,6 +36,82 @@ class FactorySupervisorError(ORBenchError):
 
 
 SCHEMA_VERSION = "orbenchlab.factory-supervisor.v1"
+
+
+def _builtin_semantic_worker(
+    task: str,
+    paper_path: str,
+    static_json: str,
+    output: str,
+    provider_env: Mapping[str, str],
+    models: Sequence[str],
+    timeout_sec: int,
+    max_tokens: int,
+) -> None:
+    config = volc_review.VolcConfig(
+        base_url=str(provider_env.get("ANTHROPIC_BASE_URL", "")).rstrip("/"),
+        token=str(provider_env.get("ANTHROPIC_AUTH_TOKEN", "")),
+        default_model="ark-code-latest",
+        timeout_sec=timeout_sec,
+    )
+    review = volc_review.review_task(
+        task,
+        paper_provenance=task_authoring._load_document(Path(paper_path)),
+        receipt=json.loads(Path(static_json).read_text(encoding="utf-8")),
+        config=config,
+        models=models,
+        round_number=1,
+        max_tokens=max_tokens,
+    )
+    volc_review.write_review(review, output)
+
+
+def _builtin_calibration_worker(
+    task: str,
+    test_image: str,
+    output: str,
+    provider_env: Mapping[str, str],
+    models: Sequence[str],
+    repetitions: int,
+    timeout_sec: int,
+    max_tokens: int,
+) -> None:
+    config = volc_review.VolcConfig(
+        base_url=str(provider_env.get("ANTHROPIC_BASE_URL", "")).rstrip("/"),
+        token=str(provider_env.get("ANTHROPIC_AUTH_TOKEN", "")),
+        default_model="ark-code-latest",
+        timeout_sec=timeout_sec,
+    )
+    volc_rollout.run_rollout(
+        task,
+        config=config,
+        models=models,
+        test_image=test_image,
+        out=output,
+        repetitions=repetitions,
+        hint_levels=[0],
+        controls=["oracle", "nop"],
+        timeout_sec=timeout_sec,
+        max_tokens=max_tokens,
+    )
+
+
+def _run_builtin_process(
+    target,
+    args: tuple[Any, ...],
+    *,
+    timeout_sec: float,
+) -> str | None:
+    """Apply a whole-stage deadline to a built-in provider workload."""
+
+    process = multiprocessing.get_context("fork").Process(target=target, args=args)
+    process.start()
+    process.join(timeout_sec)
+    if process.is_alive():
+        process.kill()
+        process.join()
+        return "whole_stage_timeout"
+    return None if process.exitcode == 0 else "builtin_nonzero_exit"
 
 
 def _digest(path: Path) -> str:
@@ -223,6 +300,8 @@ def run(
     harbor_cli_executable: str | None = None,
     builtin_volc: bool = False,
     max_external_attempts: int = 2,
+    max_review_tokens: int = 2400,
+    max_calibration_tokens: int = 2400,
 ) -> dict[str, Any]:
     """Execute or resume the fixed five-stage control-plane."""
 
@@ -232,6 +311,8 @@ def run(
         or len(set(semantic_review_models)) < 2
         or timeout_sec <= 0
         or not 1 <= max_external_attempts <= 5
+        or not 1 <= max_review_tokens <= 32_000
+        or not 1 <= max_calibration_tokens <= 32_000
     ):
         raise FactorySupervisorError("calibration requires two distinct models, >=5 repetitions and positive timeout")
     root = Path(out)
@@ -276,6 +357,13 @@ def run(
             "semantic_review_models": list(semantic_review_models),
             "builtin_volc": bool(builtin_volc),
             "max_external_attempts": max_external_attempts,
+            "provider_budget": {
+                "semantic_requests": len(semantic_review_models),
+                "semantic_max_output_tokens": len(semantic_review_models) * max_review_tokens,
+                "calibration_requests": len(calibration_models) * repetitions,
+                "calibration_max_output_tokens": len(calibration_models) * repetitions * max_calibration_tokens,
+                "whole_stage_timeout_sec": timeout_sec,
+            },
             "timeout_sec": timeout_sec,
             "provider_route_digest": route_digest,
         }
@@ -305,15 +393,58 @@ def run(
             attempts = previous.get("attempts", []) if isinstance(previous, Mapping) else []
             return isinstance(attempts, list) and len(attempts) < max_external_attempts
 
-        def record_attempt(name: str, result: Mapping[str, Any]) -> None:
+        def reserve_attempt(name: str) -> str:
             previous = state["stages"].get(name, {})
             attempts = list(previous.get("attempts", [])) if isinstance(previous, Mapping) else []
+            if len(attempts) >= max_external_attempts:
+                raise FactorySupervisorError(f"external attempt cap reached for {name}")
+            attempt_number = len(attempts) + 1
+            attempt_id = "sha256:" + hashlib.sha256(
+                _canonical(
+                    {
+                        "identity_digest": identity_digest,
+                        "stage": name,
+                        "attempt": attempt_number,
+                    }
+                )
+            ).hexdigest()
+            attempts.append(
+                {
+                    "attempt": attempt_number,
+                    "attempt_id": attempt_id,
+                    "status": "running",
+                }
+            )
+            record(
+                name,
+                {
+                    "status": "running",
+                    "attempt_id": attempt_id,
+                    "attempt_count": len(attempts),
+                    "attempts": attempts,
+                },
+            )
+            return attempt_id
+
+        def complete_attempt(name: str, attempt_id: str, result: Mapping[str, Any]) -> None:
+            previous = state["stages"].get(name, {})
+            attempts = list(previous.get("attempts", [])) if isinstance(previous, Mapping) else []
+            if (
+                not attempts
+                or attempts[-1].get("attempt_id") != attempt_id
+                or attempts[-1].get("status") != "running"
+            ):
+                raise FactorySupervisorError(f"external attempt reservation changed for {name}")
             summary = {
                 key: value
                 for key, value in result.items()
                 if key not in {"attempts", "attempt_count"}
             }
-            attempts.append({"attempt": len(attempts) + 1, **summary})
+            attempts[-1] = {
+                "attempt": attempts[-1]["attempt"],
+                "attempt_id": attempt_id,
+                **summary,
+            }
             record(name, {**dict(result), "attempt_count": len(attempts), "attempts": attempts})
 
         def record_exhausted(name: str) -> None:
@@ -349,42 +480,42 @@ def run(
         elif not can_attempt("semantic_review"):
             record_exhausted("semantic_review")
         elif builtin_volc:
-            try:
-                config = volc_review.VolcConfig(
-                    base_url=str((provider_env or {}).get("ANTHROPIC_BASE_URL", "")).rstrip("/"),
-                    token=str((provider_env or {}).get("ANTHROPIC_AUTH_TOKEN", "")),
-                    default_model="ark-code-latest",
-                    timeout_sec=max(1, int(timeout_sec)),
-                )
-                review = volc_review.review_task(
-                    task,
-                    paper_provenance=task_authoring._load_document(paper_path),
-                    receipt=static_receipt,
-                    config=config,
-                    models=semantic_review_models,
-                    round_number=1,
-                )
-                volc_review.write_review(review, root / "semantic")
+            attempt_id = reserve_attempt("semantic_review")
+            failure = _run_builtin_process(
+                _builtin_semantic_worker,
+                (
+                    str(task),
+                    str(paper_path),
+                    str(static_json),
+                    str(root / "semantic"),
+                    dict(provider_env or {}),
+                    list(semantic_review_models),
+                    max(1, int(timeout_sec)),
+                    max_review_tokens,
+                ),
+                timeout_sec=timeout_sec,
+            )
+            if failure is None and semantic_json.is_file():
                 semantic = {
                     "status": "passed",
                     "mode": "builtin-volc",
                     "output": str(semantic_json),
                     "output_digest": _digest(semantic_json),
                 }
-            except volc_review.VolcReviewError as exc:
+            else:
                 semantic = {
                     "status": "blocked",
-                    "failure_class": "volc_review_failed",
-                    "failure_detail": str(exc),
+                    "failure_class": failure or "expected_receipt_missing",
                 }
-            record_attempt("semantic_review", semantic)
+            complete_attempt("semantic_review", attempt_id, semantic)
         else:
+            attempt_id = reserve_attempt("semantic_review")
             args = ["--task-dir", str(task), "--paper-provenance", str(paper_path), "--receipt", str(static_json), "--round", "1", "--models", ",".join(semantic_review_models), "--out", str(root / "semantic")]
             semantic = _command(semantic_review_executable, args, timeout_sec=timeout_sec, cwd=workspace, child_env=provider_child)
             if semantic.get("status") == "passed" and not semantic_json.is_file():
                 semantic = {**semantic, "status": "blocked", "failure_class": "expected_receipt_missing"}
             if semantic_json.is_file(): semantic = {**semantic, "output": str(semantic_json), "output_digest": _digest(semantic_json)}
-            record_attempt("semantic_review", semantic)
+            complete_attempt("semantic_review", attempt_id, semantic)
         semantic_passed = False
         if semantic_json.is_file():
             semantic_receipt = json.loads(semantic_json.read_text(encoding="utf-8"))
@@ -399,6 +530,7 @@ def run(
         elif not can_attempt("harbor"):
             record_exhausted("harbor")
         else:
+            attempt_id = reserve_attempt("harbor")
             required = ("executed_task_dir", "oracle_job", "nop_job")
             if harbor_cli_executable:
                 try:
@@ -428,7 +560,7 @@ def run(
             if harbor.get("status") == "passed" and not harbor_json.is_file():
                 harbor = {**harbor, "status": "blocked", "failure_class": "expected_receipt_missing"}
             if harbor_json.is_file(): harbor = {**harbor, "output": str(harbor_json), "output_digest": _digest(harbor_json)}
-            record_attempt("harbor", harbor)
+            complete_attempt("harbor", attempt_id, harbor)
 
         calibration_json = root / "calibration" / "screening-report.json"
         if calibration_json.exists():
@@ -439,44 +571,42 @@ def run(
         elif not can_attempt("calibration"):
             record_exhausted("calibration")
         elif builtin_volc:
-            try:
-                config = volc_review.VolcConfig(
-                    base_url=str((provider_env or {}).get("ANTHROPIC_BASE_URL", "")).rstrip("/"),
-                    token=str((provider_env or {}).get("ANTHROPIC_AUTH_TOKEN", "")),
-                    default_model="ark-code-latest",
-                    timeout_sec=max(1, int(timeout_sec)),
-                )
-                volc_rollout.run_rollout(
-                    task,
-                    config=config,
-                    models=calibration_models,
-                    test_image=test_image,
-                    out=root / "calibration",
-                    repetitions=repetitions,
-                    hint_levels=[0],
-                    controls=["oracle", "nop"],
-                    timeout_sec=max(1, int(timeout_sec)),
-                )
+            attempt_id = reserve_attempt("calibration")
+            failure = _run_builtin_process(
+                _builtin_calibration_worker,
+                (
+                    str(task),
+                    test_image,
+                    str(root / "calibration"),
+                    dict(provider_env or {}),
+                    list(calibration_models),
+                    repetitions,
+                    max(1, int(timeout_sec)),
+                    max_calibration_tokens,
+                ),
+                timeout_sec=timeout_sec,
+            )
+            if failure is None and calibration_json.is_file():
                 calibration = {
                     "status": "passed",
                     "mode": "builtin-volc",
                     "output": str(calibration_json),
                     "output_digest": _digest(calibration_json),
                 }
-            except (volc_review.VolcReviewError, volc_rollout.VolcRolloutError) as exc:
+            else:
                 calibration = {
                     "status": "blocked",
-                    "failure_class": "volc_calibration_failed",
-                    "failure_detail": str(exc),
+                    "failure_class": failure or "expected_receipt_missing",
                 }
-            record_attempt("calibration", calibration)
+            complete_attempt("calibration", attempt_id, calibration)
         else:
+            attempt_id = reserve_attempt("calibration")
             args = ["--task-dir", str(task), "--test-image", test_image, "--out", str(root / "calibration"), "--models", ",".join(calibration_models), "--repetitions", str(repetitions), "--hint-level", "0", "--controls", "oracle,nop"]
             calibration = _command(calibration_executable, args, timeout_sec=timeout_sec, cwd=workspace, child_env=provider_child)
             if calibration.get("status") == "passed" and not calibration_json.is_file():
                 calibration = {**calibration, "status": "blocked", "failure_class": "expected_receipt_missing"}
             if calibration_json.is_file(): calibration = {**calibration, "output": str(calibration_json), "output_digest": _digest(calibration_json)}
-            record_attempt("calibration", calibration)
+            complete_attempt("calibration", attempt_id, calibration)
 
         cards_json = root / "cards" / "task-cards.json"
         evidence = [path for path in (harbor_json, calibration_json) if path.is_file()]
