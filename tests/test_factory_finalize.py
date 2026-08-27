@@ -136,12 +136,66 @@ def _evidence(tmp_path: Path, task: Path) -> tuple[Path, Path, Path, Path]:
         },
         "report_digest",
     )
-    return (
-        _write(tmp_path / "static.json", static),
-        _write(tmp_path / "harbor.json", harbor),
-        _write(tmp_path / "calibration.json", calibration),
-        _write(tmp_path / "summary.json", {"summary": "human review packet"}),
+    static_path = _write(tmp_path / "static.json", static)
+    harbor_path = _write(tmp_path / "harbor.json", harbor)
+    calibration_path = _write(tmp_path / "calibration.json", calibration)
+    models = []
+    for name, arm in sorted(arms.items()):
+        models.append(
+            {
+                "model": name,
+                "n_observed": arm["n"],
+                "n_complete": arm["complete"],
+                "metric_n": arm["metric_n"],
+                "solve_n": arm["solve_n"],
+                "quality_n": arm["quality_n"],
+                "feasibility_n": arm["feasibility_n"],
+                "solve_rate": arm["solve_rate"],
+                "quality_pass_rate": arm["quality_pass_rate"],
+                "mean_feasibility": arm["mean_feasibility"],
+                "infra_exceptions": arm["infra_exceptions"],
+                "failure_modes": arm["failure_modes"],
+                "evidence_levels": ["E3"],
+                "source_reports": [str(calibration_path)],
+            }
+        )
+    card = {
+        "task_card_schema_version": "orbenchlab.task-card.v1",
+        "task_id": task_id,
+        "family": task_id,
+        "title": "Fixture task",
+        "purpose": "Exercise a strict optimization task.",
+        "source": {"status": "bound"},
+        "difficulty": {
+            "axes": [{"name": "instance_size", "levels": ["small", "large"]}],
+            "interventions": {"hint_levels": [0, 1]},
+            "declared": True,
+        },
+        "performance": {
+            "models": models,
+            "control_screenings": [],
+            "observed_gaps": [discrimination["observed_gap"]],
+        },
+        "decision": "review-promising",
+        "evidence": {
+            "level": "E3",
+            "task_genome_path": "fixture-genome.json",
+            "task_genome_digest": "sha256:" + "9" * 64,
+            "source_reports": [str(harbor_path), str(calibration_path)],
+            "report_digests": [
+                factory_finalize._file_digest(harbor_path),
+                factory_finalize._file_digest(calibration_path),
+            ],
+        },
+        "limitations": ["Fixture evidence."],
+        "intake": {"path": None, "present": False},
+        "summary_markdown": "# Fixture task\n",
+    }
+    summary_path = _write(
+        tmp_path / "task-cards.json",
+        {"pipeline_schema_version": "orbenchlab.pipeline.v1", "cards": [card]},
     )
+    return static_path, harbor_path, calibration_path, summary_path
 
 
 def test_finalize_promotes_only_complete_independent_evidence(tmp_path: Path):
@@ -232,6 +286,24 @@ def test_calibration_summary_cannot_override_raw_trial_outcomes(tmp_path: Path):
     )
     assert receipt["promoted"] is False
     assert next(g for g in receipt["gates"] if g["name"] == "model_calibration")["status"] == "fail"
+
+
+def test_agent_written_all_good_summary_is_not_a_pipeline_task_card(tmp_path: Path):
+    plan, run, work, task = _factory(tmp_path)
+    static, harbor, calibration, _ = _evidence(tmp_path, task)
+    summary = _write(tmp_path / "agent-summary.json", {"summary": "all gates passed"})
+    receipt = factory_finalize.build_receipt(
+        plan_path=plan,
+        factory_run_path=run,
+        workdir=work,
+        task_dir=task,
+        static_receipt_path=static,
+        harbor_receipt_path=harbor,
+        calibration_receipt_path=calibration,
+        final_summary_path=summary,
+    )
+    assert receipt["promoted"] is False
+    assert next(g for g in receipt["gates"] if g["name"] == "final_summary")["status"] == "fail"
 
 
 def test_static_gate_requires_real_passing_provenance_rows(tmp_path: Path):

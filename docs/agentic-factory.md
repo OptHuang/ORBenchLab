@@ -6,7 +6,7 @@ a trajectory, or choose a hint. It assigns those jobs to independent agent
 sessions and enforces the parts that should not depend on model judgment:
 
 - an immutable, checksummed stage DAG;
-- a paper, provenance and seed-task workspace binding;
+- a paper, deterministic page-marked text extraction, provenance and seed-task workspace binding;
 - fixed agent profiles, provider route, model and prompt identity;
 - whole-process time and output limits;
 - one atomic receipt per attempt and safe successful-session reuse;
@@ -87,6 +87,39 @@ orbench agent-factory run \
 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` or the corresponding OpenAI
 profile variables are read only at the session boundary. Receipts contain a
 route digest and never the credential.
+
+`prepare-paper` runs bounded `pdftotext` once and binds the extractor binary,
+version, arguments, page count and output digest into the workspace manifest.
+Agents reason over the read-only `paper.txt` snapshot and use the original PDF
+only for difficult anchor checks. This avoids paying every session to rediscover
+the same PDF text.
+
+After independent static, Harbor and repeated-model commands have produced
+their receipts, run the fail-closed finalizer:
+
+```bash
+orbench agent-factory finalize \
+  --plan out/factory-plan.json \
+  --factory-run out/factory-run/factory-run.json \
+  --workdir out/factory-workspace \
+  --task-dir out/factory-workspace/factory/tasks/task-v2 \
+  --static-receipt out/static/authoring-receipt.json \
+  --harbor-receipt out/harbor/harbor-control-screening.json \
+  --calibration-receipt out/calibration/screening-report.json \
+  --final-summary out/cards/task-cards.json \
+  --out out/final
+```
+
+The finalizer recomputes calibration arms and conservative model separation
+from raw per-trial outcomes. It also validates the deterministic task card and
+binds it to the exact Harbor and calibration artifact bytes. Agent-written
+“all passed” summaries cannot unlock promotion. The strongest result is
+`eligible-for-human-release-review` at E3, not publication or TB-Science
+acceptance.
+
+The finalizer consumes independent receipts; it does not itself launch Docker,
+Harbor or the repeated model campaign. A higher-level unattended controller
+must still execute those commands and pass their exact output paths here.
 
 ## Current security boundary
 

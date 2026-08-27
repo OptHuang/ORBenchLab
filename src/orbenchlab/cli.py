@@ -188,7 +188,11 @@ def _add_agent_factory(sub: argparse._SubParsersAction) -> None:
     finalize_parser.add_argument("--static-receipt", required=True)
     finalize_parser.add_argument("--harbor-receipt", required=True)
     finalize_parser.add_argument("--calibration-receipt", required=True)
-    finalize_parser.add_argument("--final-summary", required=True)
+    finalize_parser.add_argument(
+        "--final-summary",
+        required=True,
+        help="deterministic pipeline task-cards.json containing exactly one task",
+    )
     finalize_parser.add_argument("--out", required=True)
     finalize_parser.set_defaults(handler=_cmd_agent_factory_finalize)
 

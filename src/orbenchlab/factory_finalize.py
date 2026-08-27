@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from . import agentic_factory, pipeline, task_authoring, volc_rollout
+from .core import schema as schema_mod
 from .core.errors import ORBenchError
 
 
@@ -243,10 +244,44 @@ def _calibration_validator(task_digest: str) -> Callable[[Mapping[str, Any]], di
     return validate
 
 
-def _summary_validator(document: Mapping[str, Any]) -> dict[str, Any]:
-    if not document:
-        raise FactoryFinalizeError("final summary is empty")
-    return {"summary_content_digest": _value_digest(document)}
+def _summary_validator(
+    *, task_id: str | None, evidence_digests: set[str]
+) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
+    def validate(document: Mapping[str, Any]) -> dict[str, Any]:
+        cards = document.get("cards")
+        if (
+            document.get("pipeline_schema_version") != pipeline.PIPELINE_SCHEMA_VERSION
+            or not isinstance(cards, list)
+            or len(cards) != 1
+            or not isinstance(cards[0], Mapping)
+        ):
+            raise FactoryFinalizeError("final summary must be one deterministic pipeline task card")
+        card = cards[0]
+        schema = schema_mod.load_schema(schema_mod.schemas_dir() / pipeline.TASK_CARD_SCHEMA)
+        schema_mod.validate(card, schema, name="factory final task card")
+        difficulty = card.get("difficulty")
+        performance = card.get("performance")
+        evidence = card.get("evidence")
+        if (
+            card.get("task_id") != task_id
+            or card.get("decision") != "review-promising"
+            or not isinstance(difficulty, Mapping)
+            or difficulty.get("declared") is not True
+            or not difficulty.get("axes")
+            or not isinstance(performance, Mapping)
+            or len(performance.get("models") or []) < 2
+            or not isinstance(evidence, Mapping)
+            or evidence.get("level") != "E3"
+            or not evidence_digests.issubset(set(evidence.get("report_digests") or []))
+        ):
+            raise FactoryFinalizeError("final task card does not bind promising E3 task evidence")
+        return {
+            "summary_content_digest": _value_digest(document),
+            "task_id": task_id,
+            "decision": card["decision"],
+        }
+
+    return validate
 
 
 def build_receipt(
@@ -301,12 +336,25 @@ def build_receipt(
         factory_gate["status"] = "fail"
         factory_gate["reason"] = type(exc).__name__
 
-    gates = [
+    evidence_gates = [
         factory_gate,
         _gate("static_authoring", Path(static_receipt_path), _static_validator(authoring_task_digest)),
         _gate("harbor_oracle_nop", Path(harbor_receipt_path), _harbor_validator(runtime_task_digest)),
         _gate("model_calibration", Path(calibration_receipt_path), _calibration_validator(runtime_task_digest)),
-        _gate("final_summary", Path(final_summary_path), _summary_validator),
+    ]
+    report_digests = {
+        str(gate["evidence_digest"])
+        for gate in evidence_gates
+        if gate["name"] in {"harbor_oracle_nop", "model_calibration"}
+        and _is_digest(gate.get("evidence_digest"))
+    }
+    gates = [
+        *evidence_gates,
+        _gate(
+            "final_summary",
+            Path(final_summary_path),
+            _summary_validator(task_id=task_id, evidence_digests=report_digests),
+        ),
     ]
     passed = all(gate["status"] == "pass" for gate in gates)
     bound_ids = {
