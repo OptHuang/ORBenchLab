@@ -69,7 +69,13 @@ def test_session_writes_bound_receipt_and_reuses_success(tmp_path: Path, profile
     assert receipt["stdout_digest"].startswith("sha256:")
     assert receipt["stderr_digest"].startswith("sha256:")
     assert receipt["trace_digest"].startswith("sha256:")
-    assert receipt["usage"] == {"input_tokens": None, "output_tokens": None, "cost_usd": None}
+    assert receipt["usage"] == {
+        "input_tokens": None,
+        "cache_creation_input_tokens": None,
+        "cache_read_input_tokens": None,
+        "output_tokens": None,
+        "cost_usd": None,
+    }
     assert "fixture-secret" not in json.dumps(receipt)
 
 
@@ -126,6 +132,7 @@ def test_timeout_is_hard_failure_with_atomic_receipt(tmp_path: Path):
 
 
 def test_output_limit_kills_process_group_without_unbounded_capture(tmp_path: Path):
+    executable = _fixture_cli(tmp_path, "while :; do printf 'fixture-output\\n'; done")
     result = run_session(
         profile="codex",
         stage="scaffold",
@@ -137,7 +144,7 @@ def test_output_limit_kills_process_group_without_unbounded_capture(tmp_path: Pa
         max_budget_usd=0.25,
         max_output_bytes=2048,
         environ=_env("codex"),
-        executable="/usr/bin/yes",
+        executable=executable,
     )
     assert result["status"] == "failed"
     assert result["failure_class"] == "output_limit_exceeded"
@@ -265,3 +272,76 @@ def test_codex_records_that_dollar_budget_is_not_cli_enforced(tmp_path: Path):
     assert result["budget"]["hard_enforced_by_cli"] is False
     assert result["budget"]["enforcement"] == "unsupported-codex-cli"
     assert "--max-budget-usd" not in result["identity"]["argv_template"]
+    assert result["usage_parser"]["status"] == "unsupported"
+
+
+def test_claude_usage_comes_only_from_complete_final_result(tmp_path: Path):
+    executable = _fixture_cli(
+        tmp_path,
+        "printf '%s\\n' "
+        "'{\"type\":\"assistant\",\"message\":{\"content\":\"do-not-copy-this\"}}' "
+        "'{\"type\":\"result\",\"subtype\":\"error_max_budget_usd\","
+        "\"total_cost_usd\":1.062661,\"usage\":{\"input_tokens\":11,"
+        "\"cache_creation_input_tokens\":22,\"cache_read_input_tokens\":33,"
+        "\"output_tokens\":44},\"result\":\"also-do-not-copy\"}'\nexit 1",
+    )
+    result = run_session(
+        profile="claude-code",
+        stage="paper-derive",
+        model="fixture-model",
+        prompt="derive",
+        workdir=tmp_path,
+        out=tmp_path / "sessions",
+        timeout_sec=2,
+        max_budget_usd=0.25,
+        environ=_env("claude-code"),
+        executable=executable,
+    )
+    assert result["status"] == "failed"
+    assert result["usage"] == {
+        "input_tokens": 11,
+        "cache_creation_input_tokens": 22,
+        "cache_read_input_tokens": 33,
+        "output_tokens": 44,
+        "cost_usd": 1.062661,
+    }
+    assert result["usage_parser"] == {
+        "protocol": "claude-stream-json-final-result-v1",
+        "status": "parsed",
+        "result_subtype": "error_max_budget_usd",
+    }
+    receipt = Path(result["receipt_path"]).read_text(encoding="utf-8")
+    assert "do-not-copy-this" not in receipt
+    assert "also-do-not-copy" not in receipt
+
+
+@pytest.mark.parametrize(
+    ("body", "status"),
+    [
+        ('printf \'%s\\n\' \'{"type":"assistant"}\'', "incomplete"),
+        (
+            'printf \'%s\\n\' \'{"type":"result","total_cost_usd":NaN,'
+            '"usage":{"input_tokens":1,"output_tokens":2}}\'',
+            "invalid",
+        ),
+        ("printf 'not-json\\n'", "invalid"),
+    ],
+)
+def test_claude_incomplete_or_invalid_usage_stays_unknown(
+    tmp_path: Path, body: str, status: str
+):
+    executable = _fixture_cli(tmp_path, body)
+    result = run_session(
+        profile="claude-code",
+        stage="reviewer",
+        model="fixture-model",
+        prompt="review",
+        workdir=tmp_path,
+        out=tmp_path / "sessions",
+        timeout_sec=1,
+        max_budget_usd=0.25,
+        environ=_env("claude-code"),
+        executable=executable,
+    )
+    assert all(value is None for value in result["usage"].values())
+    assert result["usage_parser"]["status"] == status

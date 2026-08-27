@@ -276,6 +276,80 @@ def _bounded_process(
     return b"".join(chunks["stdout"]), b"".join(chunks["stderr"]), exit_code, failure
 
 
+def _null_usage() -> dict[str, int | float | None]:
+    return {
+        "input_tokens": None,
+        "cache_creation_input_tokens": None,
+        "cache_read_input_tokens": None,
+        "output_tokens": None,
+        "cost_usd": None,
+    }
+
+
+def _parse_usage(
+    profile: str, stdout: bytes
+) -> tuple[dict[str, int | float | None], dict[str, Any]]:
+    """Extract only accounting metadata from a complete Claude final event."""
+
+    usage = _null_usage()
+    parser: dict[str, Any] = {
+        "protocol": (
+            "claude-stream-json-final-result-v1" if profile == "claude-code" else None
+        ),
+        "status": "unsupported" if profile != "claude-code" else "incomplete",
+    }
+    if profile != "claude-code":
+        return usage, parser
+    try:
+        lines = [line for line in stdout.decode("utf-8").splitlines() if line.strip()]
+        events = [json.loads(line) for line in lines]
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        parser["status"] = "invalid"
+        return usage, parser
+    if not events or any(not isinstance(event, Mapping) for event in events):
+        parser["status"] = "invalid" if events else "incomplete"
+        return usage, parser
+    result_indices = [index for index, event in enumerate(events) if event.get("type") == "result"]
+    if result_indices != [len(events) - 1]:
+        return usage, parser
+    result = events[-1]
+    raw_usage = result.get("usage")
+    cost = result.get("total_cost_usd")
+    fields = {
+        "input_tokens": raw_usage.get("input_tokens") if isinstance(raw_usage, Mapping) else None,
+        "cache_creation_input_tokens": (
+            raw_usage.get("cache_creation_input_tokens", 0)
+            if isinstance(raw_usage, Mapping)
+            else None
+        ),
+        "cache_read_input_tokens": (
+            raw_usage.get("cache_read_input_tokens", 0)
+            if isinstance(raw_usage, Mapping)
+            else None
+        ),
+        "output_tokens": raw_usage.get("output_tokens") if isinstance(raw_usage, Mapping) else None,
+    }
+    if (
+        any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in fields.values()
+        )
+        or not isinstance(cost, (int, float))
+        or isinstance(cost, bool)
+        or not math.isfinite(float(cost))
+        or float(cost) < 0
+    ):
+        parser["status"] = "invalid"
+        return usage, parser
+    usage.update(fields)
+    usage["cost_usd"] = float(cost)
+    parser["status"] = "parsed"
+    subtype = result.get("subtype")
+    if isinstance(subtype, str):
+        parser["result_subtype"] = subtype
+    return usage, parser
+
+
 def run_session(
     *,
     profile: str,
@@ -368,6 +442,7 @@ def run_session(
             timeout_sec=timeout_sec,
             max_output_bytes=max_output_bytes,
         )
+        usage, usage_parser = _parse_usage(profile, stdout)
 
         _atomic_bytes(session_dir / "stdout.bin", stdout)
         _atomic_bytes(session_dir / "stderr.bin", stderr)
@@ -403,7 +478,8 @@ def run_session(
                     "failure_class": failure_class,
                 }
             ),
-            "usage": {"input_tokens": None, "output_tokens": None, "cost_usd": None},
+            "usage": usage,
+            "usage_parser": usage_parser,
             "evidence_level": "E1-agent-session-process",
             "limitations": [
                 "Agent completion is not static-gate, verifier, or Harbor evidence.",
