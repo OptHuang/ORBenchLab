@@ -1,0 +1,38 @@
+schema_version = "1.4"
+artifacts = ["/root/submission/solver.py", "/root/submission/solution.json"]
+
+[task]
+name = "terminal-bench-science/alphaevolve-scheduling"
+description = "Improve a deterministic job-shop scheduling heuristic and emit a verifier-checkable schedule for three controlled difficulty levels."
+authors = [{ name = "ORBenchLab", email = "orbenchlab@example.org" }]
+keywords = ["operations-research", "job-shop", "algorithm-discovery", "scheduling"]
+version = "0.1.0"
+
+[metadata]
+author_name = "ORBenchLab"
+author_email = "orbenchlab@example.org"
+author_organization = "Independent Researcher"
+author_profile = "https://github.com/OptHuang"
+domain = "mathematical-sciences"
+field = "operations-research"
+subfield = "combinatorial-optimization"
+tags = ["scheduling", "heuristic-search", "algorithmic-discovery"]
+expert_time_estimate_hours = 8.0
+
+[verifier]
+timeout_sec = 120.0
+environment_mode = "separate"
+
+[verifier.environment]
+network_mode = "no-network"
+
+[agent]
+timeout_sec = 1800.0
+
+[environment]
+build_timeout_sec = 600.0
+cpus = 2
+memory_mb = 2048
+storage_mb = 10240
+gpus = 0
+network_mode = "no-network"

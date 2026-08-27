@@ -1,0 +1,19 @@
+{
+  "schema_version": "orbenchlab.paper-task-derivation.v1",
+  "source": {
+    "title": "AlphaEvolve: A coding agent for scientific and algorithmic discovery",
+    "url": "https://arxiv.org/abs/2506.13131",
+    "source_content_digest": "sha256:f092c8cbd65da89951ee6496374da9a54963f9035758c25ac6e4625f506df9ad",
+    "role": "conceptual inspiration only"
+  },
+  "mappings": [
+    {"paper_concept": "LLM-directed code improvement", "task_contract": "agent edits submission/solver.py", "verifier_obligation": "solver runs from a clean environment and emits the declared JSON"},
+    {"paper_concept": "automated evaluator feedback", "task_contract": "independent verifier recomputes schedule feasibility and makespan", "verifier_obligation": "mutations are rejected and CTRF records each test"},
+    {"paper_concept": "algorithmic discovery under a measurable objective", "task_contract": "job-shop makespan with controlled scale and contention", "verifier_obligation": "objective is recomputed; no self-reported score is trusted"}
+  ],
+  "non_claims": [
+    "This task does not reproduce proprietary AlphaEvolve infrastructure or experiments.",
+    "The paper PDF and any paper benchmark data are not copied into the task package.",
+    "Task difficulty and model gaps require new Harbor measurements; they are not inherited from the paper."
+  ]
+}
