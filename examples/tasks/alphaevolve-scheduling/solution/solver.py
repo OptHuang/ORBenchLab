@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
+import argparse
 from itertools import permutations
 from pathlib import Path
 
@@ -23,17 +23,21 @@ def schedule_for_order(jobs: list[dict], seed: int) -> dict:
 
 
 def main() -> None:
-    root = Path(os.environ.get("ORBENCH_TASK_ROOT", "/root"))
-    instance = json.loads((root / "instance.json").read_text(encoding="utf-8"))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--instance", required=True)
+    parser.add_argument("--output", required=True)
+    args = parser.parse_args()
+    instance_path = Path(args.instance)
+    output_path = Path(args.output)
+    instance = json.loads(instance_path.read_text(encoding="utf-8"))
     schedules = {}
     for level in instance["levels"]:
         schedules[level["id"]] = {}
         for seed in level["seeds"]:
             candidates = (schedule_for_order(list(order), seed) for order in permutations(level["jobs"]))
             schedules[level["id"]][str(seed)] = min(candidates, key=lambda value: value["makespan"])
-    out = root / "submission" / "solution.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({"schema_version": "alphaevolve-scheduling.solution.v1", "schedules": schedules}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps({"schema_version": "alphaevolve-scheduling.solution.v1", "schedules": schedules}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

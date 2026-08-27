@@ -530,6 +530,10 @@ def validate_task(
         # a 39-item rubric cannot silently acquire a 40th status.
         "counts": implementation_counts,
         "overall_counts": overall_counts,
+        "counts_scope": {
+            "counts": "exactly the 39 implementation rubric criteria",
+            "overall_counts": "implementation rubric plus paper/previous-receipt provenance checks",
+        },
         "decision": decision,
         "previous_receipt_digest": previous_digest,
         "limitations": [
@@ -555,6 +559,7 @@ def write_receipt(receipt: Mapping[str, Any], out: str | Path) -> dict[str, Path
         f"- Round: `{receipt['round']}`",
         f"- Implementation counts (39 criteria): `{receipt['counts']}`",
         f"- Overall counts (including provenance): `{receipt.get('overall_counts', receipt['counts'])}`",
+        f"- Count scopes: `{receipt.get('counts_scope', {})}`",
         f"- Rubric: `{receipt['rubric']['implementation_criteria_count']}` criteria from {receipt['rubric']['implementation_source']}",
         f"- Receipt digest: `{receipt['receipt_digest']}`",
         "",
