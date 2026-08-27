@@ -187,6 +187,7 @@ def _add_agent_factory(sub: argparse._SubParsersAction) -> None:
     finalize_parser.add_argument("--workdir", required=True)
     finalize_parser.add_argument("--task-dir", required=True)
     finalize_parser.add_argument("--static-receipt", required=True)
+    finalize_parser.add_argument("--semantic-review", required=True)
     finalize_parser.add_argument("--harbor-receipt", required=True)
     finalize_parser.add_argument("--calibration-receipt", required=True)
     finalize_parser.add_argument(
@@ -198,9 +199,11 @@ def _add_agent_factory(sub: argparse._SubParsersAction) -> None:
     finalize_parser.set_defaults(handler=_cmd_agent_factory_finalize)
 
     supervise = inner.add_parser("supervise", help="run or resume deterministic post-agent gates")
-    for flag in ("plan", "factory-run", "workdir", "task-dir", "paper-provenance", "out", "test-image"):
+    for flag in ("plan", "factory-run", "workdir", "task-dir", "task-genome", "paper-provenance", "out", "test-image"):
         supervise.add_argument(f"--{flag}", required=True)
     supervise.add_argument("--harbor-executable")
+    supervise.add_argument("--review-executable")
+    supervise.add_argument("--review-model", action="append", required=True)
     supervise.add_argument("--executed-task-dir", default="")
     supervise.add_argument("--oracle-job", default="")
     supervise.add_argument("--nop-job", default="")
@@ -327,6 +330,7 @@ def _cmd_agent_factory_finalize(args: argparse.Namespace) -> int:
         workdir=args.workdir,
         task_dir=args.task_dir,
         static_receipt_path=args.static_receipt,
+        semantic_review_path=args.semantic_review,
         harbor_receipt_path=args.harbor_receipt,
         calibration_receipt_path=args.calibration_receipt,
         final_summary_path=args.final_summary,
@@ -347,11 +351,14 @@ def _cmd_agent_factory_finalize(args: argparse.Namespace) -> int:
 def _cmd_agent_factory_supervise(args: argparse.Namespace) -> int:
     result = factory_supervisor_mod.run(
         plan_path=args.plan, factory_run_path=args.factory_run, workdir=args.workdir,
-        task_dir=args.task_dir, paper_provenance=args.paper_provenance, out=args.out,
+        task_dir=args.task_dir, task_genome=args.task_genome, paper_provenance=args.paper_provenance, out=args.out,
         harbor_executable=args.harbor_executable,
+        semantic_review_executable=args.review_executable,
+        semantic_review_models=args.review_model,
         harbor_inputs={"executed_task_dir": args.executed_task_dir, "oracle_job": args.oracle_job, "nop_job": args.nop_job},
         calibration_executable=args.calibration_executable, calibration_models=args.model,
         test_image=args.test_image, repetitions=args.repetitions, timeout_sec=args.timeout_sec,
+        provider_env={name: os.environ[name] for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY") if name in os.environ},
     )
     _print_json({"status": result["status"], "promoted": result["promoted"], "identity_digest": result["identity_digest"], "written": str(Path(args.out) / "supervisor-state.json")})
     return 0 if result["promoted"] else 8

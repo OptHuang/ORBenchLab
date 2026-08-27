@@ -19,7 +19,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from . import factory_finalize, pipeline, task_authoring
+from . import agent_sessions, factory_finalize, pipeline, task_authoring, volc_rollout
 from .core.errors import ORBenchError
 
 
@@ -52,6 +52,7 @@ def _command(
     *,
     timeout_sec: float,
     cwd: Path,
+    child_env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     if not executable:
         return {"status": "blocked", "failure_class": "external_dependency_missing", "argv": None}
@@ -60,7 +61,7 @@ def _command(
     process = subprocess.Popen(
         argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, start_new_session=True, text=False,
-        env={"PATH": os.environ.get("PATH", "")},
+        env=dict(child_env) if child_env is not None else {"PATH": os.environ.get("PATH", "")},
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout_sec)
@@ -93,21 +94,29 @@ def run(
     factory_run_path: str | Path,
     workdir: str | Path,
     task_dir: str | Path,
+    task_genome: str | Path,
     paper_provenance: str | Path,
     out: str | Path,
     harbor_executable: str | None,
     harbor_inputs: Mapping[str, str],
+    semantic_review_executable: str | None,
+    semantic_review_models: Sequence[str],
     calibration_executable: str | None,
     calibration_models: Sequence[str],
     test_image: str,
+    provider_env: Mapping[str, str] | None = None,
     repetitions: int = 5,
     timeout_sec: float = 600,
 ) -> dict[str, Any]:
     """Execute or resume the fixed five-stage control-plane."""
 
-    if repetitions < 5 or len(set(calibration_models)) < 2 or timeout_sec <= 0:
+    if repetitions < 5 or len(set(calibration_models)) < 2 or len(set(semantic_review_models)) < 2 or timeout_sec <= 0:
         raise FactorySupervisorError("calibration requires two distinct models, >=5 repetitions and positive timeout")
-    root, task, workspace = Path(out), Path(task_dir), Path(workdir)
+    root, task, workspace, genome_path = Path(out), Path(task_dir), Path(workdir), Path(task_genome)
+    provider_child, route_digest = agent_sessions._session_env("claude-code", provider_env or {})
+    genome = task_authoring._load_document(genome_path)
+    if str(genome.get("family") or "") != volc_rollout._task_id(task) or not genome.get("difficulty_axes"):
+        raise FactorySupervisorError("task genome must bind task identity and declare difficulty axes")
     root.mkdir(parents=True, exist_ok=True)
     lock = (root / ".supervisor.lock").open("a+b")
     fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -116,12 +125,16 @@ def run(
             "plan_digest": _digest(Path(plan_path)), "factory_run_digest": _digest(Path(factory_run_path)),
             "task_tree_digest": task_authoring._task_tree_digest(task),
             "paper_provenance_digest": _digest(Path(paper_provenance)),
+            "task_genome_digest": _digest(genome_path),
             "models": list(calibration_models), "repetitions": repetitions,
             "test_image": test_image,
             "harbor_adapter": _executable_binding(harbor_executable),
             "harbor_inputs": dict(sorted(harbor_inputs.items())),
             "calibration_adapter": _executable_binding(calibration_executable),
+            "semantic_review_adapter": _executable_binding(semantic_review_executable),
+            "semantic_review_models": list(semantic_review_models),
             "timeout_sec": timeout_sec,
+            "provider_route_digest": route_digest,
         }
         identity_digest = "sha256:" + hashlib.sha256(_canonical(identity)).hexdigest()
         state_path = root / "supervisor-state.json"
@@ -152,6 +165,17 @@ def run(
         else:
             reuse("static", static_json)
 
+        semantic_json = root / "semantic" / "volc-authoring-review.json"
+        if semantic_json.exists():
+            reuse("semantic_review", semantic_json)
+        else:
+            args = ["--task-dir", str(task), "--paper-provenance", str(paper_provenance), "--receipt", str(static_json), "--round", "1", "--models", ",".join(semantic_review_models), "--out", str(root / "semantic")]
+            semantic = _command(semantic_review_executable, args, timeout_sec=timeout_sec, cwd=workspace, child_env=provider_child)
+            if semantic.get("status") == "passed" and not semantic_json.is_file():
+                semantic = {**semantic, "status": "blocked", "failure_class": "expected_receipt_missing"}
+            if semantic_json.is_file(): semantic = {**semantic, "output": str(semantic_json), "output_digest": _digest(semantic_json)}
+            record("semantic_review", semantic)
+
         harbor_json = root / "harbor" / "harbor-control-screening.json"
         if harbor_json.exists():
             reuse("harbor", harbor_json)
@@ -172,7 +196,7 @@ def run(
             reuse("calibration", calibration_json)
         else:
             args = ["--task-dir", str(task), "--test-image", test_image, "--out", str(root / "calibration"), "--models", ",".join(calibration_models), "--repetitions", str(repetitions), "--hint-level", "0", "--controls", "oracle,nop"]
-            calibration = _command(calibration_executable, args, timeout_sec=timeout_sec, cwd=workspace)
+            calibration = _command(calibration_executable, args, timeout_sec=timeout_sec, cwd=workspace, child_env=provider_child)
             if calibration.get("status") == "passed" and not calibration_json.is_file():
                 calibration = {**calibration, "status": "blocked", "failure_class": "expected_receipt_missing"}
             if calibration_json.is_file(): calibration = {**calibration, "output": str(calibration_json), "output_digest": _digest(calibration_json)}
@@ -181,15 +205,15 @@ def run(
         cards_json = root / "cards" / "task-cards.json"
         evidence = [path for path in (harbor_json, calibration_json) if path.is_file()]
         if not cards_json.exists():
-            pipeline.run(out=root / "cards", task_inputs=[task], screening_inputs=evidence)
+            pipeline.run(out=root / "cards", task_inputs=[genome_path], screening_inputs=evidence)
             record("cards", {"status": "passed", "output": str(cards_json), "output_digest": _digest(cards_json)})
         else:
             reuse("cards", cards_json)
 
-        prerequisites = all(path.is_file() for path in (static_json, harbor_json, calibration_json, cards_json))
+        prerequisites = all(path.is_file() for path in (static_json, semantic_json, harbor_json, calibration_json, cards_json))
         final_path = root / "final" / "factory-finalization.json"
         if prerequisites:
-            final = factory_finalize.build_receipt(plan_path=plan_path, factory_run_path=factory_run_path, workdir=workspace, task_dir=task, static_receipt_path=static_json, harbor_receipt_path=harbor_json, calibration_receipt_path=calibration_json, final_summary_path=cards_json)
+            final = factory_finalize.build_receipt(plan_path=plan_path, factory_run_path=factory_run_path, workdir=workspace, task_dir=task, static_receipt_path=static_json, semantic_review_path=semantic_json, harbor_receipt_path=harbor_json, calibration_receipt_path=calibration_json, final_summary_path=cards_json)
             factory_finalize.write_receipt(final, root / "final")
         else:
             final = {"decision": "not-promoted", "promoted": False, "evidence_level": "E1", "failure_class": "prerequisite_blocked"}

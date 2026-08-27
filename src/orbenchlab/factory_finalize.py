@@ -17,6 +17,7 @@ from typing import Any, Callable, Mapping
 from . import agentic_factory, pipeline, task_authoring, volc_rollout
 from .core import schema as schema_mod
 from .core.errors import ORBenchError
+from .volc_review import REQUIRED_REVIEW_CRITERIA
 
 
 class FactoryFinalizeError(ORBenchError):
@@ -94,22 +95,50 @@ def _static_validator(task_digest: str) -> Callable[[Mapping[str, Any]], dict[st
             document.get("authoring_schema_version") != task_authoring.AUTHORING_SCHEMA_VERSION
             or document.get("receipt_digest") != _value_digest(unsigned)
             or document.get("task_tree_digest") != task_digest
-            or document.get("decision") != "ready-for-harbor-validation"
+            or document.get("decision") not in {"ready-for-human-review", "ready-for-harbor-validation"}
             or not isinstance(criteria, list)
             or len(criteria) != len(task_authoring.IMPLEMENTATION_CRITERIA)
             or {row.get("name") for row in criteria if isinstance(row, Mapping)}
             != set(task_authoring.IMPLEMENTATION_CRITERIA)
-            or any(row.get("status") != "pass" for row in criteria if isinstance(row, Mapping))
+            or any(not isinstance(row, Mapping) or row.get("status") == "fail" for row in criteria)
             or not isinstance(provenance, list)
             or not provenance
             or any(
-                not isinstance(row, Mapping) or row.get("status") != "pass"
+                not isinstance(row, Mapping) or row.get("status") == "fail"
                 for row in provenance
             )
         ):
             raise FactoryFinalizeError("static authoring receipt did not pass completely")
         return {"task_tree_digest": task_digest, "receipt_digest": document["receipt_digest"]}
 
+    return validate
+
+
+def _semantic_validator(task_digest: str, static_digest: str, paper_digest: str) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
+    def validate(document: Mapping[str, Any]) -> dict[str, Any]:
+        unsigned = {key: value for key, value in document.items() if key != "review_digest"}
+        models, reviewers = document.get("models"), document.get("reviewers")
+        if (document.get("schema_version") != "orbenchlab.volc-authoring-review.v1"
+            or document.get("review_digest") != _value_digest(unsigned)
+            or document.get("task_tree_digest") != task_digest
+            or document.get("static_receipt_digest") != static_digest
+            or not paper_digest or document.get("paper_digest") != paper_digest
+            or document.get("aggregate_decision") != "promising-needs-harbor"
+            or not isinstance(models, list) or len(models) < 2 or len(set(models)) != len(models)
+            or document.get("review_count") != len(models)
+            or not isinstance(reviewers, list) or len(reviewers) != len(models)):
+            raise FactoryFinalizeError("semantic review receipt binding failed")
+        for model, reviewer in zip(models, reviewers, strict=True):
+            review = reviewer.get("review") if isinstance(reviewer, Mapping) else None
+            criteria = review.get("criteria") if isinstance(review, Mapping) else None
+            if (not isinstance(reviewer, Mapping) or reviewer.get("model") != model
+                or not isinstance(review, Mapping) or review.get("decision") != "promising"
+                or review.get("shape_complete") is not True or review.get("rubric_complete") is not True
+                or not isinstance(criteria, list) or len(criteria) != len(REQUIRED_REVIEW_CRITERIA)
+                or {row.get("name") for row in criteria if isinstance(row, Mapping)} != REQUIRED_REVIEW_CRITERIA
+                or any(not isinstance(row, Mapping) or row.get("status") != "pass" or not str(row.get("evidence", "")).strip() for row in criteria)):
+                raise FactoryFinalizeError("semantic reviewer lacks a complete passing rubric")
+        return {"task_tree_digest": task_digest, "review_digest": document["review_digest"], "models": models}
     return validate
 
 
@@ -291,6 +320,7 @@ def build_receipt(
     workdir: str | Path,
     task_dir: str | Path,
     static_receipt_path: str | Path,
+    semantic_review_path: str | Path,
     harbor_receipt_path: str | Path,
     calibration_receipt_path: str | Path,
     final_summary_path: str | Path,
@@ -336,9 +366,18 @@ def build_receipt(
         factory_gate["status"] = "fail"
         factory_gate["reason"] = type(exc).__name__
 
+    try:
+        static_digest = str(_load(Path(static_receipt_path)).get("receipt_digest") or "")
+    except FactoryFinalizeError:
+        static_digest = ""
+    try:
+        paper_digest = str(task_authoring._load_document(task / "paper-provenance.json").get("source_content_digest") or "")
+    except (OSError, task_authoring.TaskAuthoringError):
+        paper_digest = ""
     evidence_gates = [
         factory_gate,
         _gate("static_authoring", Path(static_receipt_path), _static_validator(authoring_task_digest)),
+        _gate("semantic_review", Path(semantic_review_path), _semantic_validator(authoring_task_digest, static_digest, paper_digest)),
         _gate("harbor_oracle_nop", Path(harbor_receipt_path), _harbor_validator(runtime_task_digest)),
         _gate("model_calibration", Path(calibration_receipt_path), _calibration_validator(runtime_task_digest)),
     ]
