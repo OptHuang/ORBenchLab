@@ -175,6 +175,25 @@ def test_autopilot_injects_each_runtime_barrier_once_and_resumes(
     monkeypatch.setattr(factory_autopilot, "_ensure_baseline", fake_baseline)
     monkeypatch.setattr(factory_autopilot, "_ensure_difficulty", fake_difficulty)
     monkeypatch.setattr(factory_autopilot, "_validate_barriers", lambda *args: None)
+    promotions = []
+
+    def fake_promotion(**kwargs):
+        promotions.append(kwargs)
+        return {
+            "selected_task": "factory/tasks/task-v2/demo",
+            "task_id": "demo",
+            "promoted": True,
+            "decision": "eligible-for-human-release-review",
+            "gates": {},
+            "final_report": {"markdown": str(tmp_path / "autopilot/promotion/final-report.md")},
+            "final_report_digest": "sha256:" + "9" * 64,
+            "promotion_digest": "sha256:" + "8" * 64,
+        }
+
+    monkeypatch.setattr(
+        factory_autopilot.factory_promotion, "run_promotion", fake_promotion
+    )
+    monkeypatch.setattr(factory_autopilot, "_selected_task", lambda workspace: None)
     kwargs = dict(
         workdir=work,
         factory_out=tmp_path / "factory-run",
@@ -189,8 +208,15 @@ def test_autopilot_injects_each_runtime_barrier_once_and_resumes(
         max_variants=3,
     )
     result = factory_autopilot.run(plan, **kwargs)
-    assert result["status"] == "semantic-complete-e1"
+    assert result["status"] == "promoted"
+    assert result["promotion"]["decision"] == "eligible-for-human-release-review"
     assert calls == {"baseline": 1, "difficulty": 1, "factory": 6}
+    assert len(promotions) == 1
+    assert promotions[0]["evidence_root"] == (tmp_path / "autopilot").resolve()
+    # A resumed promoted run returns immediately without re-running promotion.
+    resumed = factory_autopilot.run(plan, **kwargs)
+    assert resumed["status"] == "promoted"
+    assert len(promotions) == 1
     persisted = json.loads((tmp_path / "autopilot/autopilot-state.json").read_text())
     assert set(persisted["barriers"]) == {"baseline", "difficulty"}
     persisted["barriers"]["baseline"]["matrix_receipt_digest"] = "sha256:" + "f" * 64

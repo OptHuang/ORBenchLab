@@ -23,6 +23,7 @@ from . import (
     difficulty_matrix,
     factory_blueprints,
     factory_gates,
+    factory_promotion,
     harbor_launcher,
     harbor_model_matrix,
     pipeline,
@@ -717,6 +718,9 @@ def run(
     max_harbor_liability_usd: float = 100.0,
     max_job_attempts: int = 2,
     held_out: bool = False,
+    promote: bool = True,
+    promotion_review_timeout_sec: float = 600.0,
+    promotion_max_review_tokens: int = 2400,
 ) -> dict[str, Any]:
     """Run or resume the complete semantic-and-runtime factory state machine."""
 
@@ -819,6 +823,8 @@ def run(
             # The blocking task tree belongs to an immutable completed stage;
             # rerunning cannot change the deterministic gate result.
             return dict(state)
+        if state.get("status") == "promoted":
+            return dict(state)
         for _ in range(128):
             _validate_barriers(state, workspace)
             factory_run, _ = agentic_factory.initialise(
@@ -835,6 +841,35 @@ def run(
                 state["factory_run_digest"] = factory_run["run_digest"]
                 state["selected_task"] = _selected_task(workspace)
                 state = _write_state(state_path, state)
+                if factory_run["status"] == "semantic-complete-e1" and promote:
+                    promotion = factory_promotion.run_promotion(
+                        plan=checked,
+                        workdir=workspace,
+                        factory_out=factory_root,
+                        evidence_root=root,
+                        out=root / "promotion",
+                        provider_env=provider_env,
+                        state=state,
+                        review_timeout_sec=promotion_review_timeout_sec,
+                        max_review_tokens=promotion_max_review_tokens,
+                    )
+                    state["promotion"] = {
+                        key: promotion.get(key)
+                        for key in (
+                            "selected_task",
+                            "task_id",
+                            "promoted",
+                            "decision",
+                            "gates",
+                            "final_report",
+                            "final_report_digest",
+                            "promotion_digest",
+                        )
+                    }
+                    state["status"] = (
+                        "promoted" if promotion["promoted"] else "promotion-blocked"
+                    )
+                    state = _write_state(state_path, state)
                 return dict(state)
             ready = agentic_factory.ready_stages(checked, factory_run)
             if not ready:

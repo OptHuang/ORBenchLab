@@ -261,6 +261,13 @@ def _add_agent_factory(sub: argparse._SubParsersAction) -> None:
     autopilot.add_argument("--max-job-attempts", type=int, default=2)
     autopilot.add_argument("--max-harbor-liability-usd", type=float, default=100.0)
     autopilot.add_argument("--held-out", action="store_true")
+    autopilot.add_argument(
+        "--stop-after-semantic",
+        action="store_true",
+        help="stop at semantic-complete-e1 instead of continuing to deterministic promotion",
+    )
+    autopilot.add_argument("--promotion-review-timeout-sec", type=float, default=600.0)
+    autopilot.add_argument("--promotion-max-review-tokens", type=int, default=2400)
     autopilot.set_defaults(handler=_cmd_agent_factory_autopilot)
 
     finalize_parser = inner.add_parser(
@@ -449,7 +456,11 @@ def _cmd_agent_factory_autopilot(args: argparse.Namespace) -> int:
         max_harbor_liability_usd=args.max_harbor_liability_usd,
         max_job_attempts=args.max_job_attempts,
         held_out=args.held_out,
+        promote=not args.stop_after_semantic,
+        promotion_review_timeout_sec=args.promotion_review_timeout_sec,
+        promotion_max_review_tokens=args.promotion_max_review_tokens,
     )
+    promotion = result.get("promotion") if isinstance(result.get("promotion"), dict) else {}
     _print_json(
         {
             "status": result["status"],
@@ -457,10 +468,14 @@ def _cmd_agent_factory_autopilot(args: argparse.Namespace) -> int:
             "factory_run_digest": result.get("factory_run_digest"),
             "selected_task": result.get("selected_task"),
             "barriers": result.get("barriers", {}),
+            "promotion_decision": promotion.get("decision"),
+            "final_report": (promotion.get("final_report") or {}).get("markdown"),
+            "quarantine": result.get("quarantine"),
             "written": str(Path(args.out) / "autopilot-state.json"),
         }
     )
-    return 0 if result["status"] == "semantic-complete-e1" else 8
+    successful = {"promoted"} if not args.stop_after_semantic else {"semantic-complete-e1"}
+    return 0 if result["status"] in successful else 8
 
 
 def _cmd_agent_factory_finalize(args: argparse.Namespace) -> int:
