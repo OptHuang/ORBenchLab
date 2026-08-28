@@ -31,6 +31,7 @@ from .agent_sessions import (
     _tree_digest as _session_tree_digest,
     run_session,
 )
+from . import factory_gates
 from .core.errors import ORBenchError
 
 
@@ -222,6 +223,7 @@ def _normalise_stage(value: Any) -> dict[str, Any]:
         "max_budget_usd",
         "max_output_bytes",
         "required_outputs",
+        "postchecks",
     }
     unknown = sorted(set(value) - allowed)
     if unknown:
@@ -276,7 +278,29 @@ def _normalise_stage(value: Any) -> dict[str, Any]:
     paths = [item["path"] for item in outputs]
     if len(set(paths)) != len(paths):
         raise AgenticFactoryError(f"stage {stage_id} repeats a required-output path")
-    return {
+    if any(
+        path == factory_gates.ADVISORY_DIR
+        or path.startswith(factory_gates.ADVISORY_DIR + "/")
+        for path in paths
+    ):
+        raise AgenticFactoryError(
+            f"stage {stage_id} may not own outputs under the harness gate directory"
+        )
+    postchecks = value.get("postchecks", [])
+    if (
+        not isinstance(postchecks, list)
+        or len(postchecks) != len(set(postchecks))
+        or len(postchecks) > 4
+        or any(
+            not isinstance(name, str) or name not in factory_gates.POSTCHECK_NAMES
+            for name in postchecks
+        )
+    ):
+        raise AgenticFactoryError(
+            f"stage {stage_id} postchecks must be unique names from "
+            f"{sorted(factory_gates.POSTCHECK_NAMES)}"
+        )
+    normalised = {
         "id": stage_id,
         "role": role,
         "profile": profile,
@@ -289,6 +313,11 @@ def _normalise_stage(value: Any) -> dict[str, Any]:
         "max_output_bytes": max_output_bytes,
         "required_outputs": outputs,
     }
+    # Preserve digest stability for plans compiled before postchecks existed:
+    # the key is canonicalized only when a deterministic gate is declared.
+    if postchecks:
+        normalised["postchecks"] = [str(name) for name in postchecks]
+    return normalised
 
 
 def _assert_acyclic(stages: Sequence[Mapping[str, Any]]) -> None:
@@ -1230,6 +1259,15 @@ def _stage_prompt(
             "factory disables Bash; use Read/Glob/Grep/Edit/Write and leave command execution to trusted gates."
         ),
     }
+    if stage.get("postchecks"):
+        contract["deterministic_postchecks"] = list(stage["postchecks"])
+        contract["postcheck_rule"] = (
+            "After this session, the trusted harness runs the listed deterministic gates over "
+            "the required outputs. A gate failure fails this attempt. If "
+            f"{factory_gates.ADVISORY_DIR}/{stage['id']}-postcheck.json exists in the workspace, "
+            "it lists the exact gate findings from the previous failed attempt; resolve every "
+            "listed failure in place."
+        )
     digest_targets = {
         output["path"]: dict(output.get("json_digest_bindings", {}))
         for output in stage["required_outputs"]
@@ -1332,6 +1370,7 @@ def _run_factory_locked(
         failed_output_snapshots: list[dict[str, Any]] = []
         retry_safe = True
         workspace_usage: dict[str, int] | None = None
+        postcheck_record: dict[str, Any] | None = None
         stage_environment = (environments or {}).get(stage["profile"], {})
         visibility_completed_stage_ids = [
             completed_id
@@ -1421,10 +1460,48 @@ def _run_factory_locked(
                 failure_class = str(session.get("failure_class") or "agent_process_failure")
             else:
                 artifacts = _validate_outputs(workspace, stage, before)
-        except (AgentSessionError, AgenticFactoryError) as exc:
+                if stage.get("postchecks"):
+                    findings = factory_gates.run_postchecks(
+                        stage,
+                        workspace=workspace,
+                        plan=checked,
+                        attempt_number=attempt_number,
+                    )
+                    postcheck_relative = (
+                        f"stages/{stage_id}/postcheck-{attempt_number:03d}.json"
+                    )
+                    _atomic_json(root / postcheck_relative, findings)
+                    postcheck_record = {
+                        "names": list(stage["postchecks"]),
+                        "passed": bool(findings["passed"]),
+                        "receipt": postcheck_relative,
+                        "findings_digest": findings["findings_digest"],
+                    }
+                    advisory = _artifact_path(
+                        workspace,
+                        f"{factory_gates.ADVISORY_DIR}/{stage_id}-postcheck.json",
+                    )
+                    if not findings["passed"]:
+                        # Keep the stage outputs in place for incremental repair
+                        # and surface the exact deterministic findings to the
+                        # next attempt's agent session.
+                        _atomic_json(advisory, findings)
+                        failure_class = "deterministic_gate_failed"
+                        failure_detail = factory_gates.failure_summary(findings)
+                        artifacts = []
+                    else:
+                        try:
+                            advisory.unlink()
+                        except FileNotFoundError:
+                            pass
+        except (
+            AgentSessionError,
+            AgenticFactoryError,
+            factory_gates.FactoryGateError,
+        ) as exc:
             failure_class = "session_contract_failure"
             failure_detail = str(exc)
-        if failure_class is not None:
+        if failure_class is not None and failure_class != "deterministic_gate_failed":
             try:
                 failed_output_snapshots = _quarantine_failed_outputs(
                     workspace,
@@ -1460,6 +1537,7 @@ def _run_factory_locked(
             ),
             "output_artifacts": artifacts,
             "failed_output_snapshots": failed_output_snapshots,
+            "postcheck": postcheck_record,
             "retry_safe": retry_safe,
             "workspace_usage": workspace_usage,
             "visibility_completed_stage_ids": visibility_completed_stage_ids,

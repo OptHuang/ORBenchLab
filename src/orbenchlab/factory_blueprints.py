@@ -308,6 +308,7 @@ def _stage(
     json_nonempty_keys: Sequence[str] = (),
     json_digest_bindings: Mapping[str, str] | None = None,
     additional_outputs: Sequence[Mapping[str, Any]] = (),
+    postchecks: Sequence[str] = (),
 ) -> dict[str, Any]:
     required_outputs = [
         {
@@ -321,7 +322,7 @@ def _stage(
         }
     ]
     required_outputs.extend(dict(value) for value in additional_outputs)
-    return {
+    stage = {
         "id": stage_id,
         "role": role,
         "profile": profile,
@@ -334,6 +335,9 @@ def _stage(
         "max_output_bytes": max_output_bytes,
         "required_outputs": required_outputs,
     }
+    if postchecks:
+        stage["postchecks"] = list(postchecks)
+    return stage
 
 
 def paper_to_benchmark_plan(
@@ -503,16 +507,24 @@ def paper_to_benchmark_plan(
             "task-author-v1",
             "Terminal-Bench Science task implementer",
             common
-            + " Copy factory-input/seed-task to factory/tasks/task-v1 and replace it with the selected "
-            "paper-backed task. Implement task.toml, environment, instruction, solution, data and strict "
+            + " Implement the selected paper-backed task as factory/tasks/task-v1/<task-slug>, where "
+            "<task-slug> is exactly the task.toml [task].name basename (the TB-Science gate requires the "
+            "task directory name to match its slug). Start from a copy of factory-input/seed-task. "
+            "Implement task.toml, environment, instruction, solution, data and strict "
             "rubric tests. Inspect the complete result and leave no placeholder or human TODO; the trusted "
-            "harness, not this no-Bash semantic session, owns command execution.",
+            "harness, not this no-Bash semantic session, owns command execution. The harness then runs the "
+            "deterministic TB-Science static authoring gate over task-v1; keep every mechanical rubric "
+            "criterion passing (task.toml schema, separate no-network verifier, CTRF wiring, resources, "
+            "metadata, README sections). If factory/gate/task-author-v1-postcheck.json exists it lists the "
+            "previous attempt's exact gate failures; fix them in place.",
             "factory/tasks/task-v1",
             model=author_model,
             profile=profile,
             depends_on=("task-design-synthesis",),
             kind="directory",
             timeout_sec=3600,
+            max_attempts=3,
+            postchecks=("tb-science-static-gate",),
         ),
         _stage(
             "task-review-science",
@@ -543,10 +555,15 @@ def paper_to_benchmark_plan(
             "task-repair-v2",
             "senior task repair agent",
             common
-            + " Copy task-v1 to factory/tasks/task-v2, resolve every supported finding from both Markdown reviews, "
+            + " Copy the task tree under factory/tasks/task-v1 to factory/tasks/task-v2, keeping the "
+            "slug-named task directory layout (factory/tasks/task-v2/<task-slug> matching the task.toml "
+            "[task].name basename), resolve every supported finding from both Markdown reviews, "
             "and prepare it for the repository's deterministic task-authoring gate plus task tests, which "
             "the trusted harness will execute after this stage. Preserve a "
-            "machine-readable repair ledger inside task-v2/data.",
+            "machine-readable repair ledger inside task-v2/data. The harness reruns the deterministic "
+            "TB-Science static gate over task-v2 and fails this attempt on any blocked criterion; if "
+            "factory/gate/task-repair-v2-postcheck.json exists it lists the previous attempt's exact gate "
+            "failures to resolve in place.",
             "factory/tasks/task-v2",
             model=author_model,
             profile=profile,
@@ -554,6 +571,7 @@ def paper_to_benchmark_plan(
             kind="directory",
             timeout_sec=3600,
             max_attempts=3,
+            postchecks=("tb-science-static-gate",),
         ),
         _stage(
             "runtime-controls",
@@ -653,7 +671,12 @@ def paper_to_benchmark_plan(
             "least three ordered levels and write factory/tasks/variants/variant-manifest.json with schema_version "
             "orbenchlab.variant-manifest.v1, one primary_axis object (name, expected_direction, ordered_levels), "
             "and variants rows (variant_id, relative_path, level, axis_levels). Paths are relative to the variants "
-            "directory and each must contain a complete strict task. Set evaluation_mode to "
+            "directory and each must contain a complete strict task. Secondary axes may be declared under "
+            "secondary_axes; every axis_levels key must then be a declared axis. The harness runs a deterministic "
+            "variant-conformance gate: every variant must pass the TB-Science static gate, and no variant may be "
+            "byte-identical to the base task or to another variant (renaming alone is not a difficulty change). If "
+            "factory/gate/variant-author-postcheck.json exists it lists the previous attempt's exact gate failures. "
+            "Set evaluation_mode to "
             + (
                 "held-out-confirmation. The trusted harness will freeze a preregistration before launching any variant trials."
                 if held_out_confirmation
@@ -665,6 +688,8 @@ def paper_to_benchmark_plan(
             depends_on=("difficulty-design",),
             kind="directory",
             timeout_sec=7200,
+            max_attempts=3,
+            postchecks=("variant-conformance",),
         ),
         _stage(
             "calibration",

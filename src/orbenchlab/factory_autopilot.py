@@ -22,9 +22,11 @@ from . import (
     agentic_factory,
     difficulty_matrix,
     factory_blueprints,
+    factory_gates,
     harbor_launcher,
     harbor_model_matrix,
     pipeline,
+    task_authoring,
     volc_rollout,
 )
 from .core.errors import ORBenchError
@@ -32,6 +34,16 @@ from .core.errors import ORBenchError
 
 class FactoryAutopilotError(ORBenchError):
     exit_code = 8
+
+
+class FactoryStaticGateBlocked(FactoryAutopilotError):
+    """A pre-Harbor deterministic gate blocked the run before any model spend."""
+
+    def __init__(self, quarantine: Mapping[str, Any]):
+        super().__init__(
+            f"static gate blocked the autopilot: {quarantine.get('gate')}"
+        )
+        self.quarantine = dict(quarantine)
 
 
 SCHEMA_VERSION = "orbenchlab.factory-autopilot.v1"
@@ -289,6 +301,19 @@ def _validate_barriers(state: Mapping[str, Any], workdir: Path) -> None:
             or sources.get("screening") != screening.get("report_digest")
         ):
             raise FactoryAutopilotError("baseline trusted receipt binding failed")
+        static_digest = baseline.get("static_receipt_digest")
+        if static_digest is not None:
+            static_doc = _load_object(root / "static-authoring-receipt.json")
+            unsigned_static = {
+                key: value for key, value in static_doc.items() if key != "receipt_digest"
+            }
+            if (
+                static_doc.get("receipt_digest") != task_authoring._digest(unsigned_static)
+                or static_doc.get("receipt_digest") != static_digest
+                or static_doc.get("decision") == "blocked"
+                or sources.get("static_authoring") != static_digest
+            ):
+                raise FactoryAutopilotError("baseline static-gate receipt binding failed")
     difficulty = barriers.get("difficulty")
     if "difficulty" in barriers and not isinstance(difficulty, Mapping):
         raise FactoryAutopilotError("difficulty barrier state must be an object")
@@ -361,6 +386,40 @@ def _runtime_capability(task_digest: str) -> dict[str, Any]:
     return receipt
 
 
+def _static_gate(
+    task: Path, *, workdir: Path, out: Path, label: str
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Run the deterministic TB-Science gate before any Harbor spend.
+
+    Returns ``(receipt, quarantine)``; ``quarantine`` is a machine-readable
+    reason object when the task is blocked, so an unattended run stops with an
+    explainable state instead of launching paid trials against a broken task.
+    """
+
+    provenance = workdir / "factory-input" / "paper-provenance.json"
+    receipt = task_authoring.validate_task(
+        task,
+        paper_provenance=provenance if provenance.is_file() else None,
+    )
+    task_authoring.write_receipt(receipt, out)
+    if receipt["decision"] == "blocked":
+        failing = sorted(
+            str(row.get("name"))
+            for group in ("implementation_criteria", "provenance_checks")
+            for row in receipt.get(group, [])
+            if isinstance(row, Mapping) and row.get("status") == "fail"
+        )
+        return receipt, {
+            "reason": "static-gate-blocked",
+            "gate": label,
+            "task": task.name,
+            "receipt_digest": receipt["receipt_digest"],
+            "receipt_path": str(out / "authoring-receipt.json"),
+            "failing_criteria": failing,
+        }
+    return receipt, None
+
+
 def _ensure_baseline(
     *,
     plan: Mapping[str, Any],
@@ -376,9 +435,16 @@ def _ensure_baseline(
     harbor_timeout_sec: float,
     max_job_attempts: int,
 ) -> dict[str, Any]:
-    task = _stage_output_path(plan, workdir, "task-repair-v2", kind="directory")
+    task = factory_gates.resolve_task_root(
+        _stage_output_path(plan, workdir, "task-repair-v2", kind="directory")
+    )
     task_digest = volc_rollout._task_tree_digest(task)
     root = evidence_root / "baseline"
+    static_receipt, quarantine = _static_gate(
+        task, workdir=workdir, out=root / "static-gate", label="baseline"
+    )
+    if quarantine is not None:
+        raise FactoryStaticGateBlocked(quarantine)
     controls = harbor_launcher.launch_controls(
         task,
         harbor_executable=harbor_executable,
@@ -416,6 +482,10 @@ def _ensure_baseline(
     shutil.copy2(root / "controls" / "harbor-control-screening.json", trusted_source)
     shutil.copy2(root / "matrix" / "harbor-model-matrix.json", trusted_source)
     shutil.copy2(root / "matrix" / "screening-report.json", trusted_source)
+    shutil.copy2(
+        root / "static-gate" / "authoring-receipt.json",
+        trusted_source / "static-authoring-receipt.json",
+    )
     _atomic_json(trusted_source / "runtime-capability.json", _runtime_capability(task_digest))
     bundle = install_trusted_bundle(
         workdir=workdir,
@@ -425,6 +495,7 @@ def _ensure_baseline(
             "harbor_controls": controls["report_digest"],
             "harbor_model_matrix": matrix["receipt_digest"],
             "screening": screening["report_digest"],
+            "static_authoring": static_receipt["receipt_digest"],
             "trace_manifest": trace["manifest_digest"],
         },
     )
@@ -433,6 +504,7 @@ def _ensure_baseline(
         "control_report_digest": controls["report_digest"],
         "matrix_receipt_digest": matrix["receipt_digest"],
         "screening_report_digest": screening["report_digest"],
+        "static_receipt_digest": static_receipt["receipt_digest"],
         "trace_manifest_digest": trace["manifest_digest"],
         "trusted_bundle_digest": bundle["bundle_digest"],
         "observed_usage": _usage_summary(matrix),
@@ -518,10 +590,20 @@ def _ensure_difficulty(
         preregistration_digest = preregistration["preregistration_digest"]
     evidence_map: dict[str, dict[str, str]] = {}
     observed = []
+    variant_static_receipts: dict[str, str] = {}
     for variant in manifest["variants"]:
         variant_id = variant["variant_id"]
         task = variants_root / variant["relative_path"]
         root = evidence_root / "difficulty" / "variants" / variant_id
+        static_receipt, quarantine = _static_gate(
+            task,
+            workdir=workdir,
+            out=root / "static-gate",
+            label=f"variant:{variant_id}",
+        )
+        if quarantine is not None:
+            raise FactoryStaticGateBlocked(quarantine)
+        variant_static_receipts[variant_id] = static_receipt["receipt_digest"]
         controls = harbor_launcher.launch_controls(
             task,
             harbor_executable=harbor_executable,
@@ -588,6 +670,7 @@ def _ensure_difficulty(
     return {
         "variant_manifest_digest": manifest["manifest_digest"],
         "variant_count": len(manifest["variants"]),
+        "variant_static_receipts": variant_static_receipts,
         "difficulty_receipt_digest": receipt["receipt_digest"],
         "decision": receipt["decision"],
         "evidence_level": receipt["evidence_level"],
@@ -724,6 +807,14 @@ def run(
             state = _write_state(state_path, state)
         environments = {"claude-code": dict(provider_env)}
         executables = {"claude-code": str(claude_binding["path"])}
+        if (
+            state.get("status") == "quarantined"
+            and isinstance(state.get("quarantine"), Mapping)
+            and state["quarantine"].get("reason") == "static-gate-blocked"
+        ):
+            # The blocking task tree belongs to an immutable completed stage;
+            # rerunning cannot change the deterministic gate result.
+            return dict(state)
         for _ in range(128):
             _validate_barriers(state, workspace)
             factory_run, _ = agentic_factory.initialise(
@@ -745,41 +836,47 @@ def run(
             if not ready:
                 raise FactoryAutopilotError("active factory has no ready stage")
             next_stage = ready[0]
-            if next_stage == "runtime-controls" and "baseline" not in state["barriers"]:
-                state["barriers"]["baseline"] = _ensure_baseline(
-                    plan=checked,
-                    workdir=workspace,
-                    evidence_root=root,
-                    harbor_executable=harbor_binding["path"],
-                    claude_executable=claude_binding["path"],
-                    models=models,
-                    repetitions=repetitions,
-                    provider_env=provider_env,
-                    max_budget_usd=max_budget_usd,
-                    max_turns=max_turns,
-                    harbor_timeout_sec=harbor_timeout_sec,
-                    max_job_attempts=max_job_attempts,
-                )
+            try:
+                if next_stage == "runtime-controls" and "baseline" not in state["barriers"]:
+                    state["barriers"]["baseline"] = _ensure_baseline(
+                        plan=checked,
+                        workdir=workspace,
+                        evidence_root=root,
+                        harbor_executable=harbor_binding["path"],
+                        claude_executable=claude_binding["path"],
+                        models=models,
+                        repetitions=repetitions,
+                        provider_env=provider_env,
+                        max_budget_usd=max_budget_usd,
+                        max_turns=max_turns,
+                        harbor_timeout_sec=harbor_timeout_sec,
+                        max_job_attempts=max_job_attempts,
+                    )
+                    state = _write_state(state_path, state)
+                if next_stage == "calibration" and "difficulty" not in state["barriers"]:
+                    state["barriers"]["difficulty"] = _ensure_difficulty(
+                        plan=checked,
+                        workdir=workspace,
+                        evidence_root=root,
+                        harbor_executable=harbor_binding["path"],
+                        claude_executable=claude_binding["path"],
+                        frontier_model=models[0],
+                        weak_model=models[1],
+                        repetitions=repetitions,
+                        provider_env=provider_env,
+                        max_budget_usd=max_budget_usd,
+                        max_turns=max_turns,
+                        harbor_timeout_sec=harbor_timeout_sec,
+                        max_variants=max_variants,
+                        held_out=held_out,
+                        max_job_attempts=max_job_attempts,
+                    )
+                    state = _write_state(state_path, state)
+            except FactoryStaticGateBlocked as blocked:
+                state["status"] = "quarantined"
+                state["quarantine"] = blocked.quarantine
                 state = _write_state(state_path, state)
-            if next_stage == "calibration" and "difficulty" not in state["barriers"]:
-                state["barriers"]["difficulty"] = _ensure_difficulty(
-                    plan=checked,
-                    workdir=workspace,
-                    evidence_root=root,
-                    harbor_executable=harbor_binding["path"],
-                    claude_executable=claude_binding["path"],
-                    frontier_model=models[0],
-                    weak_model=models[1],
-                    repetitions=repetitions,
-                    provider_env=provider_env,
-                    max_budget_usd=max_budget_usd,
-                    max_turns=max_turns,
-                    harbor_timeout_sec=harbor_timeout_sec,
-                    max_variants=max_variants,
-                    held_out=held_out,
-                    max_job_attempts=max_job_attempts,
-                )
-                state = _write_state(state_path, state)
+                return dict(state)
             result = agentic_factory.run_factory(
                 checked,
                 workdir=workspace,
