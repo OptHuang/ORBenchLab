@@ -207,7 +207,8 @@ def test_batch_liability_ledger_is_exact_and_persisted(tmp_path: Path, monkeypat
     spec = _spec(candidates)
     monkeypatch.setattr(factory_batch.factory_blueprints, "prepare_workspace", lambda **k: (_ for _ in ()).throw(RuntimeError("stop")))
     reference = factory_batch._reference_plan_liability(spec)
-    # 1 candidate: exact plan liability + Harbor (1+3)*2*5*0.5*2=40 + promotion 5.
+    # 1 candidate: exact plan liability + Harbor (1+3)*2*5*0.5*2=40 + promotion
+    # review = 2 reviewers x 5.0 per-session budget.
     state = factory_batch.run_batch(
         spec=spec,
         out=tmp_path / "batch",
@@ -220,8 +221,8 @@ def test_batch_liability_ledger_is_exact_and_persisted(tmp_path: Path, monkeypat
     per = state["liability"]["per_candidate"]
     assert per["semantic_plan_usd"] == reference
     assert per["harbor_usd"] == 40.0
-    assert per["promotion_review_usd"] == 5.0
-    assert per["total_usd"] == round(reference + 40.0 + 5.0, 6)
+    assert per["promotion_review_usd"] == 10.0
+    assert per["total_usd"] == round(reference + 40.0 + 10.0, 6)
     ledger = json.loads((tmp_path / "batch" / "batch-ledger.json").read_text())
     assert ledger["worst_case_total_usd"] == per["total_usd"]
     assert ledger["admitted"] == ["alpha"]

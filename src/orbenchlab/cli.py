@@ -460,7 +460,12 @@ def _add_agent_factory(sub: argparse._SubParsersAction) -> None:
     batch.add_argument("--max-job-attempts", type=int, default=2)
     batch.add_argument("--max-harbor-liability-usd-per-candidate", type=float, default=40.0)
     batch.add_argument("--max-total-liability-usd", type=float, default=200.0)
-    batch.add_argument("--max-promotion-review-usd", type=float, default=5.0)
+    batch.add_argument(
+        "--max-promotion-review-usd",
+        type=float,
+        default=None,
+        help="per-reviewer promotion session budget (defaults to --max-budget-usd)",
+    )
     batch.add_argument("--max-candidates", type=int)
     batch.add_argument("--max-parallel", type=int, default=1)
     batch.add_argument("--held-out", action="store_true")

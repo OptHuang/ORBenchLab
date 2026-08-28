@@ -1114,7 +1114,9 @@ def run(
                         out=root / "promotion",
                         provider_env=provider_env,
                         state=state,
+                        review_executable=claude_binding["path"],
                         review_timeout_sec=promotion_review_timeout_sec,
+                        review_max_budget_usd=max_budget_usd,
                         max_review_tokens=promotion_max_review_tokens,
                     )
                     state["promotion"] = {

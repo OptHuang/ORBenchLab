@@ -281,47 +281,42 @@ def _runtime_evidence(evidence_root: Path, task: Path) -> None:
     )
 
 
-def _fake_semantic_review(monkeypatch) -> None:
-    def fake_process(target, args, *, timeout_sec):
-        task, paper_path, static_json, output, _env, models, _timeout, _tokens = args
-        static = json.loads(Path(static_json).read_text(encoding="utf-8"))
-        paper = json.loads(
-            (Path(task) / "paper-provenance.json").read_text(encoding="utf-8")
-        )
-        reviewers = [
-            {
-                "model": model,
-                "review": {
-                    "decision": "promising",
-                    "shape_complete": True,
-                    "rubric_complete": True,
-                    "criteria": [
-                        {"name": name, "status": "pass", "evidence": "inspected"}
-                        for name in sorted(REQUIRED_REVIEW_CRITERIA)
-                    ],
-                },
-            }
-            for model in models
-        ]
-        review = {
-            "schema_version": "orbenchlab.volc-authoring-review.v1",
-            "task_tree_digest": task_authoring._task_tree_digest(Path(task)),
-            "static_receipt_digest": static["receipt_digest"],
-            "paper_digest": paper["source_content_digest"],
-            "aggregate_decision": "promising-needs-harbor",
-            "models": list(models),
-            "review_count": len(models),
-            "reviewers": reviewers,
-        }
-        review["review_digest"] = _value_digest(review)
-        out_dir = Path(output)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "volc-authoring-review.json").write_text(
-            json.dumps(review, indent=2, sort_keys=True), encoding="utf-8"
-        )
-        return None
+import pytest as _pytest
 
-    monkeypatch.setattr(factory_supervisor, "_run_builtin_process", fake_process)
+
+def _review_cli(tmp_path: Path, *, decision: str = "promising") -> Path:
+    """Fake reviewer CLI: writes a strict review.json with the 7 criteria.
+
+    The intervention/review sandbox mounts a private tmpfs over /tmp, so the
+    executable must live outside it to be visible inside bwrap.
+    """
+
+    import uuid as _uuid
+
+    bin_root = Path("/var/tmp") / f"orbench-review-{_uuid.uuid4().hex}"
+    bin_root.mkdir(parents=True, exist_ok=True)
+    executable = bin_root / "review-claude"
+    criteria = sorted(REQUIRED_REVIEW_CRITERIA)
+    executable.write_text(
+        f"""#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+verdict = {{
+    "decision": {decision!r},
+    "shape_complete": True,
+    "rubric_complete": True,
+    "criteria": [
+        {{"name": name, "status": "pass", "evidence": "inspected " + name}}
+        for name in {criteria!r}
+    ],
+}}
+open("review.json", "w", encoding="utf-8").write(json.dumps(verdict))
+print(json.dumps({{"type": "result", "subtype": "success", "total_cost_usd": 0.01}}))
+""",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    return executable
 
 
 def _run_semantic_factory(tmp_path: Path) -> tuple[dict, Path, Path]:
@@ -344,7 +339,7 @@ def test_promotion_runs_all_gates_and_writes_final_report(tmp_path: Path, monkey
     plan, workdir, factory_out = _run_semantic_factory(tmp_path)
     evidence_root = tmp_path / "autopilot"
     _runtime_evidence(evidence_root, workdir / SELECTED)
-    _fake_semantic_review(monkeypatch)
+    review_cli = _review_cli(tmp_path)
     state = {
         "barriers": {
             "baseline": {"observed_usage": {"cost_usd": 1.25, "n_output_tokens": 100}}
@@ -358,6 +353,7 @@ def test_promotion_runs_all_gates_and_writes_final_report(tmp_path: Path, monkey
         out=evidence_root / "promotion",
         provider_env=PROVIDER,
         state=state,
+        review_executable=review_cli,
     )
     assert summary["promoted"] is True
     assert summary["decision"] == "eligible-for-human-release-review"
@@ -390,6 +386,7 @@ def test_promotion_runs_all_gates_and_writes_final_report(tmp_path: Path, monkey
         out=evidence_root / "promotion",
         provider_env=PROVIDER,
         state=state,
+        review_executable=review_cli,
     )
     assert again["promoted"] is True
     assert again["promotion_digest"] == summary["promotion_digest"]
@@ -401,7 +398,7 @@ def test_promotion_without_matching_runtime_evidence_blocks_explicitly(
     plan, workdir, factory_out = _run_semantic_factory(tmp_path)
     evidence_root = tmp_path / "autopilot"
     evidence_root.mkdir()
-    _fake_semantic_review(monkeypatch)
+    review_cli = _review_cli(tmp_path)
     summary = factory_promotion.run_promotion(
         plan=plan,
         workdir=workdir,
@@ -410,6 +407,7 @@ def test_promotion_without_matching_runtime_evidence_blocks_explicitly(
         out=evidence_root / "promotion",
         provider_env=PROVIDER,
         state={},
+        review_executable=review_cli,
     )
     assert summary["promoted"] is False
     assert summary["gates"]["runtime_evidence"]["reason"] == "promotion_evidence_missing"
@@ -420,11 +418,8 @@ def test_promotion_never_promotes_a_blocked_semantic_review(tmp_path: Path, monk
     plan, workdir, factory_out = _run_semantic_factory(tmp_path)
     evidence_root = tmp_path / "autopilot"
     _runtime_evidence(evidence_root, workdir / SELECTED)
-
-    def blocked_process(target, args, *, timeout_sec):
-        return "builtin_nonzero_exit"
-
-    monkeypatch.setattr(factory_supervisor, "_run_builtin_process", blocked_process)
+    # A reviewer that emits a non-promising verdict must block promotion.
+    review_cli = _review_cli(tmp_path, decision="revise")
     summary = factory_promotion.run_promotion(
         plan=plan,
         workdir=workdir,
@@ -433,6 +428,44 @@ def test_promotion_never_promotes_a_blocked_semantic_review(tmp_path: Path, monk
         out=evidence_root / "promotion",
         provider_env=PROVIDER,
         state={},
+        review_executable=review_cli,
     )
     assert summary["promoted"] is False
-    assert summary["gates"]["semantic_review"]["status"] == "blocked"
+    assert summary["gates"]["semantic_review"]["status"] in {"fail", "blocked"}
+
+
+def test_promotion_never_uses_the_urllib_volc_worker(tmp_path: Path, monkeypatch):
+    # The unattended promotion path must go through CLI agent sessions, never
+    # the legacy raw-HTTP volc worker.
+    from orbenchlab import factory_supervisor, volc_review
+
+    def boom_worker(*args, **kwargs):
+        raise AssertionError("promotion called the raw-HTTP volc worker")
+
+    def boom_review(*args, **kwargs):
+        raise AssertionError("promotion called volc_review.review_task")
+
+    monkeypatch.setattr(factory_supervisor, "_builtin_semantic_worker", boom_worker)
+    monkeypatch.setattr(volc_review, "review_task", boom_review)
+    plan, workdir, factory_out = _run_semantic_factory(tmp_path)
+    evidence_root = tmp_path / "autopilot"
+    _runtime_evidence(evidence_root, workdir / SELECTED)
+    review_cli = _review_cli(tmp_path)
+    summary = factory_promotion.run_promotion(
+        plan=plan,
+        workdir=workdir,
+        factory_out=factory_out,
+        evidence_root=evidence_root,
+        out=evidence_root / "promotion",
+        provider_env=PROVIDER,
+        state={},
+        review_executable=review_cli,
+    )
+    assert summary["promoted"] is True
+    assert summary["semantic_review_mechanism"] == "cli-agent-session"
+    review = json.loads(
+        (evidence_root / "promotion" / "semantic" / "volc-authoring-review.json").read_text()
+    )
+    assert review["review_mechanism"] == "cli-agent-session"
+    assert len(review["session_bindings"]) == 2
+    assert all(b["session_receipt_digest"] for b in review["session_bindings"])

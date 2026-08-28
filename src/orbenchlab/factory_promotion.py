@@ -23,6 +23,7 @@ from typing import Any, Mapping
 from . import (
     agentic_factory,
     factory_finalize,
+    factory_review,
     factory_supervisor,
     harbor_model_matrix,
     pipeline,
@@ -169,7 +170,9 @@ def run_promotion(
     out: str | Path,
     provider_env: Mapping[str, str],
     state: Mapping[str, Any],
+    review_executable: str | Path | None = None,
     review_timeout_sec: float = 600.0,
+    review_max_budget_usd: float = 1.0,
     max_review_tokens: int = 2400,
 ) -> dict[str, Any]:
     """Run or resume the deterministic post-semantic promotion chain."""
@@ -250,11 +253,33 @@ def run_promotion(
         }
 
     semantic_json = root / "semantic" / "volc-authoring-review.json"
-    reviewers = _reviewer_models(checked)
+    reviewers = list(dict.fromkeys(_reviewer_models(checked)))
+    semantic_validator = factory_finalize._semantic_validator(
+        authoring_digest,
+        str(static_receipt.get("receipt_digest") or ""),
+        str(
+            task_authoring._load_document(paper_provenance).get("source_content_digest")
+            or ""
+        ),
+    )
+
+    def revalidate_semantic() -> None:
+        # Never treat the mere presence of the JSON as a pass: promotion runs
+        # the exact finalize validator (digest + binding + full passing rubric)
+        # before showing a pass, on both fresh and resume paths.
+        try:
+            factory_finalize._load(semantic_json)
+            semantic_validator(_load_json(semantic_json))
+            gates["semantic_review"] = {"status": "pass", "receipt": str(semantic_json)}
+        except (factory_finalize.FactoryFinalizeError, FactoryPromotionError, ValueError, KeyError, TypeError) as exc:
+            gates["semantic_review"] = {
+                "status": "fail",
+                "reason": f"semantic_review_revalidation_failed:{type(exc).__name__}",
+                "receipt": str(semantic_json),
+            }
+
     if semantic_json.is_file():
-        # Resume path: the receipt bytes are reused verbatim, so the gate row
-        # is identical to a fresh pass and the promotion digest stays stable.
-        gates["semantic_review"] = {"status": "pass", "receipt": str(semantic_json)}
+        revalidate_semantic()
     elif gates["static"]["status"] != "pass":
         gates["semantic_review"] = {
             "status": "blocked",
@@ -272,36 +297,43 @@ def run_promotion(
             "status": "blocked",
             "reason": "provider_env_missing",
         }
+    elif not review_executable:
+        gates["semantic_review"] = {
+            "status": "blocked",
+            "reason": "review_executable_unavailable",
+        }
     else:
-        failure = factory_supervisor._run_builtin_process(
-            factory_supervisor._builtin_semantic_worker,
-            (
-                str(task),
-                str(paper_provenance),
-                str(static_json),
-                str(root / "semantic"),
-                dict(provider_env),
-                list(dict.fromkeys(reviewers)),
-                max(1, int(review_timeout_sec)),
-                int(max_review_tokens),
-            ),
-            timeout_sec=review_timeout_sec,
-        )
-        if failure is None and semantic_json.is_file():
-            gates["semantic_review"] = {
-                "status": "pass",
-                "receipt": str(semantic_json),
-            }
-        else:
+        try:
+            review = factory_review.review_task_via_sessions(
+                task,
+                paper_provenance_path=paper_provenance,
+                static_receipt_path=static_json,
+                models=reviewers,
+                provider_env=provider_env,
+                out=root / "semantic",
+                max_budget_usd=review_max_budget_usd,
+                timeout_sec=review_timeout_sec,
+                executable=review_executable,
+            )
+            factory_review.write_review(review, root / "semantic")
+            revalidate_semantic()
+        except (factory_review.FactoryReviewError, agentic_factory.AgenticFactoryError) as exc:
             gates["semantic_review"] = {
                 "status": "blocked",
-                "reason": failure or "expected_receipt_missing",
+                "reason": f"review_session_failed:{type(exc).__name__}",
             }
     if semantic_json.is_file():
+        review_doc = _load_json(semantic_json)
         gates["semantic_review"]["receipt_digest"] = _file_digest(semantic_json)
-        gates["semantic_review"]["aggregate_decision"] = _load_json(semantic_json).get(
+        gates["semantic_review"]["aggregate_decision"] = review_doc.get(
             "aggregate_decision"
         )
+        gates["semantic_review"]["review_mechanism"] = review_doc.get("review_mechanism")
+        gates["semantic_review"]["session_receipt_digests"] = [
+            row.get("session_receipt_digest")
+            for row in review_doc.get("session_bindings", [])
+            if isinstance(row, Mapping)
+        ]
 
     cards_json = root / "cards" / "task-cards.json"
     screening_inputs = [
@@ -361,6 +393,10 @@ def run_promotion(
         "runtime_task_tree_digest": runtime_digest,
         "authoring_task_tree_digest": authoring_digest,
         "reviewer_models": reviewers,
+        "semantic_review_mechanism": "cli-agent-session",
+        "semantic_review_liability_usd": round(
+            len(reviewers) * float(review_max_budget_usd), 6
+        ),
         "gates": gates,
         "promoted": bool(final.get("promoted")),
         "decision": final.get("decision"),

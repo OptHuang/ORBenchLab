@@ -146,6 +146,11 @@ def _reference_plan_liability(spec: Mapping[str, Any]) -> float:
     return float(plan["maximum_model_liability_usd"])
 
 
+def _reviewer_count(spec: Mapping[str, Any]) -> int:
+    reviewers = spec["models"]["reviewer_models"]
+    return len({str(model) for model in reviewers})
+
+
 def _candidate_liability(
     *,
     reference_semantic_usd: float,
@@ -153,6 +158,8 @@ def _candidate_liability(
     promotion_review_usd: float,
     promote: bool,
 ) -> dict[str, Any]:
+    # promotion_review_usd is already the exact reviewers x per-session budget
+    # (each promotion reviewer runs one CLI session with a hard --max-budget-usd).
     promotion = promotion_review_usd if promote else 0.0
     total = round(reference_semantic_usd + per_candidate_harbor_usd + promotion, 6)
     return {
@@ -324,7 +331,7 @@ def run_batch(
     max_job_attempts: int = 2,
     max_harbor_liability_usd_per_candidate: float = 40.0,
     max_total_liability_usd: float = 200.0,
-    max_promotion_review_usd: float = 5.0,
+    max_promotion_review_usd: float | None = None,
     max_candidates: int | None = None,
     max_parallel: int = 1,
     held_out: bool = False,
@@ -334,7 +341,7 @@ def run_batch(
 
     if max_parallel < 1 or max_parallel > 8:
         raise FactoryBatchError("max_parallel must be in 1..8")
-    if max_promotion_review_usd < 0:
+    if max_promotion_review_usd is not None and max_promotion_review_usd < 0:
         raise FactoryBatchError("max_promotion_review_usd must be non-negative")
     root = Path(out).resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -415,10 +422,19 @@ def _run_batch_locked(
             "per-candidate Harbor liability exceeds its configured cap"
         )
     reference_semantic = _reference_plan_liability(spec)
+    # Exact promotion-review liability: one CLI session per distinct reviewer,
+    # each carrying the same hard --max-budget-usd the autopilot passes to the
+    # review session (equal to the per-trial budget).
+    review_budget = (
+        max_promotion_review_usd
+        if max_promotion_review_usd is not None
+        else max_budget_usd
+    )
+    promotion_review_usd = round(_reviewer_count(spec) * float(review_budget), 6)
     per_candidate = _candidate_liability(
         reference_semantic_usd=reference_semantic,
         per_candidate_harbor_usd=per_candidate_harbor,
-        promotion_review_usd=max_promotion_review_usd,
+        promotion_review_usd=promotion_review_usd,
         promote=promote,
     )
     total_liability = round(len(promising) * per_candidate["total_usd"], 6)

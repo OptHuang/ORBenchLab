@@ -51,6 +51,18 @@ from pathlib import Path
 
 envelope = json.loads(sys.stdin.readline())
 prompt = envelope["message"]["content"]
+if "Terminal-Bench Science task reviewer" in prompt:
+    # Promotion semantic review runs as a least-visibility CLI session; emit a
+    # strict passing verdict with all seven proposal criteria.
+    criteria = ["difficult", "outcome_verified", "scientifically_grounded",
+                "scope", "solvable", "verifiable", "well_specified"]
+    verdict = {"decision": "promising", "shape_complete": True,
+               "rubric_complete": True,
+               "criteria": [{"name": n, "status": "pass", "evidence": "inspected " + n}
+                            for n in criteria]}
+    Path("review.json").write_text(json.dumps(verdict), encoding="utf-8")
+    print(json.dumps({"type": "result", "subtype": "success", "total_cost_usd": 0.01}))
+    raise SystemExit(0)
 contract = json.loads(prompt.split("ORBENCH_FACTORY_CONTRACT\\n", 1)[1])
 stage = contract["stage_id"]
 trusted = contract.get("trusted_json_digest_values", {})
@@ -387,7 +399,6 @@ def test_paper_to_promoted_task_card_without_human_steps(
         weak_model="weak",
     )
     agentic_factory.write_plan(plan, e2e_bin / "plan.json")
-    _fake_semantic_review(monkeypatch)
     state = factory_autopilot.run(
         plan,
         workdir=workdir,
