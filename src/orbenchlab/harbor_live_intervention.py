@@ -54,6 +54,80 @@ CONTROL_CONTRACT = "claude-stream-json-interrupt-ack-result-hint-v1"
 _MAX_EVENTS = 20000
 _MAX_JOURNAL_BYTES = 64 * 1024 * 1024
 
+# Built-in tools that must be OFF: the agent may act only through the container
+# MCP proxy, never on the host and never with host network egress.
+_DISABLED_BUILTIN_TOOLS = ("Bash", "Read", "Write", "Edit", "WebFetch", "WebSearch", "NotebookEdit", "Task")
+# Safe host env passed to the Claude child. The provider credential is NEVER
+# here: only the loopback relay route + a revocable scoped token reach the child.
+_SAFE_HOST_ENV = ("HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR", "CLAUDE_CONFIG_DIR")
+
+
+def build_claude_live_command(
+    *,
+    claude_executable: str | Path,
+    model: str,
+    max_budget_usd: float,
+    max_turns: int,
+    mcp_config_path: str | Path,
+    proxy_server_name: str,
+    proxy_tool_names: Sequence[str],
+    relay_route: str,
+    relay_token: str,
+    host_env: Mapping[str, str] | None = None,
+    claude_config_dir: str | Path | None = None,
+) -> tuple[list[str], dict[str, str]]:
+    """Build the credential-safe Claude stream-json argv and child env.
+
+    - Built-in Bash/Read/Write/Edit/Web tools are disabled; the only allowed
+      tools are the container MCP proxy's ``mcp__<server>__<tool>`` names, so
+      the agent acts only inside the no-network task container.
+    - The real provider credential is never placed in argv or env: the child
+      receives only the loopback relay route and a revocable scoped token, so a
+      leak scan of argv/env/proc finds no secret.
+    """
+
+    if not model.strip() or not 0 < float(max_budget_usd) <= 100 or int(max_turns) < 1:
+        raise LiveInterventionError("model, budget and max_turns must be valid")
+    if not relay_route.startswith("http://") and not relay_route.startswith("https://"):
+        raise LiveInterventionError("relay route must be an http(s) URL")
+    if not relay_token:
+        raise LiveInterventionError("a scoped relay token is required")
+    if not proxy_tool_names:
+        raise LiveInterventionError("at least one proxy tool must be exposed")
+    allowed = ",".join(f"mcp__{proxy_server_name}__{tool}" for tool in proxy_tool_names)
+    argv = [
+        str(claude_executable),
+        "--print",
+        "--verbose",
+        "--input-format=stream-json",
+        "--output-format=stream-json",
+        "--replay-user-messages",
+        "--permission-mode=bypassPermissions",
+        "--max-turns",
+        str(int(max_turns)),
+        "--max-budget-usd",
+        format(float(max_budget_usd), ".12g"),
+        "--strict-mcp-config",
+        "--mcp-config",
+        str(mcp_config_path),
+        "--tools",
+        allowed,
+        "--allowedTools",
+        allowed,
+        "--disallowedTools",
+        ",".join(_DISABLED_BUILTIN_TOOLS),
+        "--model",
+        model.strip(),
+    ]
+    source_env = host_env if host_env is not None else os.environ
+    child: dict[str, str] = {name: source_env[name] for name in _SAFE_HOST_ENV if name in source_env}
+    if claude_config_dir is not None:
+        child["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
+    # Only the relay route + scoped token — never the real ANTHROPIC/ARK secret.
+    child["ANTHROPIC_BASE_URL"] = relay_route
+    child["ANTHROPIC_AUTH_TOKEN"] = relay_token
+    return argv, child
+
 
 def _digest_bytes(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
@@ -653,5 +727,6 @@ __all__ = [
     "LIVE_SCHEMA_VERSION",
     "LiveInterventionError",
     "Trigger",
+    "build_claude_live_command",
     "run_live_intervention",
 ]
