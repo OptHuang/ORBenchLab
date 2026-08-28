@@ -87,36 +87,61 @@ def _ctrf_summary(path: Path) -> dict[str, int]:
     return counts
 
 
-def _validate_model_job(
+def _job_trials(
     job_dir: Path,
     *,
     task_id: str,
     model: str,
-    repetitions: int,
-) -> list[dict[str, Any]]:
+    requested: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Validate one Harbor job trial-by-trial.
+
+    Returns ``(valid_rows, excluded_rows)``.  A trial whose verifier evidence
+    is *absent* (no CTRF or no reward — a setup crash or verifier timeout left
+    no conclusive grade) is excluded as inconclusive and disclosed, so one
+    such trial no longer discards its four completed siblings.  Evidence that
+    is *present but inconsistent* stays a hard error: that is corruption, not
+    an infrastructure gap.
+    """
+
     job_result_path = job_dir / "result.json"
     job_result = _load_json(job_result_path)
     stats = job_result.get("stats")
     if (
-        job_result.get("n_total_trials") != repetitions
+        job_result.get("n_total_trials") != requested
         or not isinstance(stats, Mapping)
-        or stats.get("n_completed_trials") != repetitions
-        or not isinstance(stats.get("n_errored_trials"), int)
-        or not 0 <= int(stats["n_errored_trials"]) <= repetitions
+        or not isinstance(stats.get("n_completed_trials"), int)
     ):
-        raise HarborModelMatrixError("Harbor model job is not a complete repeated rectangle")
-    trials = sorted(
-        path.parent.parent
-        for path in job_dir.glob("*/verifier/ctrf.json")
-        if path.is_file() and not path.is_symlink()
+        raise HarborModelMatrixError("Harbor model job result does not match its request")
+    trial_dirs = sorted(
+        path.parent
+        for path in job_dir.glob("*/result.json")
+        if path.is_file() and not path.is_symlink() and path.parent.parent == job_dir
     )
-    if len(trials) != repetitions or len(set(trials)) != repetitions:
-        raise HarborModelMatrixError("Harbor model job has missing or duplicate completed trials")
+    if len(trial_dirs) > requested:
+        raise HarborModelMatrixError("Harbor model job contains surplus trials")
     rows: list[dict[str, Any]] = []
-    for attempt, trial in enumerate(trials, start=1):
+    excluded: list[dict[str, Any]] = []
+    for trial in trial_dirs:
         result_path = trial / "result.json"
         reward_path = trial / "verifier" / "reward.txt"
         ctrf_path = trial / "verifier" / "ctrf.json"
+        if (
+            not reward_path.is_file()
+            or reward_path.is_symlink()
+            or not ctrf_path.is_file()
+            or ctrf_path.is_symlink()
+        ):
+            excluded.append(
+                {
+                    "job_name": job_dir.name,
+                    "trial_name": trial.name,
+                    "model_id": model,
+                    "reason": "inconclusive-no-verifier-evidence",
+                    "trial_result_digest": _file_digest(result_path),
+                }
+            )
+            continue
         result = _load_json(result_path)
         exception = result.get("exception_info")
         if exception is not None and not isinstance(exception, Mapping):
@@ -172,11 +197,10 @@ def _validate_model_job(
                         "job_result_digest": _file_digest(job_result_path),
                         "trial_result_digest": _file_digest(result_path),
                         "model": model,
-                        "attempt": attempt,
+                        "trial_name": trial.name,
                     }
                 ),
                 "model_id": model,
-                "attempt": attempt,
                 "status": "pass" if reward == 1.0 else "fail",
                 "agent_failure_class": (
                     str(exception.get("exception_type") or "AgentError")
@@ -185,6 +209,7 @@ def _validate_model_job(
                 ),
                 "usage": usage,
                 "reward": reward,
+                "job_name": job_dir.name,
                 "trial_name": trial.name,
                 "trial_result_digest": _file_digest(result_path),
                 "reward_digest": _file_digest(reward_path),
@@ -193,7 +218,7 @@ def _validate_model_job(
                 "trajectories": trace_rows,
             }
         )
-    return rows
+    return rows, excluded
 
 
 def _next_job(jobs: Path, *, task_id: str, model: str) -> tuple[str, int]:
@@ -269,22 +294,49 @@ def _reserve_job(
         return job_name, attempt, reservation
 
 
-def _valid_job(
-    jobs: Path,
-    *,
-    task_id: str,
-    model: str,
-    repetitions: int,
-) -> tuple[Path, list[dict[str, Any]]] | None:
+def _existing_jobs(jobs: Path, *, task_id: str, model: str) -> list[Path]:
     prefix = f"{task_id}-{_model_key(model)}-attempt-"
-    for job in sorted(jobs.glob(prefix + "*"), reverse=True):
-        try:
-            return job, _validate_model_job(
-                job, task_id=task_id, model=model, repetitions=repetitions
-            )
-        except HarborModelMatrixError:
-            continue
-    return None
+    return sorted(
+        path
+        for path in jobs.glob(prefix + "*")
+        if path.is_dir()
+        and not path.is_symlink()
+        and (path / "result.json").is_file()
+    )
+
+
+def _validated_reservation(
+    root: Path,
+    job: Path,
+    *,
+    task_digest: str,
+    model: str,
+    max_budget_usd: float,
+    max_turns: int,
+    route_digest: str,
+    preregistration_digest: str | None,
+) -> dict[str, Any]:
+    reservation_path = root / "reservations" / f"{job.name}.json"
+    reservation = _load_json(reservation_path)
+    unsigned = {
+        key: value for key, value in reservation.items() if key != "reservation_digest"
+    }
+    requested = reservation.get("repetitions")
+    if (
+        reservation.get("reservation_digest") != _digest(unsigned)
+        or reservation.get("job_name") != job.name
+        or reservation.get("task_tree_digest") != task_digest
+        or reservation.get("model_id") != model
+        or not isinstance(requested, int)
+        or isinstance(requested, bool)
+        or requested < 1
+        or reservation.get("max_budget_usd_per_trial") != max_budget_usd
+        or reservation.get("max_turns_per_trial") != max_turns
+        or reservation.get("provider_route_digest") != route_digest
+        or reservation.get("preregistration_digest") != preregistration_digest
+    ):
+        raise HarborModelMatrixError("Harbor job reservation is missing or malformed")
+    return dict(reservation)
 
 
 def launch_matrix(
@@ -345,17 +397,52 @@ def launch_matrix(
         for name, value in provider_env.items()
         if ("KEY" in name.upper() or "TOKEN" in name.upper()) and str(value)
     )
+    excluded_trials: list[dict[str, Any]] = []
+    surplus_trials = 0
     for model in selected:
-        reusable = _valid_job(
-            jobs, task_id=task_id, model=model, repetitions=repetitions
-        )
-        if reusable is None:
+        valid: list[dict[str, Any]] = []
+
+        def consume_job(job: Path, requested: int, reservation: Mapping[str, Any]) -> None:
+            rows, skipped = _job_trials(
+                job, task_id=task_id, model=model, requested=requested
+            )
+            valid.extend(rows)
+            excluded_trials.extend(skipped)
+            job_rows.append(
+                {
+                    "model_id": model,
+                    "job_name": job.name,
+                    "job_result_digest": _file_digest(job / "result.json"),
+                    "reservation_digest": reservation["reservation_digest"],
+                    "requested_trials": requested,
+                    "valid_trials": len(rows),
+                    "excluded_trials": len(skipped),
+                }
+            )
+
+        # Confirmed trials from earlier (possibly partial) jobs are never
+        # re-bought: every existing job is consumed against its reservation
+        # before any new liability is reserved.
+        for job in _existing_jobs(jobs, task_id=task_id, model=model):
+            reservation = _validated_reservation(
+                root,
+                job,
+                task_digest=task_digest,
+                model=model,
+                max_budget_usd=max_budget_usd,
+                max_turns=max_turns,
+                route_digest=route_digest,
+                preregistration_digest=preregistration_digest,
+            )
+            consume_job(job, int(reservation["repetitions"]), reservation)
+        while len(valid) < repetitions:
+            missing = repetitions - len(valid)
             job_name, attempt, reservation = _reserve_job(
                 root,
                 task_id=task_id,
                 task_tree_digest=task_digest,
                 model=model,
-                repetitions=repetitions,
+                repetitions=missing,
                 max_budget_usd=max_budget_usd,
                 max_turns=max_turns,
                 provider_route_digest=route_digest,
@@ -394,7 +481,7 @@ def launch_matrix(
                     "--job-name",
                     job_name,
                     "--n-attempts",
-                    str(repetitions),
+                    str(missing),
                     "--n-concurrent",
                     "1",
                     "--max-retries",
@@ -409,38 +496,14 @@ def launch_matrix(
                 extra_env=child_env,
                 secret_values=secrets,
             )
-            job = jobs / job_name
-            trials = _validate_model_job(
-                job, task_id=task_id, model=model, repetitions=repetitions
-            )
-        else:
-            job, trials = reusable
-            reservation_path = root / "reservations" / f"{job.name}.json"
-            reservation = _load_json(reservation_path)
-            unsigned_reservation = {
-                key: value for key, value in reservation.items() if key != "reservation_digest"
-            }
-            if (
-                reservation.get("reservation_digest") != _digest(unsigned_reservation)
-                or reservation.get("job_name") != job.name
-                or reservation.get("task_tree_digest") != task_digest
-                or reservation.get("model_id") != model
-                or reservation.get("repetitions") != repetitions
-                or reservation.get("max_budget_usd_per_trial") != max_budget_usd
-                or reservation.get("max_turns_per_trial") != max_turns
-                or reservation.get("provider_route_digest") != route_digest
-                or reservation.get("preregistration_digest") != preregistration_digest
-            ):
-                raise HarborModelMatrixError("reused Harbor job reservation is malformed")
-        all_trials.extend(trials)
-        job_rows.append(
-            {
-                "model_id": model,
-                "job_name": job.name,
-                "job_result_digest": _file_digest(job / "result.json"),
-                "reservation_digest": reservation["reservation_digest"],
-            }
-        )
+            consume_job(jobs / job_name, missing, reservation)
+        # Deterministic order and stable renumbering; a resumed run that finds
+        # more than ``repetitions`` valid trials keeps the earliest ones and
+        # discloses the surplus rather than silently changing the rectangle.
+        valid.sort(key=lambda row: (row["job_name"], row["trial_name"]))
+        surplus_trials += max(0, len(valid) - repetitions)
+        for attempt_number, row in enumerate(valid[:repetitions], start=1):
+            all_trials.append({**row, "attempt": attempt_number})
     receipt: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "task": task_id,
@@ -449,6 +512,8 @@ def launch_matrix(
         "repetitions": repetitions,
         "rectangular": len(all_trials) == len(selected) * repetitions,
         "trials": all_trials,
+        "excluded_trials": excluded_trials,
+        "surplus_valid_trials": surplus_trials,
         "jobs": job_rows,
         "provider_route_digest": route_digest,
         "preregistration_digest": preregistration_digest,
@@ -470,6 +535,16 @@ def launch_matrix(
         "limitations": [
             "Verifier-grounded Harbor trajectories; not TB-Science acceptance.",
             "Independent full restarts; no same-checkpoint E4 causal intervention claim.",
+            *(
+                [
+                    f"{len(excluded_trials)} trial(s) had no conclusive verifier evidence "
+                    "and were excluded from the rectangle as inconclusive; exclusions are "
+                    "itemised in excluded_trials and may bias rates if failures correlate "
+                    "with infrastructure loss."
+                ]
+                if excluded_trials
+                else []
+            ),
         ],
     }
     receipt["receipt_digest"] = _digest(receipt)
@@ -511,7 +586,7 @@ def write_trace_bundle(
                 return dict(manifest)
         raise HarborModelMatrixError("refusing to overwrite another trace bundle")
     destination.mkdir(parents=True, exist_ok=True)
-    jobs = {
+    model_jobs = {
         str(row.get("model_id")): str(row.get("job_name"))
         for row in checked["jobs"]
         if isinstance(row, Mapping)
@@ -523,7 +598,7 @@ def write_trace_bundle(
             if not isinstance(trial, Mapping):
                 raise HarborModelMatrixError("matrix trial row is malformed")
             model = str(trial.get("model_id") or "")
-            job_name = jobs.get(model)
+            job_name = str(trial.get("job_name") or "") or model_jobs.get(model)
             trajectories = trial.get("trajectories")
             if not job_name or not isinstance(trajectories, list) or not trajectories:
                 raise HarborModelMatrixError("matrix trial lacks a bound trajectory")
@@ -636,6 +711,7 @@ def build_screening_report(
         repetitions=int(checked["repetitions"]),
     )
     decision = "review-promising" if discrimination["promising"] else "collect-more-evidence"
+    excluded = checked.get("excluded_trials") or []
     task_row = {
         "task": checked["task"],
         "family": checked["task"],
@@ -646,6 +722,7 @@ def build_screening_report(
         "decision": decision,
         "evidence_level": "E3",
         "limitations": list(checked["limitations"]),
+        "excluded_trial_count": len(excluded),
     }
     report: dict[str, Any] = {
         "schema_version": "orbenchlab.screening-report.v1",

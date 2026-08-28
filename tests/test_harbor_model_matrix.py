@@ -244,3 +244,109 @@ def test_cli_runs_real_harbor_matrix_contract(tmp_path: Path, monkeypatch, capsy
     assert payload["evidence_level"] == "E3"
     assert payload["checkpoint_capability"] is False
     assert "fixture-provider-secret" not in json.dumps(payload)
+
+
+def _flaky_harbor(root: Path) -> Path:
+    """First frontier job leaves one trial without verifier evidence."""
+
+    executable = root / "flaky-harbor"
+    marker = root / "flaky-marker"
+    executable.write_text(
+        f"""#!/usr/bin/env python3
+import json, pathlib, sys
+args = sys.argv[1:]
+def value(flag): return args[args.index(flag) + 1]
+model = value('--model')
+repetitions = int(value('--n-attempts'))
+job = pathlib.Path(value('--jobs-dir')) / value('--job-name')
+marker = pathlib.Path({str(marker)!r})
+first_flaky = model == 'frontier' and not marker.exists()
+if first_flaky:
+    marker.write_text('used')
+for attempt in range(1, repetitions + 1):
+    trial = job / ('demo-task__' + value('--job-name')[-3:] + '-' + str(attempt))
+    trial.joinpath('verifier').mkdir(parents=True)
+    trial.joinpath('agent').mkdir(parents=True)
+    incomplete = first_flaky and attempt == repetitions
+    reward = 1.0 if model == 'frontier' else 0.0
+    exception = None if reward else {{'exception_type': 'NonZeroAgentExitCodeError'}}
+    passed = 2 if reward else 0
+    failed = 0 if reward else 2
+    trial.joinpath('result.json').write_text(json.dumps({{
+        'task_name': 'terminal-bench-science/demo-task',
+        'exception_info': {{'exception_type': 'VerifierTimeoutError'}} if incomplete else exception,
+        'agent_result': {{'n_input_tokens': 10, 'n_cache_tokens': 2,
+        'n_output_tokens': 3, 'cost_usd': 0.25}},
+        'verifier_result': None if incomplete else {{'rewards': {{'reward': reward}}}},
+    }}))
+    if incomplete:
+        continue
+    trial.joinpath('verifier/reward.txt').write_text(str(reward) + '\\n')
+    trial.joinpath('verifier/ctrf.json').write_text(json.dumps({{
+        'results': {{'summary': {{'tests': 2, 'passed': passed, 'failed': failed,
+        'skipped': 0, 'pending': 0, 'other': 0}}}}
+    }}))
+    trial.joinpath('agent/trajectory.json').write_text(json.dumps({{
+        'schema_version': 'ATIF-v1.0', 'steps': [{{'step_id': 1}}]
+    }}))
+job.mkdir(parents=True, exist_ok=True)
+job.joinpath('result.json').write_text(json.dumps({{
+    'id': model + '-job', 'n_total_trials': repetitions,
+    'stats': {{'n_completed_trials': repetitions - (1 if first_flaky else 0),
+    'n_errored_trials': 0 if model == 'frontier' else repetitions}}
+}}))
+""",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    return executable
+
+
+def test_inconclusive_trial_is_topped_up_without_rebuying_confirmed_trials(
+    tmp_path: Path,
+):
+    out = tmp_path / "out"
+    receipt = harbor_model_matrix.launch_matrix(
+        _task(tmp_path),
+        harbor_executable=_flaky_harbor(tmp_path),
+        claude_executable=_claude(tmp_path),
+        out=out,
+        models=["frontier", "weak"],
+        repetitions=3,
+        provider_env=PROVIDER,
+        max_budget_usd=0.5,
+        max_turns=10,
+        timeout_sec=10,
+        max_job_attempts=3,
+    )
+    assert receipt["rectangular"] is True
+    assert len(receipt["trials"]) == 6
+    assert len(receipt["excluded_trials"]) == 1
+    assert (
+        receipt["excluded_trials"][0]["reason"] == "inconclusive-no-verifier-evidence"
+    )
+    frontier_jobs = [
+        row for row in receipt["jobs"] if row["model_id"] == "frontier"
+    ]
+    # One partial job (2/3 valid) plus one top-up job of exactly the missing 1.
+    assert [row["requested_trials"] for row in frontier_jobs] == [3, 1]
+    assert [row["valid_trials"] for row in frontier_jobs] == [2, 1]
+    assert any("excluded from the rectangle" in row for row in receipt["limitations"])
+    # A resumed launch re-consumes the same jobs byte-for-byte: same receipt,
+    # no third frontier job, confirmed trials never re-bought.
+    resumed = harbor_model_matrix.launch_matrix(
+        tmp_path / "task",
+        harbor_executable=tmp_path / "flaky-harbor",
+        claude_executable=tmp_path / "claude",
+        out=out,
+        models=["frontier", "weak"],
+        repetitions=3,
+        provider_env=PROVIDER,
+        max_budget_usd=0.5,
+        max_turns=10,
+        timeout_sec=10,
+        max_job_attempts=3,
+    )
+    assert resumed["receipt_digest"] == receipt["receipt_digest"]
+    assert len(list((out / "jobs").glob("demo_task-frontier-*"))) == 2
+    assert len(list((out / "reservations").glob("*.json"))) == 3
