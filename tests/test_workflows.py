@@ -326,6 +326,12 @@ def test_workspace_validator_rejects_checkout_and_descendants(repo_root, tmp_pat
 def test_workspace_validator_allows_a_controlled_absolute_persistent_root(repo_root):
     root = repo_root / f".orbenchlab-durable-test-{uuid.uuid4().hex}"
     try:
+        # Create the root explicitly private so the positive case is
+        # independent of the host account's umask (a collaborative 0002
+        # umask would otherwise produce a group-writable root the validator
+        # correctly rejects).
+        root.mkdir(mode=0o700)
+        root.chmod(0o700)
         result = _validate_run_workspace(repo_root, root)
         assert result.returncode == 0, result.stderr
         expected = (root / "controls").resolve()
