@@ -16,6 +16,7 @@ itself is idempotent.
 
 from __future__ import annotations
 
+import re
 import concurrent.futures
 import fcntl
 import hashlib
@@ -120,9 +121,45 @@ def _provider_paper_binding_dir(spec: Mapping[str, Any]) -> list[dict[str, Any]]
     return candidates
 
 
+def _provider_triaged_intake(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Candidates from a digest-bound daily candidate manifest (P0-E).
+
+    The manifest and every candidate provenance are re-verified before any
+    candidate is yielded, so a tampered receipt is rejected before paid work.
+    """
+
+    from . import source_manifest
+
+    manifest_path = str(spec.get("manifest") or "")
+    if not manifest_path:
+        raise FactoryBatchError("triaged-intake provider requires a manifest path")
+    try:
+        manifest = source_manifest.load_verified_manifest(manifest_path)
+    except source_manifest.CandidateManifestError as exc:
+        raise FactoryBatchError(f"triaged-intake manifest failed verification: {exc}") from None
+    seed = str(spec.get("seed_task") or "")
+    candidates = []
+    for entry in manifest["entries"]:
+        # Source ids (e.g. arXiv 2401.01234) can carry '.'/'_'; normalise to the
+        # candidate-id alphabet [a-z0-9-] deterministically.
+        safe = re.sub(r"[^a-z0-9-]+", "-", str(entry["source_id"]).lower()).strip("-")[:64]
+        candidates.append(
+            {
+                "id": _safe_candidate_id(safe),
+                "paper_file": str(entry["paper_file"]),
+                "paper_provenance": str(entry["paper_provenance"]),
+                "seed_task": seed,
+            }
+        )
+    if not candidates:
+        raise FactoryBatchError("triaged-intake manifest has no candidates")
+    return candidates
+
+
 _PROVIDERS: dict[str, Callable[[Mapping[str, Any]], list[dict[str, Any]]]] = {
     "explicit-list": _provider_explicit_list,
     "paper-binding-dir": _provider_paper_binding_dir,
+    "triaged-intake": _provider_triaged_intake,
 }
 
 
