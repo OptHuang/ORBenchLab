@@ -198,6 +198,7 @@ def review_task_via_sessions(
     max_output_bytes: int = 8 * 1024 * 1024,
     round_number: int = 1,
     executable: str | Path | None = None,
+    credential_relay: bool = False,
 ) -> dict[str, Any]:
     """Run one independent CLI review session per model and aggregate them."""
 
@@ -265,6 +266,7 @@ def review_task_via_sessions(
             executable=executable,
             read_only_paths=read_only,
             allow_bash=False,
+            credential_relay=credential_relay,
         )
         # Snapshot the verdict beside its session receipt as soon as the
         # session completes, so a later crash cannot lose it.

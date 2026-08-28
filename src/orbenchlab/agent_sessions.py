@@ -638,11 +638,21 @@ def run_session(
     read_only_paths: Sequence[str | Path] = (),
     hidden_paths: Sequence[str | Path] = (),
     allow_bash: bool = True,
+    credential_relay: bool = False,
 ) -> dict[str, Any]:
-    """Run or safely reuse one deterministic autonomous-agent session."""
+    """Run or safely reuse one deterministic autonomous-agent session.
+
+    When ``credential_relay`` is set the real provider token never enters the
+    agent's process environment: a host-side, per-session-scoped relay holds the
+    real credential, the child receives only a loopback route and a revocable
+    scoped token, and the session fails closed if the real token is found in any
+    session artifact or process argv after the run.
+    """
 
     if profile not in _PROFILES:
         raise AgentSessionError("profile must be codex or claude-code")
+    if credential_relay and profile != "claude-code":
+        raise AgentSessionError("credential relay transport supports claude-code only")
     if (
         not stage.strip()
         or not model.strip()
@@ -666,11 +676,12 @@ def run_session(
     if not cwd.is_dir() or cwd.is_symlink():
         raise AgentSessionError("workdir must be a real directory")
     child_env, route_digest = _session_env(profile, environ)
-    secret_values = tuple(
-        str(value).encode()
+    secret_strings = tuple(
+        str(value)
         for name, value in environ.items()
         if ("KEY" in name.upper() or "TOKEN" in name.upper()) and str(value)
     )
+    secret_values = tuple(value.encode() for value in secret_strings)
     requested = str(executable or ("codex" if profile == "codex" else "claude"))
     resolved = shutil.which(requested) if not Path(requested).is_absolute() else requested
     if not resolved or not Path(resolved).is_file():
@@ -710,6 +721,9 @@ def run_session(
         ),
         "filesystem_sandbox": filesystem_sandbox,
         "bash_tool_enabled": bool(allow_bash),
+        "credential_transport": (
+            "host-side-relay-per-session-scoped-token" if credential_relay else "direct-provider-env"
+        ),
     }
     session_id = _digest(identity).removeprefix("sha256:")[:32]
     session_dir = output_root / session_id
@@ -723,6 +737,32 @@ def run_session(
             return {**reused, "receipt_path": str(receipt_path), "reused": True}
 
         started = time.monotonic()
+        relay = None
+        relay_scope_digest = None
+        if credential_relay:
+            from . import harbor_credentials
+
+            spec = _PROFILES[profile]
+            relay = harbor_credentials.CredentialRelay(
+                real_base_url=str(environ[spec["route"]]),
+                real_token=str(environ[spec["token"]]),
+                bind_host="127.0.0.1",
+                max_requests=max(8, int(120)),
+            )
+            relay.start()
+            scoped_token = relay.issue_token(
+                {"stage": stage.strip(), "model": model.strip(), "session_id": session_id}
+            )
+            relay_scope_digest = _digest(
+                {"stage": stage.strip(), "model": model.strip(), "session_id": session_id}
+            )
+            # Real token/route leave the child env; only a loopback scoped token remains.
+            child_env = {
+                name: value
+                for name, value in child_env.items()
+                if name not in spec["allowed"]
+            }
+            child_env.update(relay.relay_env(scoped_token))
         live_paths = {
             "stdout": session_dir / "stdout.live",
             "stderr": session_dir / "stderr.live",
@@ -741,15 +781,20 @@ def run_session(
                 stream.write(live_redactors[name].feed(chunk))
                 stream.flush()
 
-            stdout, stderr, exit_code, failure_class = _bounded_process(
-                command,
-                cwd=cwd,
-                env=child_env,
-                stdin=_stdin(profile, prompt),
-                timeout_sec=timeout_sec,
-                max_output_bytes=max_output_bytes,
-                on_chunk=write_live,
-            )
+            try:
+                stdout, stderr, exit_code, failure_class = _bounded_process(
+                    command,
+                    cwd=cwd,
+                    env=child_env,
+                    stdin=_stdin(profile, prompt),
+                    timeout_sec=timeout_sec,
+                    max_output_bytes=max_output_bytes,
+                    on_chunk=write_live,
+                )
+            finally:
+                if relay is not None:
+                    relay.revoke_token(scoped_token)
+                    relay.stop()
             for name, stream in live_streams.items():
                 stream.write(live_redactors[name].feed(b"", final=True))
                 stream.flush()
@@ -764,6 +809,25 @@ def run_session(
                 path.unlink()
             except FileNotFoundError:
                 pass
+        credential_security: dict[str, Any] | None = None
+        if credential_relay:
+            from . import harbor_credentials
+
+            # Fail closed: the real provider token must not survive in any session
+            # artifact or process argv. The barrier never echoes the secret value.
+            harbor_credentials.assert_no_credential_leak(
+                secret_values=list(secret_strings),
+                artifact_roots=[session_dir, cwd],
+                scan_proc=True,
+            )
+            credential_security = {
+                "policy_version": harbor_credentials.RELAY_POLICY_VERSION,
+                "transport": "host-side-relay-per-session-scoped-token",
+                "scope_digest": relay_scope_digest,
+                "token_lifecycle": "issued-then-revoked-and-relay-stopped",
+                "leak_scan": "no-real-credential-in-artifacts-or-argv",
+                "real_token_in_child_env": False,
+            }
         receipt: dict[str, Any] = {
             "schema_version": "orbenchlab.agent-session.receipt.v1",
             "session_id": session_id,
@@ -781,6 +845,7 @@ def run_session(
             "max_output_bytes": max_output_bytes,
             "captured_output_bytes": len(stdout) + len(stderr),
             "provider_credential_redacted": stdout_redacted or stderr_redacted,
+            "credential_security": credential_security,
             "budget": {
                 "max_budget_usd": budget,
                 "enforcement": identity["budget_enforcement"],
@@ -820,6 +885,12 @@ def run_session(
                     "from a child shell or initiate arbitrary shell-network egress."
                     if not allow_bash
                     else "Bash inherits the agent process environment; use only on an externally isolated worker."
+                ),
+                (
+                    "The real provider credential is held by a host-side relay and never entered "
+                    "the agent environment; the child held only a revocable loopback-scoped token."
+                    if credential_relay
+                    else "The real provider credential is present in the agent process environment."
                 ),
                 "This process harness does not provide network isolation.",
                 "Live trace files support monitoring, but this runner does not inject hints into an active checkpoint.",

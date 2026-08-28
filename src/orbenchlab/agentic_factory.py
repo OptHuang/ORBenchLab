@@ -1355,6 +1355,7 @@ def _run_factory_locked(
     environments: Mapping[str, Mapping[str, str]] | None = None,
     executables: Mapping[str, str | Path] | None = None,
     max_new_stages: int | None = None,
+    credential_relay: bool = False,
 ) -> dict[str, Any]:
     """Run or resume ready agent stages until completion or quarantine.
 
@@ -1447,6 +1448,7 @@ def _run_factory_locked(
                 read_only_paths=protected_inputs,
                 hidden_paths=hidden_inputs,
                 allow_bash=not bool(checked.get("workspace_manifest")),
+                credential_relay=credential_relay and stage["profile"] == "claude-code",
             )
             if checked.get("workspace_manifest"):
                 identity = session.get("identity")
@@ -1653,6 +1655,7 @@ def run_factory(
     environments: Mapping[str, Mapping[str, str]] | None = None,
     executables: Mapping[str, str | Path] | None = None,
     max_new_stages: int | None = None,
+    credential_relay: bool = False,
 ) -> dict[str, Any]:
     """Serialize one factory state chain and run or resume its ready stages."""
 
@@ -1665,6 +1668,7 @@ def run_factory(
             environments=environments,
             executables=executables,
             max_new_stages=max_new_stages,
+            credential_relay=credential_relay,
         )
 
 

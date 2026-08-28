@@ -79,6 +79,7 @@ def _controls_with_repair(
     max_repair_rounds: int,
     repair_max_budget_usd: float,
     scope: str,
+    credential_relay: bool = False,
 ) -> tuple[Path, dict[str, Any], dict[str, Any]]:
     """Launch Oracle/NOP controls, repairing a task defect within a round cap.
 
@@ -155,6 +156,7 @@ def _controls_with_repair(
                 round_number=attempt + 1,
                 parent_task_digest=volc_rollout._task_tree_digest(current),
                 failure_bundle_digest=bundle["bundle_digest"],
+                credential_relay=credential_relay,
             )
             repair_receipts.append(repair)
             if repair["status"] != "produced" or repair["static_decision"] == "blocked":
@@ -646,6 +648,7 @@ def _ensure_baseline(
     harbor_relay_bind_host: str = "127.0.0.1",
     max_repair_rounds: int = 0,
     repair_max_budget_usd: float = 4.0,
+    credential_relay: bool = False,
 ) -> dict[str, Any]:
     original_task = factory_gates.resolve_task_root(
         _stage_output_path(plan, workdir, "task-repair-v2", kind="directory")
@@ -668,6 +671,7 @@ def _ensure_baseline(
         max_repair_rounds=max_repair_rounds,
         repair_max_budget_usd=repair_max_budget_usd,
         scope="baseline",
+        credential_relay=credential_relay,
     )
     task_digest = volc_rollout._task_tree_digest(task)
     if task is not original_task:
@@ -1283,8 +1287,16 @@ def run(
     repair_max_budget_usd: float = 4.0,
     harbor_relay_host: str = "127.0.0.1",
     harbor_relay_bind_host: str = "127.0.0.1",
+    credential_relay: bool = True,
 ) -> dict[str, Any]:
-    """Run or resume the complete semantic-and-runtime factory state machine."""
+    """Run or resume the complete semantic-and-runtime factory state machine.
+
+    ``credential_relay`` defaults to on: every claude-code agent session in the
+    unattended chain (paper stages, runtime repair, promotion review) receives a
+    revocable loopback-scoped token from a host-side relay instead of the real
+    provider credential, and each session fails closed if the real token is found
+    in any artifact or process argv.
+    """
 
     checked = agentic_factory.validate_plan(plan)
     agentic_factory._require_hard_budget_profiles(checked)
@@ -1446,6 +1458,7 @@ def run(
                         review_timeout_sec=promotion_review_timeout_sec,
                         review_max_budget_usd=max_budget_usd,
                         max_review_tokens=promotion_max_review_tokens,
+                        credential_relay=credential_relay,
                     )
                     state["promotion"] = {
                         key: promotion.get(key)
@@ -1488,6 +1501,7 @@ def run(
                         harbor_relay_bind_host=harbor_relay_bind_host,
                         max_repair_rounds=max_runtime_repair_rounds,
                         repair_max_budget_usd=repair_max_budget_usd,
+                        credential_relay=credential_relay,
                     )
                     state = _write_state(state_path, state)
                 if (
@@ -1552,6 +1566,7 @@ def run(
                 environments=environments,
                 executables=executables,
                 max_new_stages=1,
+                credential_relay=credential_relay,
             )
             state["factory_status"] = result["status"]
             state["factory_run_digest"] = result["run_digest"]

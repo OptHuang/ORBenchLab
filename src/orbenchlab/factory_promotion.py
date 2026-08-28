@@ -199,6 +199,7 @@ def run_promotion(
     review_timeout_sec: float = 600.0,
     review_max_budget_usd: float = 1.0,
     max_review_tokens: int = 2400,
+    credential_relay: bool = False,
 ) -> dict[str, Any]:
     """Run or resume the deterministic post-semantic promotion chain."""
 
@@ -340,6 +341,7 @@ def run_promotion(
                 max_budget_usd=review_max_budget_usd,
                 timeout_sec=review_timeout_sec,
                 executable=review_executable,
+                credential_relay=credential_relay,
             )
             factory_review.write_review(review, root / "semantic")
             revalidate_semantic()

@@ -578,3 +578,96 @@ def test_no_bash_session_cannot_read_host_files(tmp_path: Path):
     assert all(value == "FileNotFoundError" for value in reads.values()), reads
     # Declared inputs stay visible.
     assert (work / "review-input" / "data.txt").read_text() == "public"
+
+
+class _FakeUpstream(__import__("http.server", fromlist=["BaseHTTPRequestHandler"]).BaseHTTPRequestHandler):
+    seen_auth: list[str] = []
+
+    def log_message(self, *_):
+        return
+
+    def do_POST(self):
+        length = int(self.headers.get("content-length") or 0)
+        self.rfile.read(length)
+        _FakeUpstream.seen_auth.append(self.headers.get("authorization", ""))
+        body = b'data: {"type":"message_stop"}\n\n'
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def test_relay_transport_keeps_real_token_out_of_agent_env_and_artifacts(tmp_path: Path):
+    # The real provider token must reach the upstream but never enter the agent
+    # environment, its argv, or any session artifact.
+    import http.server
+    import threading
+
+    from orbenchlab import harbor_credentials
+
+    real_token = "REAL-agent-session-secret-zzz-0123456789abcdef"
+    _FakeUpstream.seen_auth = []
+    upstream = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _FakeUpstream)
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+
+    # Point the real relay origin at the fake upstream while keeping the pinned
+    # Volc route for identity validation.
+    original_validate = harbor_credentials._validate_volc_base
+    origin = f"http://127.0.0.1:{upstream.server_address[1]}"
+
+    def _patched(base_url):
+        _, route_path = original_validate(base_url)
+        return origin, route_path
+
+    harbor_credentials._validate_volc_base = _patched
+    try:
+        work = tmp_path / "work"
+        work.mkdir()
+        cli = tmp_path / "forwarder"
+        cli.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, urllib.request\n"
+            "base = os.environ['ANTHROPIC_BASE_URL']\n"
+            "token = os.environ['ANTHROPIC_AUTH_TOKEN']\n"
+            "open('child_token.txt', 'w').write(token)\n"
+            "req = urllib.request.Request(base + '/v1/messages', data=b'{}',\n"
+            "    method='POST', headers={'x-api-key': token, 'authorization': 'Bearer ' + token})\n"
+            "urllib.request.urlopen(req, timeout=5).read()\n"
+            "print('forwarded')\n",
+            encoding="utf-8",
+        )
+        cli.chmod(0o755)
+        receipt = agent_sessions.run_session(
+            profile="claude-code",
+            stage="author",
+            model="m",
+            prompt="p",
+            workdir=work,
+            out=tmp_path / "sessions",
+            timeout_sec=30,
+            environ={"ANTHROPIC_BASE_URL": VOLC, "ANTHROPIC_AUTH_TOKEN": real_token},
+            max_budget_usd=0.1,
+            executable=cli,
+            credential_relay=True,
+        )
+    finally:
+        harbor_credentials._validate_volc_base = original_validate
+        upstream.shutdown()
+
+    assert receipt["status"] == "completed"
+    # The child saw a scoped relay token, never the real one.
+    child_token = (work / "child_token.txt").read_text()
+    assert child_token != real_token and len(child_token) >= 32
+    # The upstream received the real token via the relay.
+    assert any(real_token in auth for auth in _FakeUpstream.seen_auth)
+    # Receipt records the safe transport and a clean leak scan.
+    security = receipt["credential_security"]
+    assert security["real_token_in_child_env"] is False
+    assert security["transport"] == "host-side-relay-per-session-scoped-token"
+    assert receipt["identity"]["credential_transport"] == "host-side-relay-per-session-scoped-token"
+    # The real token is absent from every session artifact.
+    session_root = Path(receipt["receipt_path"]).parent
+    for path in list(session_root.rglob("*")) + list(work.rglob("*")):
+        if path.is_file():
+            assert real_token not in path.read_text(errors="ignore"), path

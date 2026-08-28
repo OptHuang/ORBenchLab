@@ -210,6 +210,7 @@ def repair_task_once(
     round_number: int,
     parent_task_digest: str,
     failure_bundle_digest: str,
+    credential_relay: bool = False,
 ) -> dict[str, Any]:
     """Run one bounded repair agent session and static-gate its output."""
 
@@ -234,6 +235,7 @@ def repair_task_once(
         executable=claude_executable,
         read_only_paths=read_only,
         allow_bash=False,
+        credential_relay=credential_relay,
     )
     produced = out / "task-vnext" / slug
     if produced.is_dir() and not produced.is_symlink():
