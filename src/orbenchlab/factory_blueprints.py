@@ -642,18 +642,59 @@ def paper_to_benchmark_plan(
             timeout_sec=3600,
         ),
         _stage(
+            "intervention-policy",
+            "hint-intervention policy author",
+            common
+            + " From trajectory-diagnosis, propose exactly one candidate hint-injection policy targeting the "
+            "single strongest recurring bottleneck. Write strict machine JSON with these keys: bottleneck_id "
+            "(short string), rationale (string), trigger (object with kind one of "
+            "'assistant-event-index'|'elapsed-sec'|'stdout-pattern' and a matching value: a positive integer "
+            "for assistant-event-index, a positive number of seconds for elapsed-sec, or a bounded substring "
+            "for stdout-pattern), hint_level (integer 1..5), and hint_text (the exact user message to inject, "
+            "non-empty, under 64000 bytes, revealing only the diagnosed missing step and never the full "
+            "solution). Do not call a model or run anything; the trusted harness validates this schema and, "
+            "when the runtime supports it, runs the controlled study.",
+            "factory/analysis/intervention-policy.json",
+            model=author_model,
+            profile=profile,
+            depends_on=("trajectory-diagnosis",),
+            timeout_sec=3600,
+            artifact_max_bytes=128_000,
+            json_required_keys=(
+                "bottleneck_id",
+                "rationale",
+                "trigger",
+                "hint_level",
+                "hint_text",
+            ),
+            json_key_types={
+                "bottleneck_id": "string",
+                "rationale": "string",
+                "trigger": "object",
+                "hint_level": "integer",
+                "hint_text": "string",
+            },
+            json_nonempty_keys=(
+                "bottleneck_id",
+                "trigger",
+                "hint_text",
+            ),
+        ),
+        _stage(
             "intervention-study",
             "controlled intervention experimenter",
             common
-            + " For each proposed bottleneck, inspect the trusted runtime capability receipt. This factory "
-            "currently exposes no resumable same-checkpoint injection, so record checkpoint_capability=false, "
-            "E4 as unavailable, and a concrete future paired-continuation design. Do not call a model and do "
-            "not run restart-with-hint while masquerading it as causal evidence.",
+            + " Inspect the trusted intervention receipts at factory-input/trusted/intervention/: the "
+            "runtime-capability receipt and, when the runtime supported it, the controlled same-session "
+            "hint-injection study the harness already ran. Report the machine evidence level exactly as the "
+            "receipts state it (E0 unsupported, E1 incomplete, E3 underpowered, or E4 controlled), separating "
+            "confirmed causal effect from description. Do not call a model, do not run restart-with-hint as "
+            "causal evidence, and do not upgrade the receipts' evidence level.",
             "factory/analysis/intervention-study.md",
             model=author_model,
             profile=profile,
             kind="text",
-            depends_on=("trajectory-diagnosis",),
+            depends_on=("intervention-policy",),
             timeout_sec=10_800,
         ),
         _stage(

@@ -103,7 +103,16 @@ def copy_task(dest_root):
     (dest / "paper-provenance.json").chmod(0o644)
     return dest
 
-if stage == "task-author-v1":
+if stage == "intervention-policy":
+    Path("factory/analysis").mkdir(parents=True, exist_ok=True)
+    Path("factory/analysis/intervention-policy.json").write_text(json.dumps({
+        "bottleneck_id": "missing-seed-rule",
+        "rationale": "Weak model forgets the seeded duration rule.",
+        "trigger": {"kind": "assistant-event-index", "value": 1},
+        "hint_level": 1,
+        "hint_text": "Reminder: apply d + ((seed + operation_index) % 2) for every operation.",
+    }, indent=2), encoding="utf-8")
+elif stage == "task-author-v1":
     copy_task("factory/tasks/task-v1")
 elif stage == "task-repair-v2":
     dest = copy_task("factory/tasks/task-v2")
@@ -398,7 +407,24 @@ def test_paper_to_promoted_task_card_without_human_steps(
     assert state["factory_status"] == "semantic-complete-e1" or state.get(
         "factory_run_digest"
     )
-    assert set(state["barriers"]) == {"baseline", "difficulty"}
+    assert set(state["barriers"]) == {"baseline", "intervention", "difficulty"}
+    # The intervention barrier ran the capability probe (study disabled by
+    # default) and installed an honest machine-readable capability receipt.
+    intervention = state["barriers"]["intervention"]
+    assert intervention["same_session_hint_injection"] is True
+    assert intervention["study_status"] == "not-run"
+    assert intervention["study_reason"] == "disabled-by-configuration"
+    icap = json.loads(
+        (
+            e2e_bin
+            / "autopilot"
+            / "intervention"
+            / "trusted-source"
+            / "runtime-capability.json"
+        ).read_text()
+    )
+    assert icap["harbor_native"] is False
+    assert icap["causal_intervention_claim_available"] is False
     assert state["barriers"]["difficulty"]["decision"] == "exploratory-promising"
     assert state["selected_task"] == "factory/tasks/task-v2/alphaevolve-scheduling"
     promotion = state["promotion"]

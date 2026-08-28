@@ -428,6 +428,20 @@ def _add_agent_factory(sub: argparse._SubParsersAction) -> None:
     )
     autopilot.add_argument("--promotion-review-timeout-sec", type=float, default=600.0)
     autopilot.add_argument("--promotion-max-review-tokens", type=int, default=2400)
+    autopilot.add_argument(
+        "--intervention-study",
+        action="store_true",
+        help="auto-run the same-session hint-injection study at the runtime barrier",
+    )
+    autopilot.add_argument(
+        "--intervention-verifier-cmd",
+        default="",
+        help="JSON array argv graded in each trial workdir (pass=exit 0); required to run a study",
+    )
+    autopilot.add_argument("--intervention-control", type=int, default=3)
+    autopilot.add_argument("--intervention-treatment", type=int, default=3)
+    autopilot.add_argument("--intervention-timeout-sec", type=float, default=900.0)
+    autopilot.add_argument("--max-intervention-liability-usd", type=float, default=20.0)
     autopilot.set_defaults(handler=_cmd_agent_factory_autopilot)
 
     batch = inner.add_parser(
@@ -642,6 +656,16 @@ def _cmd_agent_factory_autopilot(args: argparse.Namespace) -> int:
         promote=not args.stop_after_semantic,
         promotion_review_timeout_sec=args.promotion_review_timeout_sec,
         promotion_max_review_tokens=args.promotion_max_review_tokens,
+        intervention_study=args.intervention_study,
+        intervention_verifier_argv=(
+            json.loads(args.intervention_verifier_cmd)
+            if args.intervention_verifier_cmd
+            else ()
+        ),
+        intervention_control=args.intervention_control,
+        intervention_treatment=args.intervention_treatment,
+        intervention_timeout_sec=args.intervention_timeout_sec,
+        max_intervention_liability_usd=args.max_intervention_liability_usd,
     )
     promotion = result.get("promotion") if isinstance(result.get("promotion"), dict) else {}
     _print_json(

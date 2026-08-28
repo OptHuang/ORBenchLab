@@ -168,6 +168,7 @@ def test_default_plan_assigns_all_semantic_stages_to_agent_sessions(tmp_path: Pa
         "pilot-frontier",
         "pilot-weak",
         "trajectory-diagnosis",
+        "intervention-policy",
         "intervention-study",
         "difficulty-design",
         "variant-author",
@@ -263,7 +264,7 @@ def test_default_plan_assigns_all_semantic_stages_to_agent_sessions(tmp_path: Pa
         "source",
         "difficulty_axes",
     ]
-    assert plan["maximum_model_liability_usd"] == 71.5
+    assert plan["maximum_model_liability_usd"] == 73.5
     assert agentic_factory.validate_plan(plan) == plan
 
 
@@ -309,7 +310,7 @@ def test_prepare_paper_cli_writes_nineteen_stage_plan(capsys, tmp_path: Path):
         ]
     ) == 0
     output = json.loads(capsys.readouterr().out)
-    assert output["stage_count"] == 19
+    assert output["stage_count"] == 20
     assert agentic_factory.load_plan(plan_path)["factory_id"] == output["factory_id"]
 
 

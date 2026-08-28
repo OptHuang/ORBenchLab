@@ -416,3 +416,86 @@ def test_unsupported_profile_study_is_recorded_not_faked(tmp_path: Path):
     assert study["status"] == "unsupported-capability"
     assert study["evidence_level"] == "E0-unsupported"
     assert study["trials"] == []
+
+
+def test_autopilot_intervention_barrier_runs_study_when_enabled(tmp_path: Path):
+    # Proves the autopilot barrier helper actually invokes the adapter and
+    # produces a trusted machine receipt, rather than leaving a bypass CLI.
+    import shutil as _shutil
+    from pathlib import Path as _Path
+
+    import pytest as _pytest
+
+    if not _shutil.which("bwrap"):
+        _pytest.skip("intervention barrier install needs the workspace sandbox tooling")
+
+    from orbenchlab import agentic_factory, factory_autopilot
+
+    root_task = _Path(__file__).resolve().parents[1] / "examples/tasks/alphaevolve-scheduling"
+    workdir = tmp_path / "work"
+    (workdir / "factory-input" / "trusted").mkdir(parents=True)
+    (workdir / "factory-input" / "paper-provenance.json").write_bytes(
+        (root_task / "paper-provenance.json").read_bytes()
+    )
+    task_dst = workdir / "factory/tasks/task-v2/alphaevolve-scheduling"
+    _shutil.copytree(root_task, task_dst)
+    (workdir / "factory/analysis").mkdir(parents=True)
+    (workdir / "factory/analysis/intervention-policy.json").write_text(
+        json.dumps(
+            {
+                "bottleneck_id": "b1",
+                "rationale": "r",
+                "trigger": {"kind": "assistant-event-index", "value": 1},
+                "hint_level": 1,
+                "hint_text": "Reminder: write hint.txt with the word injected.",
+            }
+        ),
+        encoding="utf-8",
+    )
+    factory_autopilot.factory_blueprints._make_inputs_read_only(
+        workdir / "factory-input"
+    )
+
+    plan = {
+        "stages": [
+            {
+                "id": "task-repair-v2",
+                "required_outputs": [
+                    {"path": "factory/tasks/task-v2", "kind": "directory"}
+                ],
+            }
+        ]
+    }
+    executable = _fake_claude(tmp_path)
+    verifier = tmp_path / "v.sh"
+    verifier.write_text("#!/bin/sh\ntest -f hint.txt\n", encoding="utf-8")
+    verifier.chmod(0o755)
+    result = factory_autopilot._ensure_intervention(
+        plan=plan,
+        workdir=workdir,
+        evidence_root=tmp_path / "evidence",
+        claude_executable=executable,
+        model="fixture-model",
+        provider_env=PROVIDER,
+        max_budget_usd=0.1,
+        enabled=True,
+        verifier_argv=[str(verifier)],
+        n_control=3,
+        n_treatment=3,
+        timeout_sec=20,
+        max_output_bytes=8 * 1024 * 1024,
+    )
+    assert result["same_session_hint_injection"] is True
+    assert result["study_status"] == "completed"
+    assert result["study_evidence_level"] == "E4-controlled-same-session-intervention"
+    cap = json.loads(
+        (
+            tmp_path
+            / "evidence"
+            / "intervention"
+            / "trusted-source"
+            / "runtime-capability.json"
+        ).read_text()
+    )
+    assert cap["harbor_native"] is False
+    assert cap["causal_intervention_claim_available"] is True

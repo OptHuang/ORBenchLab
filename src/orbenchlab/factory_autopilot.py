@@ -27,6 +27,7 @@ from . import (
     harbor_launcher,
     harbor_model_matrix,
     pipeline,
+    session_interventions,
     task_authoring,
     volc_rollout,
 )
@@ -315,6 +316,52 @@ def _validate_barriers(state: Mapping[str, Any], workdir: Path) -> None:
                 or sources.get("static_authoring") != static_digest
             ):
                 raise FactoryAutopilotError("baseline static-gate receipt binding failed")
+    intervention = barriers.get("intervention")
+    if "intervention" in barriers and not isinstance(intervention, Mapping):
+        raise FactoryAutopilotError("intervention barrier state must be an object")
+    if isinstance(intervention, Mapping):
+        manifest, iroot = _validate_installed_bundle(
+            workdir=workdir,
+            relative="intervention",
+            expected_digest=str(intervention.get("trusted_bundle_digest") or ""),
+        )
+        capability = _load_object(iroot / "runtime-capability.json")
+        unsigned_capability = {
+            key: value for key, value in capability.items() if key != "receipt_digest"
+        }
+        sources = manifest.get("source_receipts")
+        if (
+            capability.get("schema_version") != "orbenchlab.runtime-capability.v1"
+            or capability.get("receipt_digest") != _value_digest(unsigned_capability)
+            or capability.get("receipt_digest")
+            != intervention.get("capability_receipt_digest")
+            or capability.get("checkpoint_capability") is not False
+            or capability.get("harbor_native") is not False
+            or not isinstance(sources, Mapping)
+            or sources.get("runtime_capability") != capability.get("receipt_digest")
+        ):
+            raise FactoryAutopilotError("intervention capability receipt binding failed")
+        study_digest = intervention.get("study_receipt_digest")
+        if study_digest is not None:
+            study = _load_object(iroot / "intervention-study.json")
+            unsigned_study = {
+                key: value for key, value in study.items() if key != "receipt_digest"
+            }
+            if (
+                study.get("schema_version")
+                != session_interventions.STUDY_SCHEMA_VERSION
+                or study.get("receipt_digest")
+                != session_interventions._digest(unsigned_study)
+                or study.get("receipt_digest") != study_digest
+                or sources.get("intervention_study") != study_digest
+                or capability.get("study_evidence_level") != study.get("evidence_level")
+                or (
+                    capability.get("causal_intervention_claim_available")
+                    and study.get("evidence_level")
+                    != "E4-controlled-same-session-intervention"
+                )
+            ):
+                raise FactoryAutopilotError("intervention study receipt binding failed")
     difficulty = barriers.get("difficulty")
     if "difficulty" in barriers and not isinstance(difficulty, Mapping):
         raise FactoryAutopilotError("difficulty barrier state must be an object")
@@ -704,6 +751,168 @@ def _ensure_difficulty(
     }
 
 
+def _load_policy(path: Path) -> dict[str, Any]:
+    """Normalize the agent-authored policy into a strict machine policy.
+
+    The harness validates the schema; it never invents trigger/hint content.
+    hint_level may arrive as a JSON number, which we coerce to int without
+    changing its value.
+    """
+
+    document = _load_object(path)
+    policy = {
+        "trigger": document.get("trigger"),
+        "hint_level": document.get("hint_level"),
+        "hint_text": document.get("hint_text"),
+    }
+    level = policy["hint_level"]
+    if isinstance(level, float) and level.is_integer():
+        policy["hint_level"] = int(level)
+    trigger = policy["trigger"]
+    if isinstance(trigger, Mapping):
+        value = trigger.get("value")
+        if isinstance(value, float) and value.is_integer() and trigger.get("kind") in {
+            "assistant-event-index"
+        }:
+            policy = {**policy, "trigger": {**trigger, "value": int(value)}}
+    try:
+        return session_interventions._validate_policy(policy)
+    except session_interventions.SessionInterventionError as exc:
+        raise FactoryAutopilotError(
+            f"agent-authored intervention policy is not a valid machine policy: {exc}"
+        ) from None
+
+
+def _ensure_intervention(
+    *,
+    plan: Mapping[str, Any],
+    workdir: Path,
+    evidence_root: Path,
+    claude_executable: str | Path,
+    model: str,
+    provider_env: Mapping[str, str],
+    max_budget_usd: float,
+    enabled: bool,
+    verifier_argv: Sequence[str],
+    n_control: int,
+    n_treatment: int,
+    timeout_sec: float,
+    max_output_bytes: int,
+) -> dict[str, Any]:
+    """Probe the same-session injection channel and, when supported and enabled,
+    run a crash-safe controlled study on the frozen task, feeding trusted input."""
+
+    task = factory_gates.resolve_task_root(
+        _stage_output_path(plan, workdir, "task-repair-v2", kind="directory")
+    )
+    task_digest = volc_rollout._task_tree_digest(task)
+    policy_path = agentic_factory._artifact_path(
+        workdir, "factory/analysis/intervention-policy.json"
+    )
+    policy = _load_policy(policy_path)
+    capability = session_interventions.probe_capability(
+        profile="claude-code", runtime="agent-session"
+    )
+    root = evidence_root / "intervention"
+    trusted_source = root / "trusted-source"
+    trusted_source.mkdir(parents=True, exist_ok=True)
+    study_receipt: dict[str, Any] | None = None
+    study_reason = None
+    if not capability["same_session_hint_injection"]:
+        study_reason = "runtime-unsupported"
+    elif not enabled:
+        study_reason = "disabled-by-configuration"
+    elif not verifier_argv:
+        study_reason = "no-verifier-command-configured"
+    else:
+        study_receipt = session_interventions.run_intervention_study(
+            profile="claude-code",
+            model=model,
+            prompt=_intervention_prompt(task),
+            template_workdir=task,
+            out=root / "study",
+            environ=provider_env,
+            verifier_argv=list(verifier_argv),
+            policy=policy,
+            n_control=n_control,
+            n_treatment=n_treatment,
+            timeout_sec=timeout_sec,
+            max_budget_usd=max_budget_usd,
+            executable=claude_executable,
+            max_output_bytes=max_output_bytes,
+        )
+    capability_receipt = {
+        "schema_version": "orbenchlab.runtime-capability.v1",
+        "task_tree_digest": task_digest,
+        "trajectory_evidence_level": "E3",
+        "channel": "claude-code-stream-json-same-session",
+        "harbor_native": False,
+        "checkpoint_capability": False,
+        "same_checkpoint_hint_injection": False,
+        "same_session_hint_injection": bool(
+            capability["same_session_hint_injection"]
+        ),
+        "policy_digest": session_interventions._digest(policy),
+        "study_status": (
+            study_receipt["status"] if study_receipt is not None else "not-run"
+        ),
+        "study_evidence_level": (
+            study_receipt["evidence_level"] if study_receipt is not None else None
+        ),
+        "study_reason": study_reason,
+        "causal_intervention_claim_available": bool(
+            study_receipt is not None
+            and study_receipt.get("evidence_level")
+            == "E4-controlled-same-session-intervention"
+        ),
+        "limitations": [
+            "Same-session stdin injection is a turn-boundary continuation, not a "
+            "mid-token checkpoint restore; it is not Harbor-native.",
+            "Harbor task trials remain independent restarts (restart-with-hint is E3).",
+        ],
+    }
+    capability_receipt["receipt_digest"] = _value_digest(
+        {k: v for k, v in capability_receipt.items() if k != "receipt_digest"}
+    )
+    _atomic_json(trusted_source / "runtime-capability.json", capability_receipt)
+    source_receipts = {"runtime_capability": capability_receipt["receipt_digest"]}
+    if study_receipt is not None:
+        shutil.copy2(
+            root / "study" / "intervention-study.json",
+            trusted_source / "intervention-study.json",
+        )
+        source_receipts["intervention_study"] = study_receipt["receipt_digest"]
+    bundle = install_trusted_bundle(
+        workdir=workdir,
+        relative="intervention",
+        source=trusted_source,
+        source_receipts=source_receipts,
+    )
+    return {
+        "task_tree_digest": task_digest,
+        "capability_receipt_digest": capability_receipt["receipt_digest"],
+        "same_session_hint_injection": capability_receipt["same_session_hint_injection"],
+        "study_status": capability_receipt["study_status"],
+        "study_evidence_level": capability_receipt["study_evidence_level"],
+        "study_reason": study_reason,
+        "study_receipt_digest": (
+            study_receipt["receipt_digest"] if study_receipt is not None else None
+        ),
+        "trusted_bundle_digest": bundle["bundle_digest"],
+    }
+
+
+def _intervention_prompt(task: Path) -> str:
+    task_id = volc_rollout._task_id(task)
+    return (
+        "You are solving a Terminal-Bench Science operations-research task in the "
+        "current directory. Read instruction.md and the data files, then create the "
+        "required solution artifacts exactly as the instruction specifies. Task id: "
+        f"{task_id}. If a follow-up user message arrives, incorporate it exactly. "
+        "Do not access the network."
+    )
+
+
 def _selected_task(workdir: Path) -> str | None:
     path = workdir / "factory" / "final" / "task-review-summary.json"
     if not path.is_file() or path.is_symlink():
@@ -740,6 +949,12 @@ def run(
     promote: bool = True,
     promotion_review_timeout_sec: float = 600.0,
     promotion_max_review_tokens: int = 2400,
+    intervention_study: bool = False,
+    intervention_verifier_argv: Sequence[str] = (),
+    intervention_control: int = 3,
+    intervention_treatment: int = 3,
+    intervention_timeout_sec: float = 900.0,
+    max_intervention_liability_usd: float = 20.0,
 ) -> dict[str, Any]:
     """Run or resume the complete semantic-and-runtime factory state machine."""
 
@@ -806,7 +1021,34 @@ def run(
         "max_job_attempts_per_model": max_job_attempts,
         "provider_route_digest": route_digest,
         "held_out_confirmation": bool(held_out),
+        "intervention": {
+            "enabled": bool(intervention_study),
+            "verifier_argv": [str(item) for item in intervention_verifier_argv],
+            "n_control": intervention_control,
+            "n_treatment": intervention_treatment,
+            "timeout_sec": intervention_timeout_sec,
+            "max_liability_usd": max_intervention_liability_usd,
+        },
     }
+    has_intervention_stage = any(
+        stage["id"] == "intervention-policy" for stage in checked["stages"]
+    )
+    if intervention_study:
+        if not has_intervention_stage:
+            raise FactoryAutopilotError(
+                "intervention study requires an intervention-policy stage in the plan"
+            )
+        if intervention_control < 3 or intervention_treatment < 3:
+            raise FactoryAutopilotError(
+                "an intervention study needs at least three control and treatment trials"
+            )
+        intervention_liability = (
+            (intervention_control + intervention_treatment) * max_budget_usd
+        )
+        if intervention_liability > max_intervention_liability_usd:
+            raise FactoryAutopilotError(
+                "worst-case intervention liability exceeds its configured cap"
+            )
     identity_digest = _value_digest(identity)
     state_path = root / "autopilot-state.json"
     lock_path = root / ".autopilot.lock"
@@ -850,9 +1092,12 @@ def run(
                 checked, factory_root, workspace=workspace
             )
             if factory_run["status"] in {"semantic-complete-e1", "quarantined"}:
+                required_barriers = {"baseline", "difficulty"}
+                if has_intervention_stage:
+                    required_barriers.add("intervention")
                 if factory_run["status"] == "semantic-complete-e1" and set(
                     state["barriers"]
-                ) != {"baseline", "difficulty"}:
+                ) != required_barriers:
                     raise FactoryAutopilotError(
                         "semantic-complete factory lacks both trusted runtime barriers"
                     )
@@ -909,6 +1154,27 @@ def run(
                         max_turns=max_turns,
                         harbor_timeout_sec=harbor_timeout_sec,
                         max_job_attempts=max_job_attempts,
+                    )
+                    state = _write_state(state_path, state)
+                if (
+                    next_stage == "intervention-study"
+                    and has_intervention_stage
+                    and "intervention" not in state["barriers"]
+                ):
+                    state["barriers"]["intervention"] = _ensure_intervention(
+                        plan=checked,
+                        workdir=workspace,
+                        evidence_root=root,
+                        claude_executable=claude_binding["path"],
+                        model=models[0],
+                        provider_env=provider_env,
+                        max_budget_usd=max_budget_usd,
+                        enabled=bool(intervention_study),
+                        verifier_argv=intervention_verifier_argv,
+                        n_control=intervention_control,
+                        n_treatment=intervention_treatment,
+                        timeout_sec=intervention_timeout_sec,
+                        max_output_bytes=32 * 1024 * 1024,
                     )
                     state = _write_state(state_path, state)
                 if next_stage == "calibration" and "difficulty" not in state["barriers"]:

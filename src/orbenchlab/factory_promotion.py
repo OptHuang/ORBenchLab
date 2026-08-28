@@ -424,6 +424,22 @@ def write_final_report(
         evidence_root / "baseline" / "trusted-source" / "runtime-capability.json"
     )
     capability = _load_json(capability_path) if capability_path.is_file() else None
+    intervention_capability_path = (
+        evidence_root / "intervention" / "trusted-source" / "runtime-capability.json"
+    )
+    intervention_capability = (
+        _load_json(intervention_capability_path)
+        if intervention_capability_path.is_file()
+        else None
+    )
+    intervention_study_path = (
+        evidence_root / "intervention" / "trusted-source" / "intervention-study.json"
+    )
+    intervention_study = (
+        _load_json(intervention_study_path)
+        if intervention_study_path.is_file()
+        else None
+    )
     agent_artifacts = {
         name: _agent_artifact(workdir, relative)
         for name, relative in (
@@ -547,11 +563,33 @@ def write_final_report(
             "",
             "## 干预证据等级",
             "",
-            f"- checkpoint capability：`{capability.get('checkpoint_capability')}`；"
-            f"same-checkpoint 注入：`{capability.get('same_checkpoint_hint_injection')}`；"
-            f"可主张 E4 因果干预：`{capability.get('causal_intervention_claim_available')}`",
-            "- Harbor 轨迹为独立全新 restart（E3 描述性）；restart-with-hint 不是 E4。",
+            f"- Harbor 轨迹：checkpoint capability `{capability.get('checkpoint_capability')}`；"
+            f"same-checkpoint 注入 `{capability.get('same_checkpoint_hint_injection')}`（独立全新 restart，E3 描述性）。",
         ]
+        if intervention_capability is not None:
+            lines.append(
+                f"- Same-session 通道（非 Harbor-native）：支持 "
+                f"`{intervention_capability.get('same_session_hint_injection')}`；"
+                f"study 状态 `{intervention_capability.get('study_status')}`"
+                f"（原因 `{intervention_capability.get('study_reason')}`）；"
+                f"证据等级 `{intervention_capability.get('study_evidence_level')}`；"
+                f"可主张 E4 因果 `{intervention_capability.get('causal_intervention_claim_available')}`。"
+            )
+        if intervention_study is not None:
+            arms = intervention_study.get("arms") or {}
+            control = (arms.get("control") or {}).get("pass_rate")
+            treatment = (arms.get("treatment") or {}).get("pass_rate")
+            lines.append(
+                f"- 受控 study：control pass rate `{control}`，treatment pass rate "
+                f"`{treatment}`，所有注入被确认 "
+                f"`{intervention_study.get('all_treatment_injections_confirmed')}`，"
+                f"receipts 全部复验 `{intervention_study.get('all_treatment_receipts_verified')}`。"
+            )
+        else:
+            lines.append(
+                "- 未运行受控 same-session study（见能力 receipt 的 machine 状态）；"
+                "restart-with-hint 不是 E4。"
+            )
     lines += ["", "## 成本与用量（provider 上报口径）", ""]
     if costs:
         lines.append(f"`{json.dumps(costs, ensure_ascii=False, sort_keys=True)}`")
