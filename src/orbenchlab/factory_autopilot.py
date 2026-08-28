@@ -464,19 +464,40 @@ def _validate_barriers(state: Mapping[str, Any], workdir: Path) -> None:
             key: value for key, value in capability.items() if key != "receipt_digest"
         }
         sources = manifest.get("source_receipts")
+        harbor_native = bool(capability.get("harbor_native"))
         if (
             capability.get("schema_version") != "orbenchlab.runtime-capability.v1"
             or capability.get("receipt_digest") != _value_digest(unsigned_capability)
             or capability.get("receipt_digest")
             != intervention.get("capability_receipt_digest")
             or capability.get("checkpoint_capability") is not False
-            or capability.get("harbor_native") is not False
             or not isinstance(sources, Mapping)
             or sources.get("runtime_capability") != capability.get("receipt_digest")
         ):
             raise FactoryAutopilotError("intervention capability receipt binding failed")
         study_digest = intervention.get("study_receipt_digest")
-        if study_digest is not None:
+        if study_digest is not None and harbor_native:
+            # Harbor-native live study: bind the live-intervention-study receipt.
+            from . import harbor_intervention_study as _his
+
+            study = _load_object(iroot / "live-intervention-study.json")
+            unsigned_study = {k: v for k, v in study.items() if k != "receipt_digest"}
+            unsigned_study["arms"] = [
+                {k: v for k, v in arm.items() if k != "reused"} for arm in study.get("arms", [])
+            ]
+            if (
+                study.get("schema_version") != _his.STUDY_SCHEMA_VERSION
+                or study.get("receipt_digest") != _his._digest(unsigned_study)
+                or study.get("receipt_digest") != study_digest
+                or sources.get("live_intervention_study") != study_digest
+                or (
+                    capability.get("causal_intervention_claim_available")
+                    and study.get("evidence_level")
+                    != "E4-controlled-same-session-intervention"
+                )
+            ):
+                raise FactoryAutopilotError("live intervention study receipt binding failed")
+        elif study_digest is not None:
             study = _load_object(iroot / "intervention-study.json")
             unsigned_study = {
                 key: value for key, value in study.items() if key != "receipt_digest"
@@ -1275,6 +1296,9 @@ def _ensure_intervention(
     timeout_sec: float,
     max_output_bytes: int,
     verifier_adapter: "session_interventions.GradeCallable | None" = None,
+    live_arm_executor=None,
+    live_levels: Sequence[str] = ("L1", "L2", "L3"),
+    live_repeats: int = 5,
 ) -> dict[str, Any]:
     """Probe the same-session injection channel and honestly record its evidence.
 
@@ -1300,12 +1324,30 @@ def _ensure_intervention(
     trusted_source = root / "trusted-source"
     trusted_source.mkdir(parents=True, exist_ok=True)
     study_receipt: dict[str, Any] | None = None
+    live_study_receipt: dict[str, Any] | None = None
     study_reason = None
     template_info: dict[str, Any] | None = None
     if not capability["same_session_hint_injection"]:
         study_reason = "runtime-unsupported"
     elif not enabled:
         study_reason = "disabled-by-configuration"
+    elif live_arm_executor is not None:
+        # Harbor-native live intervention: each arm performs the real
+        # interrupt/hint handshake in a no-network container and is graded by
+        # the SEPARATE frozen verifier, so the study reaches E4 honestly.
+        from . import harbor_intervention_study as _his
+
+        template_info = _build_agent_visible_template(task, root / "agent-template")
+        live_study_receipt = _his.run_live_intervention_study(
+            task_id=volc_rollout._task_id(task),
+            model=model,
+            levels=list(live_levels),
+            repeats=live_repeats,
+            out=root / "live-study",
+            arm_executor=live_arm_executor,
+            max_budget_usd_per_arm=max_budget_usd,
+        )
+        study_reason = "harbor-native-live-intervention"
     elif verifier_adapter is None:
         # No Harbor-equivalent, secret-safe, isolated verifier adapter is
         # available; a host-shell verifier would score an empty submission as
@@ -1333,12 +1375,45 @@ def _ensure_intervention(
             agent_allow_bash=True,
             grade=verifier_adapter,
         )
+    # Unify evidence fields across the honest E0/E1 path, the caller-adapter
+    # path, and the Harbor-native live path.
+    if live_study_receipt is not None:
+        _study_valid = bool(live_study_receipt.get("study_valid"))
+        u_harbor_native = True
+        u_study_status = "completed" if _study_valid else "invalid"
+        u_study_level = (
+            live_study_receipt["evidence_level"]
+            if _study_valid
+            else "E1-live-study-no-valid-arms"
+        )
+        u_causal = bool(
+            _study_valid
+            and live_study_receipt.get("evidence_level")
+            == "E4-controlled-same-session-intervention"
+        )
+        u_verifier_mech = "harbor-native-container-verifier"
+    elif study_receipt is not None:
+        u_harbor_native = False
+        u_study_status = study_receipt["status"]
+        u_study_level = study_receipt["evidence_level"]
+        u_causal = bool(
+            study_receipt.get("evidence_level") == "E4-controlled-same-session-intervention"
+        )
+        u_verifier_mech = "caller-supplied-trusted-adapter"
+    else:
+        u_harbor_native = False
+        u_study_status = "not-run"
+        u_study_level = (
+            "E0-unsupported" if study_reason == "runtime-unsupported" else "E1-capability-only-no-study"
+        )
+        u_causal = False
+        u_verifier_mech = None
     capability_receipt = {
         "schema_version": "orbenchlab.runtime-capability.v1",
         "task_tree_digest": task_digest,
         "trajectory_evidence_level": "E3",
         "channel": "claude-code-stream-json-same-session",
-        "harbor_native": False,
+        "harbor_native": u_harbor_native,
         "checkpoint_capability": False,
         "same_checkpoint_hint_injection": False,
         "same_session_hint_injection": bool(
@@ -1353,40 +1428,39 @@ def _ensure_intervention(
         "hidden_from_agent_file_count": (
             template_info["hidden_file_count"] if template_info else None
         ),
-        "verifier_mechanism": (
-            "caller-supplied-trusted-adapter" if verifier_adapter is not None else None
-        ),
+        "verifier_mechanism": u_verifier_mech,
         "policy_digest": session_interventions._digest(policy),
-        "study_status": (
-            study_receipt["status"] if study_receipt is not None else "not-run"
-        ),
-        "study_evidence_level": (
-            study_receipt["evidence_level"]
-            if study_receipt is not None
-            else (
-                "E0-unsupported"
-                if study_reason == "runtime-unsupported"
-                else "E1-capability-only-no-study"
-            )
-        ),
+        "study_status": u_study_status,
+        "study_evidence_level": u_study_level,
         "study_reason": study_reason,
-        "causal_intervention_claim_available": bool(
-            study_receipt is not None
-            and study_receipt.get("evidence_level")
-            == "E4-controlled-same-session-intervention"
+        "causal_intervention_claim_available": u_causal,
+        "limitations": (
+            [
+                "Live intervention interrupts the model at a tool/assistant "
+                "checkpoint on the same session and grades with the separate "
+                "no-network container verifier.",
+                "Harbor task matrix trials remain independent restarts (restart-with-hint is E3).",
+            ]
+            if u_harbor_native
+            else [
+                "Same-session stdin injection is a turn-boundary continuation, not a "
+                "mid-token checkpoint restore; it is not Harbor-native.",
+                "Harbor task trials remain independent restarts (restart-with-hint is E3).",
+            ]
         ),
-        "limitations": [
-            "Same-session stdin injection is a turn-boundary continuation, not a "
-            "mid-token checkpoint restore; it is not Harbor-native.",
-            "Harbor task trials remain independent restarts (restart-with-hint is E3).",
-        ],
     }
     capability_receipt["receipt_digest"] = _value_digest(
         {k: v for k, v in capability_receipt.items() if k != "receipt_digest"}
     )
     _atomic_json(trusted_source / "runtime-capability.json", capability_receipt)
     source_receipts = {"runtime_capability": capability_receipt["receipt_digest"]}
-    if study_receipt is not None:
+    if live_study_receipt is not None:
+        shutil.copy2(
+            root / "live-study" / "live-intervention-study.json",
+            trusted_source / "live-intervention-study.json",
+        )
+        source_receipts["live_intervention_study"] = live_study_receipt["receipt_digest"]
+    elif study_receipt is not None:
         shutil.copy2(
             root / "study" / "intervention-study.json",
             trusted_source / "intervention-study.json",
@@ -1405,8 +1479,14 @@ def _ensure_intervention(
         "study_status": capability_receipt["study_status"],
         "study_evidence_level": capability_receipt["study_evidence_level"],
         "study_reason": study_reason,
+        "harbor_native": capability_receipt["harbor_native"],
+        "causal_intervention_claim_available": capability_receipt[
+            "causal_intervention_claim_available"
+        ],
         "study_receipt_digest": (
-            study_receipt["receipt_digest"] if study_receipt is not None else None
+            live_study_receipt["receipt_digest"]
+            if live_study_receipt is not None
+            else (study_receipt["receipt_digest"] if study_receipt is not None else None)
         ),
         "trusted_bundle_digest": bundle["bundle_digest"],
     }
@@ -1470,6 +1550,9 @@ def run(
     harbor_relay_host: str = "127.0.0.1",
     harbor_relay_bind_host: str = "127.0.0.1",
     credential_relay: bool = True,
+    live_arm_executor_factory=None,
+    live_intervention_levels: Sequence[str] = ("L1", "L2", "L3"),
+    live_intervention_repeats: int = 5,
 ) -> dict[str, Any]:
     """Run or resume the complete semantic-and-runtime factory state machine.
 
@@ -1758,6 +1841,13 @@ def run(
                         n_treatment=intervention_treatment,
                         timeout_sec=intervention_timeout_sec,
                         max_output_bytes=32 * 1024 * 1024,
+                        live_arm_executor=(
+                            live_arm_executor_factory(_current_task_root(checked, workspace))
+                            if live_arm_executor_factory is not None
+                            else None
+                        ),
+                        live_levels=live_intervention_levels,
+                        live_repeats=live_intervention_repeats,
                     )
                     state = _write_state(state_path, state)
                 if next_stage == "calibration" and "difficulty" not in state["barriers"]:

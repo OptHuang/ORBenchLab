@@ -452,3 +452,94 @@ def _repair_plan() -> dict:
     return agentic_factory.compile_plan(
         name="repair plan", source_binding_digest="sha256:" + "a" * 64, stages=stages
     )
+
+
+def _valid_arm_outcome(level, repeat, intervention_id, journal_dir):
+    import pathlib
+    pathlib.Path(journal_dir).mkdir(parents=True, exist_ok=True)
+    reward = 0.0 if level == "baseline" else 1.0
+    return {
+        "journal": {
+            "protocol_satisfied": True,
+            "single_session": True,
+            "harbor_identity": {"container_id": f"cid-{level}-{repeat}"},
+            "journal_digest": "sha256:" + "a" * 64,
+            "error": None,
+        },
+        "reward": reward,
+        "ctrf": {"summary": {"passed": int(reward)}},
+        "reward_digest": "sha256:" + "b" * 64,
+        "ctrf_digest": "sha256:" + "c" * 64,
+        "verifier_container_id": f"cid-{level}-{repeat}",
+        "budget_usd": 0.05,
+    }
+
+
+def test_ensure_intervention_runs_harbor_native_live_study(tmp_path: Path, monkeypatch):
+    import shutil
+    from orbenchlab import factory_autopilot as fa
+
+    work = _workspace(tmp_path)
+    # Place the task at the canonical task-repair-v2 output.
+    task = work / "factory" / "task-repair-v2" / "alphaevolve-scheduling"
+    shutil.copytree(GOOD_TASK, task)
+    (work / "factory" / "analysis").mkdir(parents=True)
+    (work / "factory" / "analysis" / "intervention-policy.json").write_text(
+        json.dumps({
+            "trigger": {"kind": "assistant-event-index", "value": 1},
+            "hint_level": 1,
+            "hint_text": "reconsider the schedule objective and correct it",
+        })
+    )
+    evidence = tmp_path / "evidence"
+    barrier = fa._ensure_intervention(
+        plan=_plan(),
+        workdir=work,
+        evidence_root=evidence,
+        claude_executable=_executable(tmp_path, "claude"),
+        model="doubao",
+        provider_env=PROVIDER,
+        max_budget_usd=0.2,
+        enabled=True,
+        verifier_argv=[],
+        n_control=3,
+        n_treatment=3,
+        timeout_sec=60,
+        max_output_bytes=1 << 20,
+        live_arm_executor=_valid_arm_outcome,
+        live_levels=("L1", "L2"),
+        live_repeats=5,
+    )
+    assert barrier["harbor_native"] is True
+    assert barrier["study_evidence_level"] == "E4-controlled-same-session-intervention"
+    assert barrier["causal_intervention_claim_available"] is True
+    # The barrier validates end to end (capability + live study binding).
+    fa._validate_barriers({"barriers": {"intervention": barrier}}, work)
+
+
+def test_ensure_intervention_defaults_to_honest_not_run(tmp_path: Path):
+    import shutil
+    from orbenchlab import factory_autopilot as fa
+
+    work = _workspace(tmp_path)
+    task = work / "factory" / "task-repair-v2" / "alphaevolve-scheduling"
+    shutil.copytree(GOOD_TASK, task)
+    (work / "factory" / "analysis").mkdir(parents=True)
+    (work / "factory" / "analysis" / "intervention-policy.json").write_text(
+        json.dumps({
+            "trigger": {"kind": "assistant-event-index", "value": 1},
+            "hint_level": 1,
+            "hint_text": "reconsider",
+        })
+    )
+    barrier = fa._ensure_intervention(
+        plan=_plan(), workdir=work, evidence_root=tmp_path / "ev",
+        claude_executable=_executable(tmp_path, "claude"), model="m",
+        provider_env=PROVIDER, max_budget_usd=0.2, enabled=True, verifier_argv=[],
+        n_control=3, n_treatment=3, timeout_sec=60, max_output_bytes=1 << 20,
+    )
+    # No live executor and no adapter -> honest E0/E1, not harbor-native.
+    assert barrier["harbor_native"] is False
+    assert barrier["study_reason"] == "no-harbor-grounded-verifier-adapter"
+    assert barrier["causal_intervention_claim_available"] is False
+    fa._validate_barriers({"barriers": {"intervention": barrier}}, work)
