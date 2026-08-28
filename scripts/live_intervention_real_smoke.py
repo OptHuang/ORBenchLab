@@ -52,7 +52,10 @@ def _load_creds() -> dict[str, str]:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        creds[key.strip()] = value.strip().strip('"')
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        creds[key] = value.strip().strip('"').strip("'")
     return creds
 
 
