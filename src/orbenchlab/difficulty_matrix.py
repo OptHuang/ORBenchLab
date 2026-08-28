@@ -58,6 +58,38 @@ def _safe_relative(value: Any) -> str:
     return raw
 
 
+def _normalise_secondary_axes(
+    document: Mapping[str, Any], *, primary_name: str
+) -> list[dict[str, Any]]:
+    raw = document.get("secondary_axes", [])
+    if raw in (None, []):
+        return []
+    if not isinstance(raw, list) or len(raw) > 8:
+        raise DifficultyMatrixError("secondary_axes must be a bounded list of axis objects")
+    axes: list[dict[str, Any]] = []
+    names: set[str] = {primary_name}
+    for row in raw:
+        if not isinstance(row, Mapping):
+            raise DifficultyMatrixError("secondary axis must be an object")
+        name = str(row.get("name") or "").strip()
+        if not name or name in names:
+            raise DifficultyMatrixError("secondary axis names must be unique and non-primary")
+        names.add(name)
+        levels = row.get("levels", [])
+        if not isinstance(levels, list) or len(levels) > 16:
+            raise DifficultyMatrixError("secondary axis levels must be a bounded list")
+        axes.append(
+            {
+                "name": name,
+                "meaning": str(row.get("meaning") or "").strip() or None,
+                "expected_direction": str(row.get("expected_direction") or "").strip()
+                or None,
+                "levels": list(levels),
+            }
+        )
+    return axes
+
+
 def load_variant_manifest(path: str | Path) -> dict[str, Any]:
     manifest_path = Path(path)
     document = _load(manifest_path)
@@ -79,6 +111,9 @@ def load_variant_manifest(path: str | Path) -> dict[str, Any]:
         or evaluation_mode not in {"exploratory", "held-out-confirmation"}
     ):
         raise DifficultyMatrixError("variant manifest lacks one ordered primary axis")
+    primary_name = axis["name"].strip()
+    secondary_axes = _normalise_secondary_axes(document, primary_name=primary_name)
+    declared_axes = {primary_name, *(row["name"] for row in secondary_axes)}
     by_level: dict[str, dict[str, Any]] = {}
     ids: set[str] = set()
     paths: set[str] = set()
@@ -98,6 +133,12 @@ def load_variant_manifest(path: str | Path) -> dict[str, Any]:
             or axis_levels.get(axis["name"]) != row.get("level")
         ):
             raise DifficultyMatrixError("variant ids, paths and primary levels must be unique and bound")
+        if secondary_axes and any(
+            str(name) not in declared_axes for name in axis_levels
+        ):
+            raise DifficultyMatrixError(
+                f"variant {variant_id} sets an undeclared difficulty axis"
+            )
         ids.add(variant_id)
         paths.add(relative)
         by_level[level_key] = {
@@ -117,10 +158,11 @@ def load_variant_manifest(path: str | Path) -> dict[str, Any]:
     return {
         "schema_version": VARIANT_SCHEMA_VERSION,
         "primary_axis": {
-            "name": axis["name"].strip(),
+            "name": primary_name,
             "expected_direction": axis["expected_direction"].strip(),
             "ordered_levels": list(axis["ordered_levels"]),
         },
+        "secondary_axes": secondary_axes,
         "variants": ordered,
         "evaluation_mode": evaluation_mode,
         "manifest_digest": _file_digest(manifest_path),
@@ -171,6 +213,11 @@ def build_preregistration(
                 "level": row["level"],
                 "task_tree_digest": volc_rollout._task_tree_digest(task),
             }
+        )
+    digests = [row["task_tree_digest"] for row in variants]
+    if len(set(digests)) != len(digests):
+        raise DifficultyMatrixError(
+            "held-out preregistration variants must have distinct task trees"
         )
     receipt: dict[str, Any] = {
         "schema_version": PREREGISTRATION_SCHEMA_VERSION,
@@ -251,6 +298,7 @@ def build_receipt(
     weak_model: str,
     held_out: bool = False,
     preregistration_path: str | Path | None = None,
+    base_task_tree_digest: str | None = None,
 ) -> dict[str, Any]:
     """Recompute an ordered difficulty matrix from raw per-variant evidence."""
 
@@ -399,6 +447,17 @@ def build_receipt(
         )
         raw_trials.extend(trials)
     assert common_repetitions is not None
+    variant_digests = [row["task_tree_digest"] for row in variant_rows]
+    if len(set(variant_digests)) != len(variant_digests):
+        raise DifficultyMatrixError(
+            "difficulty variants must be pairwise distinct task trees; identical "
+            "variants cannot carry a difficulty claim"
+        )
+    if base_task_tree_digest is not None and base_task_tree_digest in variant_digests:
+        raise DifficultyMatrixError(
+            "a difficulty variant is byte-identical to the base task; renaming "
+            "is not a difficulty change"
+        )
     if held_out:
         assert preregistration is not None
         prereg_variants = preregistration.get("variants")
@@ -463,10 +522,26 @@ def build_receipt(
         if promising
         else "quarantine"
     )
+    difficulty_genome = {
+        "primary_axis": manifest["primary_axis"],
+        "secondary_axes": manifest.get("secondary_axes", []),
+        "variants": [
+            {
+                "variant_id": row["variant_id"],
+                "level": row["level"],
+                "axis_levels": dict(row.get("axis_levels", {})),
+                "task_tree_digest": row["task_tree_digest"],
+            }
+            for row in variant_rows
+        ],
+    }
     receipt: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "variant_manifest_digest": manifest["manifest_digest"],
         "primary_axis": manifest["primary_axis"],
+        "secondary_axes": manifest.get("secondary_axes", []),
+        "difficulty_genome": difficulty_genome,
+        "base_task_tree_digest": base_task_tree_digest,
         "frontier_model": frontier_model,
         "weak_model": weak_model,
         "repetitions_per_cell": common_repetitions,

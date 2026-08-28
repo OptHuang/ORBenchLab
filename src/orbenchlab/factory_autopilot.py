@@ -639,6 +639,9 @@ def _ensure_difficulty(
             "model_matrix": str(root / "matrix" / "harbor-model-matrix.json"),
         }
         observed.append({"variant_id": variant_id, **_usage_summary(matrix)})
+    base_task = factory_gates.resolve_task_root(
+        _stage_output_path(plan, workdir, "task-repair-v2", kind="directory")
+    )
     receipt = difficulty_matrix.build_receipt(
         manifest_path=manifest_path,
         variants_root=variants_root,
@@ -647,6 +650,7 @@ def _ensure_difficulty(
         weak_model=weak_model,
         held_out=held_out,
         preregistration_path=preregistration_path,
+        base_task_tree_digest=volc_rollout._task_tree_digest(base_task),
     )
     output = difficulty_matrix.write_receipt(receipt, evidence_root / "difficulty")
     trusted_source = evidence_root / "difficulty" / "trusted-source"

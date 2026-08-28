@@ -177,3 +177,77 @@ def test_writer_is_idempotent_and_refuses_conflicting_receipt(tmp_path: Path):
         difficulty_matrix.write_receipt(
             {"receipt_digest": "sha256:" + "2" * 64, "decision": "confirmed-promising"}, out
         )
+
+
+def test_secondary_axes_are_validated_and_recorded(tmp_path: Path):
+    manifest_path, root, evidence, _ = _fixture(tmp_path)
+    document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    document["secondary_axes"] = [
+        {"name": "hint", "meaning": "instruction hint richness", "levels": [0, 1]}
+    ]
+    for row in document["variants"]:
+        row["axis_levels"]["hint"] = 0
+    manifest_path.write_text(json.dumps(document), encoding="utf-8")
+    receipt = difficulty_matrix.build_receipt(
+        manifest_path=manifest_path,
+        variants_root=root,
+        evidence=evidence,
+        frontier_model="frontier",
+        weak_model="weak",
+    )
+    assert receipt["secondary_axes"][0]["name"] == "hint"
+    genome = receipt["difficulty_genome"]
+    assert {row["variant_id"] for row in genome["variants"]} == {"easy", "medium", "hard"}
+    assert all(row["axis_levels"]["hint"] == 0 for row in genome["variants"])
+
+
+def test_undeclared_axis_levels_are_rejected_when_axes_are_declared(tmp_path: Path):
+    manifest_path, root, evidence, _ = _fixture(tmp_path)
+    document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    document["secondary_axes"] = [{"name": "hint", "levels": [0, 1]}]
+    document["variants"][0]["axis_levels"]["undeclared_axis"] = 3
+    manifest_path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(difficulty_matrix.DifficultyMatrixError):
+        difficulty_matrix.load_variant_manifest(manifest_path)
+
+
+def test_byte_identical_variants_cannot_carry_a_difficulty_claim(tmp_path: Path):
+    manifest_path, root, evidence, _ = _fixture(tmp_path)
+    # Make "medium" byte-identical to "easy": renaming alone is not difficulty.
+    (root / "medium" / "task.toml").write_text(
+        (root / "easy" / "task.toml").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    from orbenchlab import volc_rollout
+
+    for name in ("easy", "medium"):
+        matrix_path = Path(evidence[name]["model_matrix"])
+        controls_path = Path(evidence[name]["controls"])
+        counts = (5, 3) if name == "easy" else (5, 0)
+        _write(matrix_path, _matrix(root / name, *counts))
+        _write(controls_path, _controls(root / name))
+    with pytest.raises(difficulty_matrix.DifficultyMatrixError) as excinfo:
+        difficulty_matrix.build_receipt(
+            manifest_path=manifest_path,
+            variants_root=root,
+            evidence=evidence,
+            frontier_model="frontier",
+            weak_model="weak",
+        )
+    assert "pairwise distinct" in str(excinfo.value)
+
+
+def test_variant_identical_to_base_task_is_rejected(tmp_path: Path):
+    manifest_path, root, evidence, _ = _fixture(tmp_path)
+    from orbenchlab import volc_rollout
+
+    base_digest = volc_rollout._task_tree_digest(root / "easy")
+    with pytest.raises(difficulty_matrix.DifficultyMatrixError) as excinfo:
+        difficulty_matrix.build_receipt(
+            manifest_path=manifest_path,
+            variants_root=root,
+            evidence=evidence,
+            frontier_model="frontier",
+            weak_model="weak",
+            base_task_tree_digest=base_digest,
+        )
+    assert "byte-identical to the base task" in str(excinfo.value)

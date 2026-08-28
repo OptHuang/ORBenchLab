@@ -105,6 +105,11 @@ def _add_difficulty_matrix(sub: argparse._SubParsersAction) -> None:
     parser.add_argument("--weak-model", required=True)
     parser.add_argument("--held-out", action="store_true")
     parser.add_argument("--preregistration")
+    parser.add_argument(
+        "--base-task-tree-digest",
+        default="",
+        help="optional base-task digest; variants identical to it are rejected",
+    )
     parser.add_argument("--out", required=True)
     parser.set_defaults(handler=_cmd_difficulty_matrix)
 
@@ -126,6 +131,7 @@ def _cmd_difficulty_matrix(args: argparse.Namespace) -> int:
         weak_model=args.weak_model,
         held_out=args.held_out,
         preregistration_path=args.preregistration,
+        base_task_tree_digest=args.base_task_tree_digest or None,
     )
     path = difficulty_matrix_mod.write_receipt(receipt, args.out)
     _print_json(
