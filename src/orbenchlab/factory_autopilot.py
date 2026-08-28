@@ -381,6 +381,11 @@ def _runtime_capability(task_digest: str) -> dict[str, Any]:
         "limitations": [
             "Harbor trials are independent full restarts.",
             "Restart-with-hint cannot establish an E4 same-checkpoint causal effect.",
+            (
+                "A separate same-session injection channel exists via "
+                "'orbench intervention-study' (claude-code stream-json stdin); it was "
+                "not used for these Harbor trials and confers no E4 status here."
+            ),
         ],
     }
     receipt["receipt_digest"] = _value_digest(receipt)

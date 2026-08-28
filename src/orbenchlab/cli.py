@@ -42,6 +42,7 @@ from . import factory_finalize as factory_finalize_mod
 from . import factory_supervisor as factory_supervisor_mod
 from . import difficulty_matrix as difficulty_matrix_mod
 from . import factory_autopilot as factory_autopilot_mod
+from . import session_interventions as session_interventions_mod
 
 PROG = "orbench"
 
@@ -89,8 +90,88 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_harbor_model_matrix(sub)
     _add_difficulty_matrix(sub)
     _add_agent_session(sub)
+    _add_intervention_study(sub)
     _add_agent_factory(sub)
     return parser
+
+
+def _add_intervention_study(sub: argparse._SubParsersAction) -> None:
+    parser = sub.add_parser(
+        "intervention-study",
+        help="run a controlled same-session hint-injection study with verifier outcomes",
+    )
+    parser.add_argument("--profile", choices=["codex", "claude-code"], default="claude-code")
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--prompt-file", required=True)
+    parser.add_argument("--template-workdir", required=True)
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--policy-file", required=True)
+    parser.add_argument(
+        "--verifier-cmd",
+        required=True,
+        help="verifier argv as a JSON array; exit 0 in the trial workdir means pass",
+    )
+    parser.add_argument("--n-control", type=int, default=3)
+    parser.add_argument("--n-treatment", type=int, default=3)
+    parser.add_argument("--timeout-sec", type=float, default=600.0)
+    parser.add_argument("--max-budget-usd", type=float, default=1.0)
+    parser.add_argument("--verifier-timeout-sec", type=float, default=300.0)
+    parser.add_argument("--executable")
+    parser.set_defaults(handler=_cmd_intervention_study)
+
+
+def _cmd_intervention_study(args: argparse.Namespace) -> int:
+    supplied = {
+        name: os.environ[name]
+        for name in (
+            ("OPENAI_BASE_URL", "OPENAI_API_KEY")
+            if args.profile == "codex"
+            else ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+        )
+        if name in os.environ
+    }
+    try:
+        policy = json.loads(Path(args.policy_file).read_text(encoding="utf-8"))
+        verifier_argv = json.loads(args.verifier_cmd)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise session_interventions_mod.SessionInterventionError(
+            "policy file and --verifier-cmd must be valid JSON"
+        ) from None
+    if not isinstance(verifier_argv, list) or not all(
+        isinstance(item, str) for item in verifier_argv
+    ):
+        raise session_interventions_mod.SessionInterventionError(
+            "--verifier-cmd must be a JSON array of strings"
+        )
+    receipt = session_interventions_mod.run_intervention_study(
+        profile=args.profile,
+        model=args.model,
+        prompt=Path(args.prompt_file).read_text(encoding="utf-8"),
+        template_workdir=args.template_workdir,
+        out=args.out,
+        environ=supplied,
+        verifier_argv=verifier_argv,
+        policy=policy,
+        n_control=args.n_control,
+        n_treatment=args.n_treatment,
+        timeout_sec=args.timeout_sec,
+        max_budget_usd=args.max_budget_usd,
+        executable=args.executable,
+        verifier_timeout_sec=args.verifier_timeout_sec,
+    )
+    _print_json(
+        {
+            "status": receipt["status"],
+            "evidence_level": receipt["evidence_level"],
+            "arms": receipt.get("arms"),
+            "all_treatment_injections_confirmed": receipt.get(
+                "all_treatment_injections_confirmed"
+            ),
+            "receipt_digest": receipt["receipt_digest"],
+            "written": str(Path(args.out) / "intervention-study.json"),
+        }
+    )
+    return 0 if receipt["status"] == "completed" else 9
 
 
 def _add_difficulty_matrix(sub: argparse._SubParsersAction) -> None:
@@ -171,6 +252,84 @@ def _add_agent_session(sub: argparse._SubParsersAction) -> None:
     )
     run.add_argument("--executable")
     run.set_defaults(handler=_cmd_agent_session_run)
+
+    capability = inner.add_parser(
+        "capability",
+        help="report the machine-readable same-session hint-injection capability",
+    )
+    capability.add_argument("--profile", choices=["codex", "claude-code"], required=True)
+    capability.add_argument(
+        "--runtime", choices=["agent-session", "harbor-trial"], default="agent-session"
+    )
+    capability.set_defaults(handler=_cmd_agent_session_capability)
+
+    intervene = inner.add_parser(
+        "intervene",
+        help="run one monitored session with an optional same-session hint injection",
+    )
+    intervene.add_argument("--profile", choices=["claude-code"], default="claude-code")
+    intervene.add_argument("--stage", required=True)
+    intervene.add_argument("--model", required=True)
+    intervene.add_argument("--prompt-file", required=True)
+    intervene.add_argument("--workdir", required=True)
+    intervene.add_argument("--out", required=True)
+    intervene.add_argument("--timeout-sec", type=float, required=True)
+    intervene.add_argument("--max-budget-usd", type=float, required=True)
+    intervene.add_argument(
+        "--policy-file",
+        default="",
+        help="JSON intervention policy; omit to run the instrumented no-injection control arm",
+    )
+    intervene.add_argument("--executable")
+    intervene.set_defaults(handler=_cmd_agent_session_intervene)
+
+
+def _cmd_agent_session_capability(args: argparse.Namespace) -> int:
+    receipt = session_interventions_mod.probe_capability(
+        profile=args.profile, runtime=args.runtime
+    )
+    _print_json(receipt)
+    return 0
+
+
+def _cmd_agent_session_intervene(args: argparse.Namespace) -> int:
+    supplied = {
+        name: os.environ[name]
+        for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+        if name in os.environ
+    }
+    policy = None
+    if args.policy_file:
+        try:
+            policy = json.loads(Path(args.policy_file).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            raise session_interventions_mod.SessionInterventionError(
+                "intervention policy file is not valid UTF-8 JSON"
+            ) from None
+    receipt = session_interventions_mod.run_intervention_session(
+        profile=args.profile,
+        stage=args.stage,
+        model=args.model,
+        prompt=Path(args.prompt_file).read_text(encoding="utf-8"),
+        workdir=args.workdir,
+        out=args.out,
+        timeout_sec=args.timeout_sec,
+        environ=supplied,
+        max_budget_usd=args.max_budget_usd,
+        policy=policy,
+        executable=args.executable,
+    )
+    _print_json(
+        {
+            "session_id": receipt["session_id"],
+            "status": receipt["status"],
+            "intervention_class": receipt["intervention_class"],
+            "injection": receipt["injection"],
+            "receipt_digest": receipt["receipt_digest"],
+            "receipt_path": receipt["receipt_path"],
+        }
+    )
+    return 0 if receipt["status"] == "completed" else 9
 
 
 def _cmd_agent_session_run(args: argparse.Namespace) -> int:
