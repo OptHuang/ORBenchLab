@@ -158,8 +158,126 @@ def _harbor_validator(task_digest: str) -> Callable[[Mapping[str, Any]], dict[st
     return validate
 
 
-def _calibration_validator(task_digest: str) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
+def _harbor_calibration_validator(
+    task_digest: str,
+) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
+    """Validate a real repeated Harbor model-matrix screening report.
+
+    This is the strongest calibration evidence the factory produces: every
+    trial is a fresh Harbor rollout whose verifier outcome, reward, CTRF and
+    ATIF trajectory digests were validated when the matrix receipt was built.
+    Arms and conservative separation are recomputed here from the raw trials.
+    """
+
+    from . import harbor_model_matrix
+
     def validate(document: Mapping[str, Any]) -> dict[str, Any]:
+        supplied = document.get("report_digest")
+        unsigned = {key: value for key, value in document.items() if key != "report_digest"}
+        rows = document.get("tasks")
+        trials = document.get("trials")
+        contract = document.get("run_contract")
+        if (
+            document.get("schema_version") != "orbenchlab.screening-report.v1"
+            or document.get("harbor_model_matrix_schema_version")
+            != harbor_model_matrix.SCHEMA_VERSION
+            or supplied != _value_digest(unsigned)
+            or document.get("task_tree_digest") != task_digest
+            or not _is_digest(document.get("harbor_model_matrix_digest"))
+            or not _is_digest(document.get("harbor_control_report_digest"))
+            or not isinstance(rows, list)
+            or len(rows) != 1
+            or not isinstance(rows[0], Mapping)
+            or not isinstance(trials, list)
+            or not isinstance(contract, Mapping)
+        ):
+            raise FactoryFinalizeError("Harbor calibration schema/digest/task binding failed")
+        row = rows[0]
+        controls = row.get("control_gates")
+        if (
+            document.get("task") != row.get("task")
+            or row.get("evidence_level") != "E3"
+            or row.get("decision") != "review-promising"
+            or not isinstance(controls, Mapping)
+            or any(
+                not isinstance(controls.get(name), Mapping)
+                or controls[name].get("gate") != "pass"
+                for name in ("oracle", "nop")
+            )
+        ):
+            raise FactoryFinalizeError("Harbor calibration is not a promising E3 receipt")
+        models = [str(model) for model in document.get("models") or []]
+        repetitions = contract.get("repetitions")
+        if (
+            len(models) < 2
+            or len(set(models)) != len(models)
+            or not isinstance(repetitions, int)
+            or isinstance(repetitions, bool)
+            or repetitions < 5
+            or list(contract.get("models") or []) != models
+            or list(contract.get("hint_levels") or []) != [0]
+        ):
+            raise FactoryFinalizeError("Harbor calibration lacks a >=5-repetition model rectangle")
+        trial_keys = set()
+        for trial in trials:
+            verifier = trial.get("verifier") if isinstance(trial, Mapping) else None
+            if (
+                not isinstance(trial, Mapping)
+                or trial.get("model") not in models
+                or trial.get("hint_level") != 0
+                or trial.get("phase") != "harbor-verifier"
+                or trial.get("status") not in {"pass", "fail"}
+                or not _is_digest(trial.get("trial_result_digest"))
+                or not _is_digest(trial.get("reward_digest"))
+                or not _is_digest(trial.get("ctrf_digest"))
+                or not isinstance(verifier, Mapping)
+                or verifier.get("receipt_valid") is not True
+                or verifier.get("status") != trial.get("status")
+                or not isinstance(trial.get("trajectories"), list)
+                or not trial["trajectories"]
+                or any(
+                    not isinstance(trace, Mapping) or not _is_digest(trace.get("digest"))
+                    for trace in trial["trajectories"]
+                )
+            ):
+                raise FactoryFinalizeError("Harbor calibration trial lacks verifier-grounded evidence")
+            trial_keys.add((trial["model"], trial.get("trial")))
+        if len(trial_keys) != len(trials) or len(trials) != len(models) * repetitions:
+            raise FactoryFinalizeError("Harbor calibration trials do not form a unique rectangle")
+        recomputed_arms = volc_rollout._summarize_trials(trials)
+        if dict(row.get("arms") or {}) != recomputed_arms:
+            raise FactoryFinalizeError("Harbor calibration arms do not match raw trial outcomes")
+        recomputed = volc_rollout._discrimination_summary(
+            recomputed_arms, sorted(models), repetitions=repetitions
+        )
+        if (
+            dict(row.get("discrimination") or {}) != recomputed
+            or recomputed.get("rectangular") is not True
+            or recomputed.get("promising") is not True
+            or row.get("discrimination_index_observed_gap") != recomputed.get("observed_gap")
+        ):
+            raise FactoryFinalizeError("Harbor calibration discrimination does not recompute as promising")
+        return {
+            "task_tree_digest": task_digest,
+            "report_digest": supplied,
+            "task_id": row.get("task"),
+            "models": sorted(models),
+            "minimum_repetitions": repetitions,
+            "observed_gap": recomputed["observed_gap"],
+            "gap_95_lower_bound": recomputed["gap_95_lower_bound"],
+            "calibration_kind": "harbor-model-matrix",
+            "evidence_level": "E3",
+        }
+
+    return validate
+
+
+def _calibration_validator(task_digest: str) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
+    harbor_validate = _harbor_calibration_validator(task_digest)
+
+    def validate(document: Mapping[str, Any]) -> dict[str, Any]:
+        if document.get("harbor_model_matrix_schema_version") is not None:
+            return harbor_validate(document)
         supplied = document.get("report_digest")
         unsigned = {key: value for key, value in document.items() if key != "report_digest"}
         rows = document.get("tasks")
@@ -267,6 +385,7 @@ def _calibration_validator(task_digest: str) -> Callable[[Mapping[str, Any]], di
             "minimum_repetitions": next(iter(repetitions)),
             "observed_gap": recomputed["observed_gap"],
             "gap_95_lower_bound": recomputed["gap_95_lower_bound"],
+            "calibration_kind": "volc-task-screen",
             "evidence_level": "E3",
         }
 

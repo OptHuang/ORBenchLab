@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from orbenchlab import agentic_factory, factory_finalize, pipeline, task_authoring, volc_rollout
 from orbenchlab.cli import main
 from orbenchlab.volc_review import REQUIRED_REVIEW_CRITERIA
@@ -422,3 +424,165 @@ def test_real_pipeline_card_is_review_promising_with_bound_genome(tmp_path: Path
     assert len(cards) == 1
     assert cards[0]["task_id"] == volc_rollout._task_id(task)
     assert cards[0]["decision"] == "review-promising"
+
+
+def _harbor_matrix_fixture(tmp_path: Path) -> tuple[Path, dict, dict]:
+    from orbenchlab import volc_rollout
+
+    task = tmp_path / "matrix-task"
+    task.mkdir()
+    (task / "task.toml").write_text('[task]\nname = "demo_matrix"\n', encoding="utf-8")
+    task_id = volc_rollout._task_id(task)
+    tree = volc_rollout._task_tree_digest(task)
+    trials = []
+    for model, passed in (("frontier", 5), ("weak", 0)):
+        for attempt in range(1, 6):
+            status = "pass" if attempt <= passed else "fail"
+            trials.append(
+                {
+                    "trial_id": factory_finalize._value_digest([model, attempt]),
+                    "model_id": model,
+                    "attempt": attempt,
+                    "status": status,
+                    "agent_failure_class": None,
+                    "usage": {"cost_usd": 0.1},
+                    "reward": 1.0 if status == "pass" else 0.0,
+                    "trial_name": f"{task_id}__{attempt}",
+                    "trial_result_digest": "sha256:" + "1" * 64,
+                    "reward_digest": "sha256:" + "2" * 64,
+                    "ctrf_digest": "sha256:" + "3" * 64,
+                    "ctrf_summary": {
+                        "tests": 2,
+                        "passed": 2 if status == "pass" else 0,
+                        "failed": 0 if status == "pass" else 2,
+                        "skipped": 0,
+                        "pending": 0,
+                        "other": 0,
+                    },
+                    "trajectories": [
+                        {
+                            "path": f"{task_id}__{attempt}/agent/trajectory.json",
+                            "digest": "sha256:" + "9" * 64,
+                            "steps": 3,
+                        }
+                    ],
+                }
+            )
+    matrix = {
+        "schema_version": "orbenchlab.harbor-model-matrix.v1",
+        "task": task_id,
+        "task_tree_digest": tree,
+        "models": ["frontier", "weak"],
+        "repetitions": 5,
+        "rectangular": True,
+        "trials": trials,
+        "jobs": [],
+        "provider_route_digest": "sha256:" + "4" * 64,
+        "preregistration_digest": None,
+        "agent": {
+            "name": "claude-code",
+            "executable_digest": "sha256:" + "a" * 64,
+            "max_budget_usd_per_trial": 1.0,
+            "max_turns_per_trial": 40,
+            "budget_enforcement": "claude-cli-max-budget-usd",
+            "max_job_attempts_per_model": 2,
+            "maximum_model_liability_usd": 20.0,
+            "liability_accounting": "crash-safe whole-job reservation before subprocess launch",
+        },
+        "evidence_level": "E3",
+        "checkpoint_capability": False,
+        "limitations": ["Verifier-grounded Harbor trajectories; not TB-Science acceptance."],
+    }
+    matrix["receipt_digest"] = factory_finalize._value_digest(
+        {key: value for key, value in matrix.items() if key != "receipt_digest"}
+    )
+    digests = {
+        key: "sha256:" + char * 64
+        for key, char in zip(
+            (
+                "job_result_digest",
+                "trial_result_digest",
+                "ctrf_digest",
+                "reward_digest",
+                "artifact_manifest_digest",
+            ),
+            "bcdef",
+        )
+    }
+    gates = {
+        "oracle": {
+            "gate": "pass",
+            "control": "oracle",
+            "task_name": task_id,
+            "reward": 1.0,
+            "ctrf_summary": {"tests": 2, "passed": 2, "failed": 0, "skipped": 0, "pending": 0, "other": 0},
+            **digests,
+        },
+        "nop": {
+            "gate": "pass",
+            "control": "nop",
+            "task_name": task_id,
+            "reward": 0.0,
+            "ctrf_summary": {"tests": 2, "passed": 0, "failed": 2, "skipped": 0, "pending": 0, "other": 0},
+            **digests,
+        },
+    }
+    controls = {
+        "schema_version": "orbenchlab.screening-report.v1",
+        "harbor_receipt_schema_version": "orbenchlab.harbor-controls.v1",
+        "task_tree_digest": tree,
+        "authoring_task_tree_digest": tree,
+        "executed_task_tree_digest": tree,
+        "tasks": [
+            {
+                "task": task_id,
+                "family": task_id,
+                "arms": {},
+                "control_gates": gates,
+                "decision": "collect-more-evidence",
+                "evidence_level": "E3",
+            }
+        ],
+    }
+    controls["report_digest"] = factory_finalize._value_digest(
+        {key: value for key, value in controls.items() if key != "report_digest"}
+    )
+    return task, matrix, controls
+
+
+def test_harbor_matrix_screening_is_accepted_as_calibration_evidence(tmp_path: Path):
+    from orbenchlab import harbor_model_matrix, volc_rollout
+
+    task, matrix, controls = _harbor_matrix_fixture(tmp_path)
+    report = harbor_model_matrix.build_screening_report(
+        matrix, harbor_controls=controls, out=tmp_path / "screening"
+    )
+    validator = factory_finalize._calibration_validator(
+        volc_rollout._task_tree_digest(task)
+    )
+    details = validator(report)
+    assert details["calibration_kind"] == "harbor-model-matrix"
+    assert details["models"] == ["frontier", "weak"]
+    assert details["minimum_repetitions"] == 5
+    assert details["observed_gap"] == 1.0
+    assert details["gap_95_lower_bound"] > 0
+
+
+def test_harbor_matrix_calibration_rejects_unverified_trials(tmp_path: Path):
+    from orbenchlab import harbor_model_matrix, volc_rollout
+
+    task, matrix, controls = _harbor_matrix_fixture(tmp_path)
+    report = harbor_model_matrix.build_screening_report(
+        matrix, harbor_controls=controls, out=tmp_path / "screening"
+    )
+    forged = dict(report)
+    forged["trials"] = [dict(row) for row in report["trials"]]
+    forged["trials"][0]["verifier"] = {**forged["trials"][0]["verifier"], "receipt_valid": False}
+    forged["report_digest"] = factory_finalize._value_digest(
+        {key: value for key, value in forged.items() if key != "report_digest"}
+    )
+    validator = factory_finalize._calibration_validator(
+        volc_rollout._task_tree_digest(task)
+    )
+    with pytest.raises(factory_finalize.FactoryFinalizeError):
+        validator(forged)
