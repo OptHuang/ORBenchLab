@@ -38,7 +38,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Mapping, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from .core.errors import ORBenchError
 
@@ -58,6 +58,10 @@ _VOLC_EXACT = "volces.com"
 _ROUTE_PATH = "/api/coding"
 # The exact endpoints the Claude/Anthropic client needs on the coding route.
 _ALLOWED_ENDPOINTS = frozenset({"/v1/messages"})
+# The real Claude CLI posts to ``/v1/messages?beta=true``; permit only this
+# exact, known-safe query allowlist (key -> allowed values) and forward it
+# verbatim to the same pinned origin. Anything else is refused.
+_ALLOWED_QUERY = {"beta": frozenset({"true", "false"})}
 RELAY_POLICY_VERSION = "orbenchlab.credential-relay.v2"
 
 
@@ -284,9 +288,11 @@ class CredentialRelay:
 
     def _validate_target_path(self, raw_path: str) -> str:
         # Reject absolute URIs, traversal, and anything outside the exact
-        # endpoint allowlist under the coding route.
+        # endpoint allowlist under the coding route. A query string is allowed
+        # only if every key/value is on the known-safe allowlist (the Claude CLI
+        # uses ``?beta=true``); it is forwarded verbatim to the same origin.
         parsed = urlsplit(raw_path)
-        if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+        if parsed.scheme or parsed.netloc or parsed.fragment:
             raise CredentialRelayError("relay refuses an absolute or decorated URI")
         path = parsed.path
         if ".." in path or "//" in path or not path.startswith(self._route_path + "/"):
@@ -294,6 +300,12 @@ class CredentialRelay:
         endpoint = path[len(self._route_path):]
         if endpoint not in _ALLOWED_ENDPOINTS:
             raise CredentialRelayError("relay endpoint is not on the allowlist")
+        if parsed.query:
+            pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+            for key, value in pairs:
+                if key not in _ALLOWED_QUERY or value not in _ALLOWED_QUERY[key]:
+                    raise CredentialRelayError("relay refuses a non-allowlisted query parameter")
+            return f"{path}?{parsed.query}"
         return path
 
     def _forward(self, handler: http.server.BaseHTTPRequestHandler) -> None:

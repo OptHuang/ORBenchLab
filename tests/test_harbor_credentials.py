@@ -85,6 +85,8 @@ def test_relay_rejects_wrong_token_revoked_token_and_bad_routes():
                 ("/api/codingevil/v1/messages", token, 403),  # not on allowlist
                 ("/api/coding/v1/complete", token, 403),      # endpoint not allowed
                 ("/not-coding/v1/messages", token, 403),
+                ("/api/coding/v1/messages?evil=1", token, 403),  # query not allowlisted
+                ("/api/coding/v1/messages?beta=maybe", token, 403),  # bad query value
             ]:
                 with pytest.raises(urllib.error.HTTPError) as exc:
                     post(path, tok)
@@ -98,6 +100,26 @@ def test_relay_rejects_wrong_token_revoked_token_and_bad_routes():
             with pytest.raises(urllib.error.HTTPError) as exc:
                 post("/api/coding/v1/messages", token)
             assert exc.value.code == 403
+    finally:
+        upstream.shutdown()
+
+
+def test_relay_allows_claude_beta_query():
+    # The real Claude CLI posts to /v1/messages?beta=true; the relay must
+    # forward exactly that query (and only the allowlisted one) to the origin.
+    _FakeVolc.seen_auth = []
+    upstream = _fake_upstream()
+    try:
+        with _relay_to(upstream) as relay:
+            token = relay.issue_token({"job": "j1"})
+            url = relay.relay_env(token)["ANTHROPIC_BASE_URL"] + "/v1/messages?beta=true"
+            request = urllib.request.Request(
+                url, data=b"{}", method="POST",
+                headers={"x-api-key": token, "content-type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                assert b"message_stop" in response.read()
+            assert relay.request_count == 1
     finally:
         upstream.shutdown()
 
