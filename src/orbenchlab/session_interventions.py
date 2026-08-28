@@ -24,6 +24,7 @@ A restart-with-hint arm is *not* this; it stays E3 elsewhere.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -120,6 +121,40 @@ def probe_capability(*, profile: str, runtime: str = "agent-session") -> dict[st
     return receipt
 
 
+def _verify_receipt_file(path: Path) -> tuple[dict[str, Any], list[str]]:
+    """Reload a sealed intervention-session receipt and re-verify its bytes."""
+
+    problems: list[str] = []
+    if not path.is_file() or path.is_symlink():
+        return {}, ["session receipt file is missing"]
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}, ["session receipt is not valid UTF-8 JSON"]
+    if not isinstance(receipt, dict):
+        return {}, ["session receipt root is not an object"]
+    unsigned = {key: value for key, value in receipt.items() if key != "receipt_digest"}
+    if (
+        receipt.get("schema_version") != SESSION_SCHEMA_VERSION
+        or receipt.get("receipt_digest") != _digest(unsigned)
+    ):
+        problems.append("receipt digest does not match its contents")
+    session_dir = path.parent
+    for name, key in (
+        ("events.jsonl", "events_digest"),
+        ("stdout.bin", "stdout_digest"),
+        ("stderr.bin", "stderr_digest"),
+    ):
+        artifact = session_dir / name
+        if (
+            not artifact.is_file()
+            or artifact.is_symlink()
+            or _digest_bytes(artifact.read_bytes()) != receipt.get(key)
+        ):
+            problems.append(f"{name} digest does not match the sealed receipt")
+    return receipt, problems
+
+
 def _validate_policy(policy: Mapping[str, Any]) -> dict[str, Any]:
     trigger = policy.get("trigger")
     hint_text = policy.get("hint_text")
@@ -155,15 +190,27 @@ def _validate_policy(policy: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _contains_text(value: Any, needle: str) -> bool:
+    if isinstance(value, str):
+        return needle in value
+    if isinstance(value, Mapping):
+        return any(_contains_text(item, needle) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_text(item, needle) for item in value)
+    return False
+
+
 class _EventMonitor:
     """Incrementally parse stream-json stdout lines into a timed event log."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, hint_probe: str | None = None) -> None:
         self.buffer = b""
         self.events: list[dict[str, Any]] = []
         self.assistant_events = 0
         self.result_seen = False
         self.truncated = False
+        self.hint_probe = hint_probe
+        self.runtime_session_id: str | None = None
 
     def feed(self, chunk: bytes, at_sec: float) -> list[dict[str, Any]]:
         self.buffer += chunk
@@ -190,8 +237,16 @@ class _EventMonitor:
                 "type": event_type,
                 "raw_text": text if value is None else None,
             }
-            if isinstance(value, Mapping) and isinstance(value.get("subtype"), str):
-                event["subtype"] = value["subtype"]
+            if isinstance(value, Mapping):
+                if isinstance(value.get("subtype"), str):
+                    event["subtype"] = value["subtype"]
+                session_id = value.get("session_id")
+                if isinstance(session_id, str) and session_id:
+                    event["session_id"] = session_id
+                    if self.runtime_session_id is None:
+                        self.runtime_session_id = session_id
+                if self.hint_probe and _contains_text(value, self.hint_probe):
+                    event["contains_hint"] = True
             if len(self.events) < _MAX_EVENTS:
                 self.events.append(event)
             else:
@@ -307,16 +362,84 @@ def run_intervention_session(
     session_id = _digest(identity).removeprefix("sha256:")[:32]
     session_dir = Path(out).resolve() / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
+    receipt_path = session_dir / "receipt.json"
+    lock_path = session_dir / "session.lock"
+    lock = lock_path.open("a+b")
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    try:
+        if receipt_path.is_file() and not receipt_path.is_symlink():
+            reused, problems = _verify_receipt_file(receipt_path)
+            if reused and not problems:
+                # Idempotent resume: a fully sealed, digest-valid session is
+                # never re-run, so a resumed study never re-buys provider calls.
+                return {**reused, "receipt_path": str(receipt_path), "reused": True}
+        return _run_intervention_session_locked(
+            profile=profile,
+            model=model,
+            prompt=prompt,
+            cwd=cwd,
+            session_dir=session_dir,
+            receipt_path=receipt_path,
+            command=command,
+            initial=initial,
+            hint_bytes=hint_bytes,
+            checked_policy=checked_policy,
+            capability=capability,
+            identity=identity,
+            session_id=session_id,
+            child_env=child_env,
+            secrets=secrets,
+            timeout_sec=float(timeout_sec),
+            trigger_deadline=trigger_deadline,
+            max_output_bytes=max_output_bytes,
+        )
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
 
-    monitor = _EventMonitor()
+
+def _run_intervention_session_locked(
+    *,
+    profile: str,
+    model: str,
+    prompt: str,
+    cwd: Path,
+    session_dir: Path,
+    receipt_path: Path,
+    command: Sequence[str],
+    initial: bytes,
+    hint_bytes: bytes,
+    checked_policy: Mapping[str, Any] | None,
+    capability: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    session_id: str,
+    child_env: Mapping[str, str],
+    secrets: Sequence[bytes],
+    timeout_sec: float,
+    trigger_deadline: float,
+    max_output_bytes: int,
+) -> dict[str, Any]:
+    secret_values = tuple(secrets)
+    monitor = _EventMonitor(
+        hint_probe=checked_policy["hint_text"] if checked_policy else None
+    )
     injection: dict[str, Any] = {
         "requested": checked_policy is not None,
         "fired": False,
         "fired_at_sec": None,
         "pre_injection_events": None,
         "pre_injection_assistant_events": None,
+        "hint_fully_written_at_sec": None,
+        "events_at_hint_write": None,
+        "hint_echo_event_index": None,
+        "first_post_hint_assistant_index": None,
         "post_injection_events": 0,
         "injection_confirmed": False,
+        "confirmation_rule": (
+            "completed session + full hint written + user event echoing the hint "
+            "strictly after the write boundary + a same-session assistant event "
+            "strictly after that echo"
+        ),
         "stdin_closed_reason": None,
         "hint_digest": _digest_bytes(hint_bytes) if hint_bytes else None,
     }
@@ -381,6 +504,11 @@ def run_intervention_session(
                 if checked_policy is None:
                     close_stdin("no-injection-control")
                 elif injection["fired"]:
+                    if injection["hint_fully_written_at_sec"] is None:
+                        injection["hint_fully_written_at_sec"] = round(
+                            time.monotonic() - started, 4
+                        )
+                        injection["events_at_hint_write"] = len(monitor.events)
                     close_stdin("hint-delivered")
             ready = streams.select(0.05)
             fresh_events: list[Mapping[str, Any]] = []
@@ -406,13 +534,6 @@ def run_intervention_session(
                 captured += len(chunk)
                 if key.data == "stdout":
                     fresh_events = monitor.feed(chunk, time.monotonic() - started)
-                    if injection["fired"]:
-                        injection["post_injection_events"] += len(fresh_events)
-                        if any(
-                            event.get("type") in {"assistant", "result", "user"}
-                            for event in fresh_events
-                        ):
-                            injection["injection_confirmed"] = True
             if failure is not None:
                 break
             elapsed = time.monotonic() - started
@@ -457,6 +578,46 @@ def run_intervention_session(
     exit_code = process.returncode
     if failure is None and exit_code != 0:
         failure = "agent_exit_nonzero"
+    if injection["fired"] and injection["events_at_hint_write"] is not None:
+        boundary = int(injection["events_at_hint_write"])
+        post_events = monitor.events[boundary:]
+        injection["post_injection_events"] = len(post_events)
+        # Confirmation is echo-anchored: the CLI cannot know the hint text
+        # before it was fully written, so a user event containing it proves
+        # consumption, and only a same-session assistant event strictly after
+        # that echo proves the runtime continued on the hint.  Late-flushed
+        # pre-hint assistant output and the echo itself never confirm.
+        echo_index = next(
+            (
+                event["index"]
+                for event in post_events
+                if event.get("type") == "user" and event.get("contains_hint")
+            ),
+            None,
+        )
+        injection["hint_echo_event_index"] = echo_index
+        if echo_index is not None:
+            assistant_index = next(
+                (
+                    event["index"]
+                    for event in monitor.events
+                    if event["index"] > echo_index
+                    and event.get("type") == "assistant"
+                    and (
+                        monitor.runtime_session_id is None
+                        or event.get("session_id") in (None, monitor.runtime_session_id)
+                    )
+                ),
+                None,
+            )
+            injection["first_post_hint_assistant_index"] = assistant_index
+            injection["injection_confirmed"] = (
+                assistant_index is not None
+                and failure is None
+                and exit_code == 0
+                and not monitor.truncated
+                and monitor.result_seen
+            )
     stdout_raw = b"".join(chunks["stdout"])
     stderr_raw = b"".join(chunks["stderr"])
     stdout, redacted_out = agent_sessions._redact_bytes(stdout_raw, secrets)
@@ -485,6 +646,9 @@ def run_intervention_session(
         "elapsed_sec": round(time.monotonic() - started, 3),
         "event_count": len(monitor.events),
         "assistant_event_count": monitor.assistant_events,
+        "result_event_seen": monitor.result_seen,
+        "runtime_session_id": monitor.runtime_session_id,
+        "agent_pid": process.pid,
         "events_truncated": monitor.truncated,
         "events_digest": _digest_bytes(events_path.read_bytes()),
         "stdout_digest": _digest_bytes(stdout),
@@ -505,6 +669,46 @@ def run_intervention_session(
     )
     _atomic_json(session_dir / "receipt.json", receipt)
     return {**receipt, "receipt_path": str(session_dir / "receipt.json")}
+
+
+def _reverify_session_receipt(
+    session: Mapping[str, Any],
+    *,
+    profile: str,
+    model: str,
+    prompt: str,
+    policy: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Reload one session receipt from disk and re-verify it byte-for-byte.
+
+    Study-level evidence grading must never trust the in-memory dict a runner
+    returned: the receipt file, its digest, its identity bindings, the sealed
+    stream digests and the completion invariants are all recomputed here.
+    """
+
+    path = Path(str(session.get("receipt_path") or ""))
+    receipt, problems = _verify_receipt_file(path)
+    if not receipt:
+        return {}, problems
+    identity = receipt.get("identity")
+    expected_policy_digest = _digest(_validate_policy(policy)) if policy else None
+    if (
+        not isinstance(identity, Mapping)
+        or identity.get("profile") != profile
+        or identity.get("model") != model.strip()
+        or identity.get("prompt_digest") != _digest_bytes(prompt.encode())
+        or identity.get("policy_digest") != expected_policy_digest
+    ):
+        problems.append("receipt identity does not bind this study contract")
+    if receipt.get("status") != "completed":
+        problems.append("session did not complete")
+    if receipt.get("exit_code") != 0:
+        problems.append("agent exited nonzero")
+    if receipt.get("events_truncated"):
+        problems.append("event log was truncated")
+    if receipt.get("result_event_seen") is not True:
+        problems.append("no final result event was observed")
+    return receipt, problems
 
 
 def _run_verifier(
@@ -559,6 +763,80 @@ def run_intervention_study(
     capability = probe_capability(profile=profile, runtime="agent-session")
     root = Path(out).resolve()
     root.mkdir(parents=True, exist_ok=True)
+    study_lock = (root / ".intervention-study.lock").open("a+b")
+    fcntl.flock(study_lock.fileno(), fcntl.LOCK_EX)
+    try:
+        return _run_intervention_study_locked(
+            profile=profile,
+            model=model,
+            prompt=prompt,
+            template=Path(template_workdir).resolve(),
+            root=root,
+            environ=environ,
+            verifier_argv=verifier_argv,
+            checked_policy=checked_policy,
+            capability=capability,
+            n_control=n_control,
+            n_treatment=n_treatment,
+            timeout_sec=timeout_sec,
+            max_budget_usd=max_budget_usd,
+            executable=executable,
+            verifier_timeout_sec=verifier_timeout_sec,
+            max_output_bytes=max_output_bytes,
+        )
+    finally:
+        fcntl.flock(study_lock.fileno(), fcntl.LOCK_UN)
+        study_lock.close()
+
+
+def _run_intervention_study_locked(
+    *,
+    profile: str,
+    model: str,
+    prompt: str,
+    template: Path,
+    root: Path,
+    environ: Mapping[str, str],
+    verifier_argv: Sequence[str],
+    checked_policy: Mapping[str, Any],
+    capability: Mapping[str, Any],
+    n_control: int,
+    n_treatment: int,
+    timeout_sec: float,
+    max_budget_usd: float,
+    executable: str | Path | None,
+    verifier_timeout_sec: float,
+    max_output_bytes: int,
+) -> dict[str, Any]:
+    if template.is_symlink() or not template.is_dir():
+        raise SessionInterventionError("template workdir must be a real directory")
+    # Persist a worst-case liability reservation before any provider call, so a
+    # crash between reservation and completion never silently restores budget.
+    reservation = {
+        "schema_version": "orbenchlab.intervention-study-reservation.v1",
+        "profile": profile,
+        "model": model,
+        "prompt_digest": _digest_bytes(prompt.encode()),
+        "policy_digest": _digest(checked_policy),
+        "template_tree_digest": _tree_digest(template),
+        "n_control": n_control,
+        "n_treatment": n_treatment,
+        "max_budget_usd_per_session": max_budget_usd,
+        "reserved_liability_usd": round(
+            (n_control + n_treatment) * float(max_budget_usd), 6
+        ),
+        "accounting": "full per-session liability charged before any session launch",
+    }
+    reservation["reservation_digest"] = _digest(reservation)
+    reservation_path = root / "study-reservation.json"
+    if reservation_path.is_file() and not reservation_path.is_symlink():
+        existing = json.loads(reservation_path.read_text(encoding="utf-8"))
+        if existing != reservation:
+            raise SessionInterventionError(
+                "intervention study output binds a different immutable contract"
+            )
+    else:
+        _atomic_json(reservation_path, reservation)
     if not capability["same_session_hint_injection"]:
         receipt = {
             "schema_version": STUDY_SCHEMA_VERSION,
@@ -584,8 +862,38 @@ def run_intervention_study(
     for arm, index, arm_policy in arms:
         trial_dir = root / "trials" / f"{arm}-{index:02d}"
         workdir = trial_dir / "workdir"
-        if not workdir.exists():
-            trial_dir.mkdir(parents=True, exist_ok=True)
+        sessions_root = trial_dir / "sessions"
+        trial_dir.mkdir(parents=True, exist_ok=True)
+        # Reuse the workdir only when it already carries a completed,
+        # digest-valid session; otherwise a partially-mutated workdir from an
+        # interrupted attempt is archived and a fresh template copy is made
+        # atomically, so no session ever re-runs against a dirty workspace.
+        has_valid_session = False
+        if sessions_root.is_dir():
+            for candidate in sorted(sessions_root.glob("*/receipt.json")):
+                _, problems = _verify_receipt_file(candidate)
+                if problems:
+                    # A receipt that exists but fails re-verification is tamper
+                    # or corruption; fail closed rather than silently discard and
+                    # re-buy the session.
+                    raise SessionInterventionError(
+                        f"{arm}-{index:02d} session receipt failed re-verification: "
+                        + "; ".join(problems)
+                    )
+                has_valid_session = True
+                break
+        if not (workdir.is_dir() and has_valid_session):
+            if workdir.exists():
+                shutil.rmtree(
+                    trial_dir / f"dirty-workdir-{uuid.uuid4().hex}", ignore_errors=True
+                )
+                os.replace(
+                    workdir, trial_dir / f"dirty-workdir-{uuid.uuid4().hex}"
+                )
+            if sessions_root.exists():
+                os.replace(
+                    sessions_root, trial_dir / f"dirty-sessions-{uuid.uuid4().hex}"
+                )
             temporary = trial_dir / f".workdir.{uuid.uuid4().hex}.tmp"
             shutil.copytree(template, temporary, symlinks=False)
             os.replace(temporary, workdir)
@@ -595,7 +903,7 @@ def run_intervention_study(
             model=model,
             prompt=prompt,
             workdir=workdir,
-            out=trial_dir / "sessions",
+            out=sessions_root,
             timeout_sec=timeout_sec,
             environ=environ,
             max_budget_usd=max_budget_usd,
@@ -603,21 +911,39 @@ def run_intervention_study(
             executable=executable,
             max_output_bytes=max_output_bytes,
         )
+        verified_receipt, receipt_problems = _reverify_session_receipt(
+            session,
+            profile=profile,
+            model=model,
+            prompt=prompt,
+            policy=arm_policy,
+        )
         verifier = _run_verifier(
             verifier_argv,
             cwd=workdir,
             timeout_sec=verifier_timeout_sec,
             max_output_bytes=max_output_bytes,
         )
+        # Evidence rows come from the re-verified on-disk receipt, never the
+        # runner's in-memory dict; an unverifiable receipt contributes no
+        # intervention class at all.
         trials.append(
             {
                 "arm": arm,
                 "index": index,
                 "session_id": session["session_id"],
-                "session_receipt_digest": session["receipt_digest"],
-                "session_status": session["status"],
-                "intervention_class": session["intervention_class"],
-                "injection": session["injection"],
+                "session_receipt_digest": verified_receipt.get("receipt_digest"),
+                "session_status": verified_receipt.get("status") or session["status"],
+                "receipt_verified": not receipt_problems,
+                "receipt_problems": receipt_problems,
+                "intervention_class": (
+                    str(verified_receipt.get("intervention_class"))
+                    if not receipt_problems
+                    else "unverified"
+                ),
+                "injection": (
+                    verified_receipt.get("injection") if not receipt_problems else None
+                ),
                 "verifier": verifier,
                 "workdir_tree_digest": _tree_digest(workdir),
             }
@@ -635,9 +961,13 @@ def run_intervention_study(
             "infra_errors": sum(
                 row["verifier"]["status"] == "infra_error" for row in rows
             ),
+            "unverified_receipts": sum(not row["receipt_verified"] for row in rows),
         }
 
     treatment_rows = [row for row in trials if row["arm"] == "treatment"]
+    receipts_verified = bool(trials) and all(
+        row["receipt_verified"] for row in trials
+    )
     all_confirmed = bool(treatment_rows) and all(
         row["intervention_class"] == "same-session-continuation"
         for row in treatment_rows
@@ -645,9 +975,15 @@ def run_intervention_study(
     graded_complete = all(
         row["verifier"]["status"] in {"pass", "fail"} for row in trials
     )
-    if all_confirmed and graded_complete and n_control >= 3 and n_treatment >= 3:
+    if (
+        receipts_verified
+        and all_confirmed
+        and graded_complete
+        and n_control >= 3
+        and n_treatment >= 3
+    ):
         evidence_level = "E4-controlled-same-session-intervention"
-    elif all_confirmed and graded_complete:
+    elif receipts_verified and all_confirmed and graded_complete:
         evidence_level = "E3-underpowered-same-session-intervention"
     else:
         evidence_level = "E1-incomplete-intervention-evidence"
@@ -660,9 +996,12 @@ def run_intervention_study(
         "model": model,
         "prompt_digest": _digest_bytes(prompt.encode()),
         "template_tree_digest": _tree_digest(template),
+        "reservation_digest": reservation["reservation_digest"],
+        "reserved_liability_usd": reservation["reserved_liability_usd"],
         "verifier_argv": [str(item) for item in verifier_argv],
         "arms": {"control": arm_summary("control"), "treatment": arm_summary("treatment")},
         "trials": trials,
+        "all_treatment_receipts_verified": receipts_verified,
         "all_treatment_injections_confirmed": all_confirmed,
         "evidence_level": evidence_level,
         "limitations": [
