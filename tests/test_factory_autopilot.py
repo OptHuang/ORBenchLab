@@ -206,6 +206,7 @@ def test_autopilot_injects_each_runtime_barrier_once_and_resumes(
         repetitions=5,
         max_budget_usd=0.5,
         max_variants=3,
+        intervention_study=False,
     )
     result = factory_autopilot.run(plan, **kwargs)
     assert result["status"] == "promoted"

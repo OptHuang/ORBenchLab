@@ -34,7 +34,9 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
+
+GradeCallable = Callable[[Path], Mapping[str, Any]]
 
 from . import agent_sessions
 from .agent_sessions import (
@@ -287,11 +289,18 @@ def run_intervention_session(
     max_output_bytes: int = agent_sessions.DEFAULT_MAX_OUTPUT_BYTES,
     trigger_timeout_sec: float | None = None,
     allow_bash: bool = True,
+    read_only_paths: Sequence[Any] = (),
+    hidden_paths: Sequence[str | Path] = (),
 ) -> dict[str, Any]:
     """Run one monitored session, optionally injecting a hint mid-session.
 
     ``policy=None`` runs the identically instrumented control arm: same
     runner, same monitoring, stdin closed after the initial message.
+
+    ``read_only_paths``/``hidden_paths`` install an OS-level Bubblewrap /
+    sandbox-exec boundary (same mechanism as factory sessions): the listed
+    inputs are immutable and the hidden paths are unreadable, so an injected
+    solver agent cannot read a hidden verifier or reference solution.
     """
 
     capability = probe_capability(profile=profile, runtime="agent-session")
@@ -323,13 +332,21 @@ def run_intervention_session(
     resolved = shutil.which(requested) if not Path(requested).is_absolute() else requested
     if not resolved or not Path(resolved).is_file():
         raise SessionInterventionError("agent CLI executable is unavailable")
-    command = _argv(
+    agent_command = _argv(
         profile,
         str(Path(resolved).resolve()),
         model.strip(),
         max_budget_usd=float(max_budget_usd),
         allow_bash=allow_bash,
     )
+    command, filesystem_sandbox = agent_sessions._read_only_command(
+        agent_command,
+        cwd=cwd,
+        paths=read_only_paths,
+        hidden_paths=hidden_paths,
+    )
+    if (read_only_paths or hidden_paths) and filesystem_sandbox is None:
+        raise SessionInterventionError("a sandboxed intervention session requires bubblewrap/sandbox-exec")
     initial = agent_sessions._stdin(profile, prompt)
     hint_bytes = b""
     if checked_policy is not None:
@@ -358,6 +375,8 @@ def run_intervention_session(
         "policy": checked_policy,
         "policy_digest": _digest(checked_policy) if checked_policy else None,
         "capability_digest": capability["receipt_digest"],
+        "bash_tool_enabled": bool(allow_bash),
+        "filesystem_sandbox": filesystem_sandbox,
     }
     session_id = _digest(identity).removeprefix("sha256:")[:32]
     session_dir = Path(out).resolve() / session_id
@@ -751,11 +770,23 @@ def run_intervention_study(
     executable: str | Path | None = None,
     verifier_timeout_sec: float = 300.0,
     max_output_bytes: int = agent_sessions.DEFAULT_MAX_OUTPUT_BYTES,
+    agent_read_only_names: Sequence[str] = (),
+    agent_allow_bash: bool = True,
+    grade: "GradeCallable | None" = None,
 ) -> dict[str, Any]:
-    """Run a controlled same-session intervention experiment with verifier outcomes."""
+    """Run a controlled same-session intervention experiment with verifier outcomes.
 
-    if n_control < 1 or n_treatment < 1 or not verifier_argv:
-        raise SessionInterventionError("study needs both arms and a verifier command")
+    ``agent_read_only_names`` are workdir-relative paths bound read-only in the
+    OS sandbox during each agent session (the public task inputs).  ``grade``,
+    when supplied, is a trusted separate verifier that scores a trial's
+    submission in isolation — the agent never sees the verifier; it replaces
+    the in-workdir ``verifier_argv`` fallback used by the standalone CLI.
+    """
+
+    if n_control < 1 or n_treatment < 1:
+        raise SessionInterventionError("study needs both arms")
+    if grade is None and not verifier_argv:
+        raise SessionInterventionError("study needs a grade callback or a verifier command")
     template = Path(template_workdir).resolve()
     if template.is_symlink() or not template.is_dir():
         raise SessionInterventionError("template workdir must be a real directory")
@@ -783,6 +814,9 @@ def run_intervention_study(
             executable=executable,
             verifier_timeout_sec=verifier_timeout_sec,
             max_output_bytes=max_output_bytes,
+            agent_read_only_names=agent_read_only_names,
+            agent_allow_bash=agent_allow_bash,
+            grade=grade,
         )
     finally:
         fcntl.flock(study_lock.fileno(), fcntl.LOCK_UN)
@@ -807,6 +841,9 @@ def _run_intervention_study_locked(
     executable: str | Path | None,
     verifier_timeout_sec: float,
     max_output_bytes: int,
+    agent_read_only_names: Sequence[str] = (),
+    agent_allow_bash: bool = True,
+    grade: GradeCallable | None = None,
 ) -> dict[str, Any]:
     if template.is_symlink() or not template.is_dir():
         raise SessionInterventionError("template workdir must be a real directory")
@@ -897,6 +934,11 @@ def _run_intervention_study_locked(
             temporary = trial_dir / f".workdir.{uuid.uuid4().hex}.tmp"
             shutil.copytree(template, temporary, symlinks=False)
             os.replace(temporary, workdir)
+        read_only = [
+            workdir / name
+            for name in agent_read_only_names
+            if (workdir / name).exists()
+        ]
         session = run_intervention_session(
             profile=profile,
             stage=f"intervention-study/{arm}/{index:02d}",
@@ -910,6 +952,8 @@ def _run_intervention_study_locked(
             policy=arm_policy,
             executable=executable,
             max_output_bytes=max_output_bytes,
+            read_only_paths=read_only,
+            allow_bash=agent_allow_bash,
         )
         verified_receipt, receipt_problems = _reverify_session_receipt(
             session,
@@ -918,12 +962,19 @@ def _run_intervention_study_locked(
             prompt=prompt,
             policy=arm_policy,
         )
-        verifier = _run_verifier(
-            verifier_argv,
-            cwd=workdir,
-            timeout_sec=verifier_timeout_sec,
-            max_output_bytes=max_output_bytes,
-        )
+        if grade is not None:
+            # Trusted separate verifier: the agent never saw it, and it scores
+            # the trial's submission in isolation.
+            verifier = dict(grade(workdir))
+            verifier.setdefault("mechanism", "separate-verifier")
+        else:
+            verifier = _run_verifier(
+                verifier_argv,
+                cwd=workdir,
+                timeout_sec=verifier_timeout_sec,
+                max_output_bytes=max_output_bytes,
+            )
+            verifier["mechanism"] = "in-workdir-verifier-argv"
         # Evidence rows come from the re-verified on-disk receipt, never the
         # runner's in-memory dict; an unverifiable receipt contributes no
         # intervention class at all.

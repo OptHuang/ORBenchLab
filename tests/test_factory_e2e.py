@@ -413,6 +413,7 @@ def test_paper_to_promoted_task_card_without_human_steps(
         max_budget_usd=0.5,
         max_variants=3,
         max_harbor_liability_usd=100.0,
+        intervention_study=False,
     )
     assert state["status"] == "promoted"
     assert state["factory_status"] == "semantic-complete-e1" or state.get(
@@ -499,6 +500,7 @@ def test_paper_to_promoted_task_card_without_human_steps(
         max_budget_usd=0.5,
         max_variants=3,
         max_harbor_liability_usd=100.0,
+        intervention_study=False,
     )
     assert resumed["status"] == "promoted"
     jobs_after = sorted(

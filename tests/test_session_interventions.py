@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -418,84 +419,121 @@ def test_unsupported_profile_study_is_recorded_not_faked(tmp_path: Path):
     assert study["trials"] == []
 
 
-def test_autopilot_intervention_barrier_runs_study_when_enabled(tmp_path: Path):
-    # Proves the autopilot barrier helper actually invokes the adapter and
-    # produces a trusted machine receipt, rather than leaving a bypass CLI.
-    import shutil as _shutil
-    from pathlib import Path as _Path
+def _bin_root(name):
+    import uuid as _uuid
+    r = Path("/var/tmp") / ("orbench-itv-" + name + "-" + _uuid.uuid4().hex)
+    r.mkdir(parents=True, exist_ok=True)
+    return r
 
-    import pytest as _pytest
 
-    if not _shutil.which("bwrap"):
-        _pytest.skip("intervention barrier install needs the workspace sandbox tooling")
+def _synthetic_task(root: Path) -> Path:
+    """A minimal strict-ish task with hidden solution/tests and public input."""
+    task = root / "demo-task"
+    (task / "environment").mkdir(parents=True)
+    (task / "solution").mkdir()
+    (task / "tests").mkdir()
+    (task / "data").mkdir()
+    (task / "submission").mkdir()
+    (task / "task.toml").write_text('[task]\nname = "terminal-bench-science/demo-task"\n', encoding="utf-8")
+    (task / "instruction.md").write_text("Write submission/answer.txt.\n", encoding="utf-8")
+    (task / "environment" / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    (task / "data" / "instance.json").write_text('{"public": true}', encoding="utf-8")
+    (task / "solution" / "solver.py").write_text("ORACLE_SECRET_SOLUTION = 42\n", encoding="utf-8")
+    (task / "tests" / "test.sh").write_text("#!/bin/sh\nHIDDEN_VERIFIER_SECRET\n", encoding="utf-8")
+    return task
 
-    from orbenchlab import agentic_factory, factory_autopilot
 
-    root_task = _Path(__file__).resolve().parents[1] / "examples/tasks/alphaevolve-scheduling"
+def test_autopilot_intervention_barrier_runs_sandboxed_study(tmp_path: Path):
+    # The barrier builds a non-leaking template, runs sandboxed sessions, and
+    # grades with verifier_argv (no local tests/test.sh grounding here).
+    if not shutil.which("bwrap"):
+        pytest.skip("intervention sandbox needs bubblewrap")
+    from orbenchlab import factory_autopilot
+
+    src = _bin_root("task")
+    task_src = _synthetic_task(src)
     workdir = tmp_path / "work"
     (workdir / "factory-input" / "trusted").mkdir(parents=True)
-    (workdir / "factory-input" / "paper-provenance.json").write_bytes(
-        (root_task / "paper-provenance.json").read_bytes()
-    )
-    task_dst = workdir / "factory/tasks/task-v2/alphaevolve-scheduling"
-    _shutil.copytree(root_task, task_dst)
+    (workdir / "factory-input" / "paper-provenance.json").write_text("{}", encoding="utf-8")
+    task_dst = workdir / "factory/tasks/task-v2/demo-task"
+    shutil.copytree(task_src, task_dst)
+    # Remove the local tests/test.sh grounding so the study uses verifier_argv.
+    shutil.rmtree(task_dst / "tests")
     (workdir / "factory/analysis").mkdir(parents=True)
     (workdir / "factory/analysis/intervention-policy.json").write_text(
-        json.dumps(
-            {
-                "bottleneck_id": "b1",
-                "rationale": "r",
-                "trigger": {"kind": "assistant-event-index", "value": 1},
-                "hint_level": 1,
-                "hint_text": "Reminder: write hint.txt with the word injected.",
-            }
-        ),
-        encoding="utf-8",
-    )
-    factory_autopilot.factory_blueprints._make_inputs_read_only(
-        workdir / "factory-input"
-    )
-
-    plan = {
-        "stages": [
-            {
-                "id": "task-repair-v2",
-                "required_outputs": [
-                    {"path": "factory/tasks/task-v2", "kind": "directory"}
-                ],
-            }
-        ]
-    }
-    executable = _fake_claude(tmp_path)
-    verifier = tmp_path / "v.sh"
+        json.dumps({
+            "bottleneck_id": "b1", "rationale": "r",
+            "trigger": {"kind": "assistant-event-index", "value": 1},
+            "hint_level": 1,
+            "hint_text": "Reminder: write hint.txt with the word injected.",
+        }), encoding="utf-8")
+    plan = {"stages": [{"id": "task-repair-v2",
+                        "required_outputs": [{"path": "factory/tasks/task-v2", "kind": "directory"}]}]}
+    bin_root = _bin_root("cli")
+    executable = _fake_claude(bin_root)
+    verifier = bin_root / "v.sh"
     verifier.write_text("#!/bin/sh\ntest -f hint.txt\n", encoding="utf-8")
     verifier.chmod(0o755)
     result = factory_autopilot._ensure_intervention(
-        plan=plan,
-        workdir=workdir,
-        evidence_root=tmp_path / "evidence",
-        claude_executable=executable,
-        model="fixture-model",
-        provider_env=PROVIDER,
-        max_budget_usd=0.1,
-        enabled=True,
-        verifier_argv=[str(verifier)],
-        n_control=3,
-        n_treatment=3,
-        timeout_sec=20,
-        max_output_bytes=8 * 1024 * 1024,
-    )
+        plan=plan, workdir=workdir, evidence_root=tmp_path / "evidence",
+        claude_executable=executable, model="fixture-model", provider_env=PROVIDER,
+        max_budget_usd=0.1, enabled=True, verifier_argv=[str(verifier)],
+        n_control=3, n_treatment=3, timeout_sec=20, max_output_bytes=8 * 1024 * 1024)
     assert result["same_session_hint_injection"] is True
     assert result["study_status"] == "completed"
     assert result["study_evidence_level"] == "E4-controlled-same-session-intervention"
-    cap = json.loads(
-        (
-            tmp_path
-            / "evidence"
-            / "intervention"
-            / "trusted-source"
-            / "runtime-capability.json"
-        ).read_text()
-    )
+    cap = json.loads((tmp_path / "evidence" / "intervention" / "trusted-source" / "runtime-capability.json").read_text())
     assert cap["harbor_native"] is False
     assert cap["causal_intervention_claim_available"] is True
+    assert cap["hidden_from_agent_file_count"] >= 1
+
+
+def test_intervention_template_hides_solution_and_tests_from_agent(tmp_path: Path):
+    if not shutil.which("bwrap"):
+        pytest.skip("intervention sandbox needs bubblewrap")
+    from orbenchlab import factory_autopilot
+
+    src = _bin_root("task2")
+    task = _synthetic_task(src)
+    info = factory_autopilot._build_agent_visible_template(task, tmp_path / "template")
+    template = info["template"]
+    # The agent-visible template contains no solution/ or tests/ and no oracle.
+    assert not (template / "solution").exists()
+    assert not (template / "tests").exists()
+    visible = {p.relative_to(template).as_posix() for p in template.rglob("*") if p.is_file()}
+    assert not any("solver" in v or "ORACLE" in v for v in visible)
+    assert "instruction.md" in visible
+    assert (template / "submission").is_dir()
+    assert info["hidden_from_agent_file_count" if False else "hidden_file_count"] >= 2
+
+    # A malicious solver that tries to read the reference solution from the
+    # sandboxed workdir cannot: the file is not in the template and the parent
+    # task tree is not mounted.
+    bin_root = _bin_root("cli2")
+    snoop = bin_root / "snoop-claude"
+    snoop.write_text(
+        """#!/usr/bin/env python3
+import json, os, sys
+sys.stdin.readline()
+found = []
+for probe in ["solution/solver.py", "tests/test.sh", "../demo-task/solution/solver.py"]:
+    try:
+        open(probe).read(); found.append(probe)
+    except OSError:
+        pass
+open("leak.json", "w").write(json.dumps(found))
+print(json.dumps({"type": "result", "subtype": "success", "total_cost_usd": 0.01}))
+""",
+        encoding="utf-8")
+    snoop.chmod(0o755)
+    workdir = tmp_path / "trial"
+    shutil.copytree(template, workdir)
+    receipt = session_interventions.run_intervention_session(
+        profile="claude-code", stage="snoop", model="m", prompt="solve",
+        workdir=workdir, out=tmp_path / "sessions", timeout_sec=20,
+        environ=PROVIDER, max_budget_usd=0.1, policy=None, executable=snoop,
+        read_only_paths=[workdir / name for name in info["agent_read_only_names"]],
+        allow_bash=True)
+    assert receipt["identity"]["filesystem_sandbox"] is not None
+    leak = json.loads((workdir / "leak.json").read_text())
+    assert leak == []

@@ -429,14 +429,14 @@ def _add_agent_factory(sub: argparse._SubParsersAction) -> None:
     autopilot.add_argument("--promotion-review-timeout-sec", type=float, default=600.0)
     autopilot.add_argument("--promotion-max-review-tokens", type=int, default=2400)
     autopilot.add_argument(
-        "--intervention-study",
+        "--disable-intervention-study",
         action="store_true",
-        help="auto-run the same-session hint-injection study at the runtime barrier",
+        help="skip the same-session hint-injection study (write an E0/E1 capability receipt only)",
     )
     autopilot.add_argument(
         "--intervention-verifier-cmd",
         default="",
-        help="JSON array argv graded in each trial workdir (pass=exit 0); required to run a study",
+        help="optional JSON array argv override; by default the frozen task verifier grades in isolation",
     )
     autopilot.add_argument("--intervention-control", type=int, default=3)
     autopilot.add_argument("--intervention-treatment", type=int, default=3)
@@ -661,7 +661,7 @@ def _cmd_agent_factory_autopilot(args: argparse.Namespace) -> int:
         promote=not args.stop_after_semantic,
         promotion_review_timeout_sec=args.promotion_review_timeout_sec,
         promotion_max_review_tokens=args.promotion_max_review_tokens,
-        intervention_study=args.intervention_study,
+        intervention_study=not args.disable_intervention_study,
         intervention_verifier_argv=(
             json.loads(args.intervention_verifier_cmd)
             if args.intervention_verifier_cmd

@@ -783,6 +783,147 @@ def _load_policy(path: Path) -> dict[str, Any]:
         ) from None
 
 
+# Task-tree entries that must never be visible to a solver agent: the
+# reference solution, the hidden verifier, and oracle-derived data files.
+_INTERVENTION_HIDDEN_DIRS = frozenset({"solution", "tests"})
+_INTERVENTION_HIDDEN_DATA = (
+    "reference-bounds.json",
+    "difficulty-matrix.json",
+    "paper-task-derivation.json",
+)
+
+
+def _build_agent_visible_template(task: Path, out: Path) -> dict[str, Any]:
+    """Copy the task into an agent-visible template stripped of oracle material.
+
+    The returned template contains only what a Harbor agent environment would
+    expose (instruction, environment, public input data, task.toml) plus an
+    empty ``submission/`` directory.  ``solution/``, ``tests/``, the paper
+    provenance/derivation and oracle data files are removed, and both the
+    visible and removed (hidden) tree digests are recorded so the receipt can
+    prove the boundary.
+    """
+
+    if out.exists():
+        shutil.rmtree(out)
+    shutil.copytree(task, out, symlinks=False)
+    hidden_rows: list[dict[str, str]] = []
+
+    def record_hidden(path: Path) -> None:
+        for candidate in sorted(path.rglob("*")) if path.is_dir() else [path]:
+            if candidate.is_file() and not candidate.is_symlink():
+                hidden_rows.append(
+                    {
+                        "path": candidate.relative_to(out).as_posix(),
+                        "content_digest": _file_digest(candidate),
+                    }
+                )
+
+    for name in _INTERVENTION_HIDDEN_DIRS:
+        target = out / name
+        if target.exists():
+            record_hidden(target)
+            shutil.rmtree(target)
+    for name in ("paper-provenance.json",):
+        target = out / name
+        if target.is_file():
+            record_hidden(target)
+            target.unlink()
+    data_dir = out / "data"
+    if data_dir.is_dir():
+        for name in _INTERVENTION_HIDDEN_DATA:
+            target = data_dir / name
+            if target.is_file():
+                record_hidden(target)
+                target.unlink()
+    submission = out / "submission"
+    submission.mkdir(exist_ok=True)
+    (submission / ".keep").write_text("", encoding="utf-8")
+    visible_rows = [
+        {
+            "path": path.relative_to(out).as_posix(),
+            "content_digest": _file_digest(path),
+        }
+        for path in sorted(out.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    ]
+    visible_names = sorted(
+        {row["path"].split("/", 1)[0] for row in visible_rows}
+        - {"submission"}
+    )
+    return {
+        "template": out,
+        "visible_tree_digest": _value_digest(visible_rows),
+        "hidden_tree_digest": _value_digest(sorted(
+            hidden_rows, key=lambda row: row["path"]
+        )),
+        "hidden_file_count": len(hidden_rows),
+        "agent_read_only_names": visible_names,
+    }
+
+
+def _isolated_verifier_grade(task: Path, *, out: Path):
+    """Return a trusted separate-verifier grader the solver agent never sees.
+
+    Each grade builds a fresh isolation dir from the frozen task tree (which
+    includes the hidden verifier and reference solution) and overlays only the
+    agent's ``submission/`` before running the task's ``tests/test.sh``.  The
+    agent's session never had ``tests/`` visible, so it cannot have faked the
+    verifier.  When the verifier cannot be grounded locally (for example it
+    requires the Harbor container), the trial is marked infra_error with a
+    machine-readable reason rather than counted as a task outcome.
+    """
+
+    test_script = task / "tests" / "test.sh"
+    out.mkdir(parents=True, exist_ok=True)
+    counter = {"n": 0}
+
+    def grade(workdir: Path) -> dict[str, Any]:
+        counter["n"] += 1
+        if not test_script.is_file():
+            return {
+                "status": "infra_error",
+                "reason": "task has no tests/test.sh to ground the verifier",
+            }
+        isolate = out / f"grade-{counter['n']:03d}"
+        if isolate.exists():
+            shutil.rmtree(isolate)
+        shutil.copytree(task, isolate, symlinks=False)
+        submission_src = workdir / "submission"
+        submission_dst = isolate / "submission"
+        if submission_dst.exists():
+            shutil.rmtree(submission_dst)
+        if submission_src.is_dir() and not submission_src.is_symlink():
+            shutil.copytree(submission_src, submission_dst, symlinks=False)
+        else:
+            submission_dst.mkdir()
+        stdout, stderr, exit_code, failure = agent_sessions._bounded_process(
+            ["bash", str(isolate / "tests" / "test.sh")],
+            cwd=isolate,
+            env={"PATH": os.environ.get("PATH", ""), "ORBENCH_LOCAL_VERIFIER": "1"},
+            stdin=b"",
+            timeout_sec=300.0,
+            max_output_bytes=8 * 1024 * 1024,
+        )
+        if failure in {"launch_error"}:
+            return {"status": "infra_error", "reason": "verifier could not launch locally"}
+        status = "pass" if failure is None and exit_code == 0 else "fail"
+        return {
+            "status": status,
+            "exit_code": exit_code,
+            "failure_class": failure,
+            "stdout_digest": _value_digest_bytes(stdout),
+            "stderr_digest": _value_digest_bytes(stderr),
+            "isolation_dir": str(isolate),
+        }
+
+    return grade
+
+
+def _value_digest_bytes(value: bytes) -> str:
+    return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
 def _ensure_intervention(
     *,
     plan: Mapping[str, Any],
@@ -818,18 +959,29 @@ def _ensure_intervention(
     trusted_source.mkdir(parents=True, exist_ok=True)
     study_receipt: dict[str, Any] | None = None
     study_reason = None
+    template_info: dict[str, Any] | None = None
+    has_local_verifier = (task / "tests" / "test.sh").is_file()
     if not capability["same_session_hint_injection"]:
         study_reason = "runtime-unsupported"
     elif not enabled:
         study_reason = "disabled-by-configuration"
-    elif not verifier_argv:
-        study_reason = "no-verifier-command-configured"
+    elif not (has_local_verifier or verifier_argv):
+        study_reason = "no-separate-verifier-adapter"
     else:
+        # Build the non-leaking agent-visible template (no solution/tests/oracle)
+        # and grade each trial with the frozen verifier in isolation, so the
+        # solver agent can never read the reference solution or hidden verifier.
+        template_info = _build_agent_visible_template(task, root / "agent-template")
+        grade = (
+            _isolated_verifier_grade(task, out=root / "grading")
+            if has_local_verifier
+            else None
+        )
         study_receipt = session_interventions.run_intervention_study(
             profile="claude-code",
             model=model,
             prompt=_intervention_prompt(task),
-            template_workdir=task,
+            template_workdir=template_info["template"],
             out=root / "study",
             environ=provider_env,
             verifier_argv=list(verifier_argv),
@@ -840,6 +992,9 @@ def _ensure_intervention(
             max_budget_usd=max_budget_usd,
             executable=claude_executable,
             max_output_bytes=max_output_bytes,
+            agent_read_only_names=template_info["agent_read_only_names"],
+            agent_allow_bash=True,
+            grade=grade,
         )
     capability_receipt = {
         "schema_version": "orbenchlab.runtime-capability.v1",
@@ -851,6 +1006,18 @@ def _ensure_intervention(
         "same_checkpoint_hint_injection": False,
         "same_session_hint_injection": bool(
             capability["same_session_hint_injection"]
+        ),
+        "agent_visible_tree_digest": (
+            template_info["visible_tree_digest"] if template_info else None
+        ),
+        "hidden_from_agent_tree_digest": (
+            template_info["hidden_tree_digest"] if template_info else None
+        ),
+        "hidden_from_agent_file_count": (
+            template_info["hidden_file_count"] if template_info else None
+        ),
+        "verifier_mechanism": (
+            "separate-isolated-frozen-verifier" if has_local_verifier else None
         ),
         "policy_digest": session_interventions._digest(policy),
         "study_status": (
@@ -949,7 +1116,7 @@ def run(
     promote: bool = True,
     promotion_review_timeout_sec: float = 600.0,
     promotion_max_review_tokens: int = 2400,
-    intervention_study: bool = False,
+    intervention_study: bool = True,
     intervention_verifier_argv: Sequence[str] = (),
     intervention_control: int = 3,
     intervention_treatment: int = 3,
