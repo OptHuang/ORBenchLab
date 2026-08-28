@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -71,6 +72,103 @@ def _factory(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     )
     assert result["status"] == "semantic-complete-e1"
     return plan_path, root / "factory-run.json", work, work / "factory/tasks/task-v2"
+
+
+def _build_cli_session_review(
+    semantic_dir: Path,
+    *,
+    authoring_digest: str,
+    static_digest: str,
+    paper_digest: str,
+    models,
+    decision: str = "promising",
+) -> Path:
+    """Fabricate a valid CLI-agent-session review tree the finalizer can verify.
+
+    Produces, per model, a strict review.json plus a self-consistent
+    agent-session receipt with sealed stdout/stderr, and an aggregate binding
+    each session by digest -- mirroring factory_review's real output.
+    """
+
+    from orbenchlab import agent_sessions, factory_review
+
+    semantic_dir.mkdir(parents=True, exist_ok=True)
+    reviewers = []
+    bindings = []
+    route_digest = "sha256:" + "a" * 64
+    executable_digest = "sha256:" + "b" * 64
+    for index, model in enumerate(models):
+        slug = factory_review._model_slug(model)
+        review_root = semantic_dir / slug
+        review_root.mkdir(parents=True, exist_ok=True)
+        verdict_doc = {
+            "decision": decision,
+            "shape_complete": True,
+            "rubric_complete": True,
+            "criteria": [
+                {"name": name, "status": "pass", "evidence": "fixture " + name}
+                for name in sorted(REQUIRED_REVIEW_CRITERIA)
+            ],
+        }
+        (review_root / "review.json").write_text(json.dumps(verdict_doc), encoding="utf-8")
+        normalized = factory_review._validate_review_document(verdict_doc)
+        session_id = ("%032x" % (index + 1))[:32]
+        session_dir = review_root / "sessions" / session_id
+        session_dir.mkdir(parents=True)
+        (session_dir / "stdout.bin").write_bytes(b"stdout-" + slug.encode())
+        (session_dir / "stderr.bin").write_bytes(b"")
+        receipt = {
+            "schema_version": "orbenchlab.agent-session.receipt.v1",
+            "session_id": session_id,
+            "identity": {
+                "profile": "claude-code",
+                "model": model,
+                "stage": f"factory-review/{slug}/round-1",
+                "route_digest": route_digest,
+                "executable_digest": executable_digest,
+                "max_budget_usd": 1.0,
+            },
+            "status": "completed",
+            "stdout_digest": "sha256:" + hashlib.sha256((session_dir / "stdout.bin").read_bytes()).hexdigest(),
+            "stderr_digest": "sha256:" + hashlib.sha256(b"").hexdigest(),
+        }
+        receipt["receipt_digest"] = agent_sessions._digest(
+            {k: v for k, v in receipt.items() if k != "receipt_digest"}
+        )
+        (session_dir / "receipt.json").write_text(
+            json.dumps(receipt, indent=2), encoding="utf-8"
+        )
+        reviewers.append({"model": model, "review": normalized})
+        bindings.append(
+            {
+                "model": model,
+                "session_id": session_id,
+                "session_receipt_digest": factory_finalize._file_digest(session_dir / "receipt.json"),
+                "route_digest": route_digest,
+                "executable_digest": executable_digest,
+                "verdict_digest": factory_finalize._value_digest(normalized),
+                "status": "completed",
+            }
+        )
+    payload = {
+        "schema_version": "orbenchlab.volc-authoring-review.v1",
+        "review_mechanism": "cli-agent-session",
+        "round": 1,
+        "task_tree_digest": authoring_digest,
+        "static_receipt_digest": static_digest,
+        "paper_digest": paper_digest,
+        "models": [str(m) for m in models],
+        "review_count": len(models),
+        "aggregate_decision": (
+            "promising-needs-harbor" if decision == "promising" else "needs-human"
+        ),
+        "reviewers": reviewers,
+        "session_bindings": bindings,
+    }
+    payload["review_digest"] = factory_finalize._value_digest(payload)
+    path = semantic_dir / "volc-authoring-review.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
 
 
 def _evidence(tmp_path: Path, task: Path) -> tuple[Path, Path, Path, Path, Path]:
@@ -146,17 +244,13 @@ def _evidence(tmp_path: Path, task: Path) -> tuple[Path, Path, Path, Path, Path]
         "report_digest",
     )
     static_path = _write(tmp_path / "static.json", static)
-    semantic = {
-        "schema_version": "orbenchlab.volc-authoring-review.v1", "round": 1,
-        "task_tree_digest": authoring_digest, "static_receipt_digest": static["receipt_digest"],
-        "paper_digest": "sha256:" + "8" * 64, "models": ["review-a", "review-b"],
-        "review_count": 2, "aggregate_decision": "promising-needs-harbor",
-        "reviewers": [{"model": model, "review": {"decision": "promising", "shape_complete": True, "rubric_complete": True,
-            "criteria": [{"name": name, "status": "pass", "evidence": "fixture evidence"} for name in sorted(REQUIRED_REVIEW_CRITERIA)]}}
-            for model in ("review-a", "review-b")],
-    }
-    semantic["review_digest"] = factory_finalize._value_digest(semantic)
-    semantic_path = _write(tmp_path / "semantic.json", semantic)
+    semantic_path = _build_cli_session_review(
+        tmp_path / "semantic",
+        authoring_digest=authoring_digest,
+        static_digest=static["receipt_digest"],
+        paper_digest="sha256:" + "8" * 64,
+        models=("review-a", "review-b"),
+    )
     harbor_path = _write(tmp_path / "harbor.json", harbor)
     calibration_path = _write(tmp_path / "calibration.json", calibration)
     models = []
@@ -389,25 +483,63 @@ def test_semantic_gate_rejects_forged_single_or_incomplete_review(tmp_path: Path
     _, _, _, task = _factory(tmp_path)
     static, semantic, _, _, _ = _evidence(tmp_path, task)
     static_digest = json.loads(static.read_text())["receipt_digest"]
-    validate = factory_finalize._semantic_validator(task_authoring._task_tree_digest(task), static_digest, "sha256:" + "8" * 64)
+    semantic_root = semantic.parent
+    validate = factory_finalize._semantic_validator(
+        task_authoring._task_tree_digest(task),
+        static_digest,
+        "sha256:" + "8" * 64,
+        semantic_root=semantic_root,
+    )
     original = json.loads(semantic.read_text())
+    # The genuine CLI-session review verifies.
+    assert validate(original)["review_mechanism"] == "cli-agent-session"
+
+    def resign(value):
+        value["review_digest"] = factory_finalize._value_digest(
+            {k: v for k, v in value.items() if k != "review_digest"}
+        )
+        return value
+
     for mutate in ("forged", "single", "incomplete"):
-        value = json.loads(json.dumps(original))
+        value = resign(json.loads(json.dumps(original)))
         if mutate == "forged":
             value["aggregate_decision"] = "needs-human"
         elif mutate == "single":
             value["models"] = value["models"][:1]
             value["reviewers"] = value["reviewers"][:1]
             value["review_count"] = 1
+            value["session_bindings"] = value["session_bindings"][:1]
         else:
             value["reviewers"][0]["review"]["criteria"].pop()
-        value["review_digest"] = factory_finalize._value_digest({k: v for k, v in value.items() if k != "review_digest"})
+        resign(value)
         try:
             validate(value)
         except factory_finalize.FactoryFinalizeError:
             pass
         else:
             raise AssertionError(f"{mutate} semantic review accepted")
+
+    # Defect A: a document that fakes a passing rubric with no CLI sessions
+    # (or with the sessions deleted, or the verdict tampered) must fail.
+    forged_no_sessions = resign(
+        {
+            **json.loads(json.dumps(original)),
+            "review_mechanism": "forged-no-sessions",
+            "session_bindings": [],
+        }
+    )
+    with pytest.raises(factory_finalize.FactoryFinalizeError):
+        validate(forged_no_sessions)
+
+    deleted_receipts = resign(json.loads(json.dumps(original)))
+    first_slug = __import__("orbenchlab.factory_review", fromlist=["_model_slug"])._model_slug(
+        deleted_receipts["models"][0]
+    )
+    import shutil as _shutil
+
+    _shutil.rmtree(semantic_root / first_slug / "sessions")
+    with pytest.raises(factory_finalize.FactoryFinalizeError):
+        validate(deleted_receipts)
 
 
 def test_real_pipeline_card_is_review_promising_with_bound_genome(tmp_path: Path):

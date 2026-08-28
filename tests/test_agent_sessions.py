@@ -153,11 +153,18 @@ def test_linux_read_only_wrapper_binds_exact_input_tree(tmp_path: Path, monkeypa
         "/",
         "/",
     ]
-    input_bind = max(index for index, value in enumerate(command) if value == "--ro-bind")
+    input_bind = max(
+        index
+        for index, value in enumerate(command)
+        if value == "--ro-bind" and command[index + 1] == str(inputs.resolve())
+    )
     assert command[input_bind + 1 : input_bind + 3] == [
         str(inputs.resolve()),
         str(inputs.resolve()),
     ]
+    # The resolved executable is also re-materialized read-only so a binary
+    # under a private-tmpfs path stays visible inside the sandbox.
+    assert command.count("--ro-bind") >= 2
     assert contract == {
         "kind": "bubblewrap-read-only-bindings-v1",
         "policy": "root-ro-workdir-rw-protected-ro-private-tmp-v1",

@@ -239,6 +239,14 @@ def _read_only_command(
                 wrapped.extend(["--tmpfs", str(path), "--remount-ro", str(path)])
             else:
                 wrapped.extend(["--ro-bind", "/dev/null", str(path)])
+        # The private /tmp tmpfs would otherwise shadow an executable that lives
+        # under /tmp (e.g. a pytest tmp_path fixture). Re-materialize the exact
+        # executable path read-only so callers never need to stage binaries
+        # outside /tmp to be visible inside the sandbox.
+        executable_path = Path(command[0])
+        if executable_path.is_file() and not executable_path.is_symlink():
+            executable_resolved = str(executable_path.resolve())
+            wrapped.extend(["--ro-bind", executable_resolved, executable_resolved])
         wrapped.extend(["--chdir", str(cwd), "--", *command])
         kind = "bubblewrap-read-only-bindings-v1"
         policy = "root-ro-workdir-rw-protected-ro-private-tmp-v1"

@@ -287,15 +287,11 @@ import pytest as _pytest
 def _review_cli(tmp_path: Path, *, decision: str = "promising") -> Path:
     """Fake reviewer CLI: writes a strict review.json with the 7 criteria.
 
-    The intervention/review sandbox mounts a private tmpfs over /tmp, so the
-    executable must live outside it to be visible inside bwrap.
+    The sandbox re-materializes the resolved executable read-only, so a plain
+    pytest tmp_path binary is visible inside bwrap on Mac and Linux.
     """
 
-    import uuid as _uuid
-
-    bin_root = Path("/var/tmp") / f"orbench-review-{_uuid.uuid4().hex}"
-    bin_root.mkdir(parents=True, exist_ok=True)
-    executable = bin_root / "review-claude"
+    executable = tmp_path / "review-claude"
     criteria = sorted(REQUIRED_REVIEW_CRITERIA)
     executable.write_text(
         f"""#!/usr/bin/env python3
@@ -469,3 +465,72 @@ def test_promotion_never_uses_the_urllib_volc_worker(tmp_path: Path, monkeypatch
     assert review["review_mechanism"] == "cli-agent-session"
     assert len(review["session_bindings"]) == 2
     assert all(b["session_receipt_digest"] for b in review["session_bindings"])
+
+
+def test_promotion_review_survives_crash_before_aggregate(tmp_path: Path, monkeypatch):
+    # Defect B: if the aggregate write is lost after the CLI sessions completed,
+    # a resume must reuse the sessions (zero re-buy) and recover the verdicts
+    # from their immutable snapshots, not degrade to needs-human.
+    from orbenchlab import factory_review
+
+    plan, workdir, factory_out = _run_semantic_factory(tmp_path)
+    evidence_root = tmp_path / "autopilot"
+    _runtime_evidence(evidence_root, workdir / SELECTED)
+    review_cli = _review_cli(tmp_path)
+
+    calls = {"n": 0}
+    real_run_session = factory_review.agent_sessions.run_session
+
+    def counting_run_session(*args, **kwargs):
+        result = real_run_session(*args, **kwargs)
+        if not result.get("reused"):
+            calls["n"] += 1
+        return result
+
+    monkeypatch.setattr(factory_review.agent_sessions, "run_session", counting_run_session)
+
+    # First run: build the review, then simulate a crash by deleting the
+    # aggregated review file and every working-copy review.json (snapshots
+    # beside the session receipts survive).
+    factory_review.review_task_via_sessions(
+        workdir / SELECTED,
+        paper_provenance_path=workdir / SELECTED / "paper-provenance.json",
+        static_receipt_path=_static_receipt(tmp_path, workdir / SELECTED),
+        models=["rev-a", "rev-b"],
+        provider_env=PROVIDER,
+        out=evidence_root / "semantic",
+        max_budget_usd=0.1,
+        timeout_sec=30,
+        executable=review_cli,
+    )
+    assert calls["n"] == 2
+    semantic_out = evidence_root / "semantic"
+    # Simulate a crash after the sessions completed but before the verdicts
+    # were aggregated: the working review.json copies are lost.
+    lost = list(semantic_out.glob("*/review.json"))
+    assert lost
+    for review_json in lost:
+        review_json.unlink()
+
+    # Resume: no new agent sessions, verdicts recovered from snapshots.
+    review = factory_review.review_task_via_sessions(
+        workdir / SELECTED,
+        paper_provenance_path=workdir / SELECTED / "paper-provenance.json",
+        static_receipt_path=_static_receipt(tmp_path, workdir / SELECTED),
+        models=["rev-a", "rev-b"],
+        provider_env=PROVIDER,
+        out=semantic_out,
+        max_budget_usd=0.1,
+        timeout_sec=30,
+        executable=review_cli,
+    )
+    assert calls["n"] == 2
+    assert review["aggregate_decision"] == "promising-needs-harbor"
+    assert all(b["status"] == "completed" for b in review["session_bindings"])
+
+
+def _static_receipt(tmp_path: Path, task: Path) -> Path:
+    r = task_authoring.validate_task(task, paper_provenance=task / "paper-provenance.json")
+    out = tmp_path / f"static-{task.name}"
+    task_authoring.write_receipt(r, out)
+    return out / "authoring-receipt.json"

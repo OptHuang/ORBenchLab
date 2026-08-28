@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -114,11 +115,92 @@ def _static_validator(task_digest: str) -> Callable[[Mapping[str, Any]], dict[st
     return validate
 
 
-def _semantic_validator(task_digest: str, static_digest: str, paper_digest: str) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
+def _verify_review_session(
+    *,
+    semantic_root: Path,
+    model: str,
+    binding: Mapping[str, Any],
+    reviewer_verdict: Mapping[str, Any],
+) -> str:
+    """Re-verify one CLI reviewer's session receipt and verdict from disk."""
+
+    from . import agent_sessions, factory_review
+
+    if not isinstance(binding, Mapping) or binding.get("model") != model or binding.get("status") != "completed":
+        raise FactoryFinalizeError("semantic session binding is missing or incomplete")
+    session_id = binding.get("session_id")
+    if not isinstance(session_id, str) or not re.fullmatch(r"[0-9a-f]{32}", session_id):
+        raise FactoryFinalizeError("semantic session id is malformed")
+    slug = factory_review._model_slug(model)
+    review_root = (semantic_root / slug).resolve()
+    if not review_root.is_relative_to(semantic_root.resolve()):
+        raise FactoryFinalizeError("semantic session path escaped the review root")
+    receipt_path = review_root / "sessions" / session_id / "receipt.json"
+    if not receipt_path.is_file() or receipt_path.is_symlink():
+        raise FactoryFinalizeError("semantic session receipt is missing")
+    if _file_digest(receipt_path) != binding.get("session_receipt_digest"):
+        raise FactoryFinalizeError("semantic session receipt file digest mismatch")
+    receipt = _load(receipt_path)
+    unsigned = {key: value for key, value in receipt.items() if key != "receipt_digest"}
+    identity = receipt.get("identity")
+    if (
+        receipt.get("schema_version") != "orbenchlab.agent-session.receipt.v1"
+        or receipt.get("receipt_digest") != agent_sessions._digest(unsigned)
+        or receipt.get("status") != "completed"
+        or not isinstance(identity, Mapping)
+        or identity.get("profile") not in {"claude-code", "codex"}
+        or identity.get("model") != model
+        or not str(identity.get("stage", "")).startswith(f"factory-review/{slug}/")
+        or identity.get("route_digest") != binding.get("route_digest")
+        or identity.get("executable_digest") != binding.get("executable_digest")
+        or not _is_digest(str(identity.get("route_digest") or ""))
+        or not _is_digest(str(identity.get("executable_digest") or ""))
+        or not isinstance(identity.get("max_budget_usd"), (int, float))
+    ):
+        raise FactoryFinalizeError("semantic session identity binding failed")
+    # Bind the sealed stdout/stderr digests, so the session's actual output is
+    # part of the evidence, not just its identity.
+    for name, key in (("stdout.bin", "stdout_digest"), ("stderr.bin", "stderr_digest")):
+        artifact = receipt_path.parent / name
+        if (
+            not artifact.is_file()
+            or artifact.is_symlink()
+            or _file_digest(artifact) != receipt.get(key)
+        ):
+            raise FactoryFinalizeError("semantic session output digest mismatch")
+    # The reviewer's on-disk verdict must reproduce the document's verdict and
+    # the binding's verdict digest; a forged in-document verdict cannot pass.
+    review_json = review_root / "review.json"
+    if not review_json.is_file() or review_json.is_symlink():
+        raise FactoryFinalizeError("semantic reviewer verdict artifact is missing")
+    try:
+        disk_verdict = factory_review._validate_review_document(
+            _load(review_json)
+        )
+    except factory_review.FactoryReviewError as exc:
+        raise FactoryFinalizeError(f"semantic reviewer verdict is invalid: {exc}") from None
+    if _value_digest(disk_verdict) != binding.get("verdict_digest"):
+        raise FactoryFinalizeError("semantic reviewer verdict digest mismatch")
+    if _value_digest(dict(reviewer_verdict)) != binding.get("verdict_digest"):
+        raise FactoryFinalizeError("document verdict does not match the sealed session verdict")
+    if disk_verdict.get("decision") != "promising":
+        raise FactoryFinalizeError("semantic reviewer on-disk decision is not promising")
+    return str(binding.get("session_receipt_digest"))
+
+
+def _semantic_validator(
+    task_digest: str,
+    static_digest: str,
+    paper_digest: str,
+    *,
+    semantic_root: Path | None = None,
+) -> Callable[[Mapping[str, Any]], dict[str, Any]]:
     def validate(document: Mapping[str, Any]) -> dict[str, Any]:
         unsigned = {key: value for key, value in document.items() if key != "review_digest"}
         models, reviewers = document.get("models"), document.get("reviewers")
+        bindings = document.get("session_bindings")
         if (document.get("schema_version") != "orbenchlab.volc-authoring-review.v1"
+            or document.get("review_mechanism") != "cli-agent-session"
             or document.get("review_digest") != _value_digest(unsigned)
             or document.get("task_tree_digest") != task_digest
             or document.get("static_receipt_digest") != static_digest
@@ -126,8 +208,17 @@ def _semantic_validator(task_digest: str, static_digest: str, paper_digest: str)
             or document.get("aggregate_decision") != "promising-needs-harbor"
             or not isinstance(models, list) or len(models) < 2 or len(set(models)) != len(models)
             or document.get("review_count") != len(models)
-            or not isinstance(reviewers, list) or len(reviewers) != len(models)):
+            or not isinstance(reviewers, list) or len(reviewers) != len(models)
+            or not isinstance(bindings, list) or len(bindings) != len(models)):
             raise FactoryFinalizeError("semantic review receipt binding failed")
+        if semantic_root is None:
+            raise FactoryFinalizeError("semantic review verification requires its session root")
+        bindings_by_model = {
+            row.get("model"): row for row in bindings if isinstance(row, Mapping)
+        }
+        if set(bindings_by_model) != set(models) or len(bindings_by_model) != len(models):
+            raise FactoryFinalizeError("semantic session bindings do not map one-to-one to models")
+        verified_digests: list[str] = []
         for model, reviewer in zip(models, reviewers, strict=True):
             review = reviewer.get("review") if isinstance(reviewer, Mapping) else None
             criteria = review.get("criteria") if isinstance(review, Mapping) else None
@@ -138,7 +229,21 @@ def _semantic_validator(task_digest: str, static_digest: str, paper_digest: str)
                 or {row.get("name") for row in criteria if isinstance(row, Mapping)} != REQUIRED_REVIEW_CRITERIA
                 or any(not isinstance(row, Mapping) or row.get("status") != "pass" or not str(row.get("evidence", "")).strip() for row in criteria)):
                 raise FactoryFinalizeError("semantic reviewer lacks a complete passing rubric")
-        return {"task_tree_digest": task_digest, "review_digest": document["review_digest"], "models": models}
+            verified_digests.append(
+                _verify_review_session(
+                    semantic_root=semantic_root,
+                    model=model,
+                    binding=bindings_by_model[model],
+                    reviewer_verdict=review,
+                )
+            )
+        return {
+            "task_tree_digest": task_digest,
+            "review_digest": document["review_digest"],
+            "models": models,
+            "review_mechanism": "cli-agent-session",
+            "verified_session_receipt_digests": verified_digests,
+        }
     return validate
 
 
@@ -499,7 +604,7 @@ def build_receipt(
     evidence_gates = [
         factory_gate,
         _gate("static_authoring", Path(static_receipt_path), _static_validator(authoring_task_digest)),
-        _gate("semantic_review", Path(semantic_review_path), _semantic_validator(authoring_task_digest, static_digest, paper_digest)),
+        _gate("semantic_review", Path(semantic_review_path), _semantic_validator(authoring_task_digest, static_digest, paper_digest, semantic_root=Path(semantic_review_path).parent)),
         _gate("harbor_oracle_nop", Path(harbor_receipt_path), _harbor_validator(runtime_task_digest)),
         _gate("model_calibration", Path(calibration_receipt_path), _calibration_validator(runtime_task_digest)),
     ]

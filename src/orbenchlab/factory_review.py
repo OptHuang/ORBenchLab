@@ -130,21 +130,57 @@ def _stage_review_inputs(
     """Build a read-only review-input tree and return the paths to protect."""
 
     input_root = review_root / "review-input"
-    if input_root.exists():
-        shutil.rmtree(input_root)
-    input_root.mkdir(parents=True)
-    shutil.copytree(task_dir, input_root / "task", symlinks=False)
-    shutil.copy2(static_receipt_path, input_root / "authoring-receipt.json")
-    shutil.copy2(paper_provenance_path, input_root / "paper-provenance.json")
+
+    def tree_digest(root: Path) -> str:
+        rows = [
+            {
+                "path": path.relative_to(root).as_posix(),
+                "content_digest": _file_digest(path),
+            }
+            for path in sorted(root.rglob("*"))
+            if path.is_file() and not path.is_symlink()
+        ]
+        return _value_digest(rows)
+
+    # Build the expected tree in a fresh temp dir, then compare with any prior
+    # staged tree.  A matching immutable tree is reused untouched (never
+    # rmtree'd — the 0555 nested tree would otherwise raise on some platforms
+    # and a crash-resume must not destroy validated inputs).
+    staging = review_root / f".review-input.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    staging.mkdir(parents=True)
+    shutil.copytree(task_dir, staging / "task", symlinks=False)
+    shutil.copy2(static_receipt_path, staging / "authoring-receipt.json")
+    shutil.copy2(paper_provenance_path, staging / "paper-provenance.json")
     derivation = task_dir / "data" / "paper-task-derivation.json"
     if derivation.is_file() and not derivation.is_symlink():
-        shutil.copy2(derivation, input_root / "paper-derivation.json")
-    for path in sorted(input_root.rglob("*"), reverse=True):
+        shutil.copy2(derivation, staging / "paper-derivation.json")
+    expected = tree_digest(staging)
+    if input_root.exists():
+        try:
+            already = tree_digest(input_root) == expected
+        except OSError:
+            already = False
+        if already:
+            shutil.rmtree(staging, ignore_errors=True)
+            return [input_root]
+        # A stale/partial tree: make it writable so it can be replaced.
+        for path in sorted(input_root.rglob("*"), reverse=True):
+            try:
+                path.chmod(0o755)
+            except OSError:
+                pass
+        try:
+            input_root.chmod(0o755)
+        except OSError:
+            pass
+        shutil.rmtree(input_root, ignore_errors=True)
+    for path in sorted(staging.rglob("*"), reverse=True):
         if path.is_file():
             path.chmod(0o444)
         elif path.is_dir():
             path.chmod(0o555)
-    input_root.chmod(0o555)
+    staging.chmod(0o555)
+    os.replace(staging, input_root)
     return [input_root]
 
 
@@ -193,8 +229,27 @@ def review_task_via_sessions(
         )
         output_name = "review.json"
         output_path = review_root / output_name
-        if output_path.exists() and not output_path.is_symlink():
+        # Only clear a stale verdict when there is no prior valid session; a
+        # crash-resume must keep a completed session's verdict artifact.
+        sessions_root = review_root / "sessions"
+        prior_session_dir = None
+        if sessions_root.is_dir():
+            for candidate in sorted(sessions_root.glob("*/receipt.json")):
+                try:
+                    doc = json.loads(candidate.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if doc.get("status") == "completed":
+                    prior_session_dir = candidate.parent
+                    break
+        if prior_session_dir is None and output_path.exists() and not output_path.is_symlink():
             output_path.unlink()
+        elif prior_session_dir is not None:
+            # Restore the verdict from its immutable snapshot if the working
+            # copy was lost between the session and aggregation.
+            snapshot = prior_session_dir / "review-output.json"
+            if snapshot.is_file() and not output_path.exists():
+                shutil.copy2(snapshot, output_path)
         prompt = _review_prompt(model=model, output_name=output_name, task_id=task_id)
         session = agent_sessions.run_session(
             profile=profile,
@@ -202,7 +257,7 @@ def review_task_via_sessions(
             model=model,
             prompt=prompt,
             workdir=review_root,
-            out=review_root / "sessions",
+            out=sessions_root,
             timeout_sec=timeout_sec,
             max_budget_usd=max_budget_usd,
             max_output_bytes=max_output_bytes,
@@ -211,6 +266,25 @@ def review_task_via_sessions(
             read_only_paths=read_only,
             allow_bash=False,
         )
+        # Snapshot the verdict beside its session receipt as soon as the
+        # session completes, so a later crash cannot lose it.
+        session_dir = Path(str(session.get("receipt_path") or "")).parent
+        snapshot = session_dir / "review-output.json"
+        if (
+            session.get("status") == "completed"
+            and output_path.is_file()
+            and not output_path.is_symlink()
+            and not snapshot.exists()
+        ):
+            tmp_snapshot = snapshot.with_name(f".{snapshot.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+            tmp_snapshot.write_bytes(output_path.read_bytes())
+            os.replace(tmp_snapshot, snapshot)
+        elif (
+            session.get("status") == "completed"
+            and not output_path.exists()
+            and snapshot.is_file()
+        ):
+            shutil.copy2(snapshot, output_path)
         verdict: dict[str, Any]
         review_problem: str | None = None
         if session.get("status") != "completed":

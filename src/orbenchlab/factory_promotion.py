@@ -261,6 +261,7 @@ def run_promotion(
             task_authoring._load_document(paper_provenance).get("source_content_digest")
             or ""
         ),
+        semantic_root=semantic_json.parent,
     )
 
     def revalidate_semantic() -> None:

@@ -419,13 +419,6 @@ def test_unsupported_profile_study_is_recorded_not_faked(tmp_path: Path):
     assert study["trials"] == []
 
 
-def _bin_root(name):
-    import uuid as _uuid
-    r = Path("/var/tmp") / ("orbench-itv-" + name + "-" + _uuid.uuid4().hex)
-    r.mkdir(parents=True, exist_ok=True)
-    return r
-
-
 def _synthetic_task(root: Path) -> Path:
     """A minimal strict-ish task with hidden solution/tests and public input."""
     task = root / "demo-task"
@@ -450,7 +443,7 @@ def test_autopilot_intervention_barrier_runs_sandboxed_study(tmp_path: Path):
         pytest.skip("intervention sandbox needs bubblewrap")
     from orbenchlab import factory_autopilot
 
-    src = _bin_root("task")
+    src = tmp_path / "task-src"; src.mkdir()
     task_src = _synthetic_task(src)
     workdir = tmp_path / "work"
     (workdir / "factory-input" / "trusted").mkdir(parents=True)
@@ -469,7 +462,7 @@ def test_autopilot_intervention_barrier_runs_sandboxed_study(tmp_path: Path):
         }), encoding="utf-8")
     plan = {"stages": [{"id": "task-repair-v2",
                         "required_outputs": [{"path": "factory/tasks/task-v2", "kind": "directory"}]}]}
-    bin_root = _bin_root("cli")
+    bin_root = tmp_path / "cli"; bin_root.mkdir()
     executable = _fake_claude(bin_root)
     verifier = bin_root / "v.sh"
     verifier.write_text("#!/bin/sh\ntest -f hint.txt\n", encoding="utf-8")
@@ -493,7 +486,7 @@ def test_intervention_template_hides_solution_and_tests_from_agent(tmp_path: Pat
         pytest.skip("intervention sandbox needs bubblewrap")
     from orbenchlab import factory_autopilot
 
-    src = _bin_root("task2")
+    src = tmp_path / "task2-src"; src.mkdir()
     task = _synthetic_task(src)
     info = factory_autopilot._build_agent_visible_template(task, tmp_path / "template")
     template = info["template"]
@@ -509,7 +502,7 @@ def test_intervention_template_hides_solution_and_tests_from_agent(tmp_path: Pat
     # A malicious solver that tries to read the reference solution from the
     # sandboxed workdir cannot: the file is not in the template and the parent
     # task tree is not mounted.
-    bin_root = _bin_root("cli2")
+    bin_root = tmp_path / "cli2"; bin_root.mkdir()
     snoop = bin_root / "snoop-claude"
     snoop.write_text(
         """#!/usr/bin/env python3
