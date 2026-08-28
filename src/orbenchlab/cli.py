@@ -442,6 +442,13 @@ def _add_agent_factory(sub: argparse._SubParsersAction) -> None:
     autopilot.add_argument("--intervention-treatment", type=int, default=3)
     autopilot.add_argument("--intervention-timeout-sec", type=float, default=900.0)
     autopilot.add_argument("--max-intervention-liability-usd", type=float, default=20.0)
+    autopilot.add_argument(
+        "--max-runtime-repair-rounds",
+        type=int,
+        default=1,
+        help="bounded task-repair rounds when an Oracle/NOP control fails (0 disables)",
+    )
+    autopilot.add_argument("--repair-max-budget-usd", type=float, default=4.0)
     autopilot.set_defaults(handler=_cmd_agent_factory_autopilot)
 
     batch = inner.add_parser(
@@ -671,6 +678,8 @@ def _cmd_agent_factory_autopilot(args: argparse.Namespace) -> int:
         intervention_treatment=args.intervention_treatment,
         intervention_timeout_sec=args.intervention_timeout_sec,
         max_intervention_liability_usd=args.max_intervention_liability_usd,
+        max_runtime_repair_rounds=args.max_runtime_repair_rounds,
+        repair_max_budget_usd=args.repair_max_budget_usd,
     )
     promotion = result.get("promotion") if isinstance(result.get("promotion"), dict) else {}
     _print_json(

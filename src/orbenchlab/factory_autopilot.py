@@ -48,6 +48,133 @@ class FactoryStaticGateBlocked(FactoryAutopilotError):
         self.quarantine = dict(quarantine)
 
 
+class FactoryRuntimeQuarantine(FactoryAutopilotError):
+    """A runtime control failure could not be repaired within its round cap."""
+
+    def __init__(self, quarantine: Mapping[str, Any]):
+        super().__init__(
+            f"runtime control quarantine: {quarantine.get('failure_class')}"
+        )
+        self.quarantine = dict(quarantine)
+
+
+class FactoryInfraRetry(FactoryAutopilotError):
+    """A transient infrastructure failure; the barrier should resume, not repair."""
+
+    def __init__(self, bundle: Mapping[str, Any]):
+        super().__init__("Harbor infrastructure failure; resume to retry")
+        self.bundle = dict(bundle)
+
+
+def _controls_with_repair(
+    *,
+    task: Path,
+    workdir: Path,
+    root: Path,
+    harbor_executable: str | Path,
+    claude_executable: str | Path,
+    model: str,
+    provider_env: Mapping[str, str],
+    harbor_timeout_sec: float,
+    max_repair_rounds: int,
+    repair_max_budget_usd: float,
+    scope: str,
+) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+    """Launch Oracle/NOP controls, repairing a task defect within a round cap.
+
+    Returns ``(task, controls_receipt, repair_state)``.  Infrastructure
+    failures raise :class:`FactoryInfraRetry` (resume, never mutate the task);
+    an unrepairable or repair-exhausted task defect raises
+    :class:`FactoryRuntimeQuarantine`.
+    """
+
+    from . import factory_runtime_repair
+
+    paper_ancestors = [
+        workdir / "factory-input" / "paper-provenance.json",
+        workdir / "factory-input" / "paper.txt",
+    ]
+    current = task
+    repair_receipts: list[dict[str, Any]] = []
+    for attempt in range(max_repair_rounds + 1):
+        controls_out = root / "controls" if attempt == 0 else root / "repair" / f"round-{attempt}" / "controls"
+        try:
+            controls = harbor_launcher.launch_controls(
+                current,
+                harbor_executable=harbor_executable,
+                out=controls_out,
+                timeout_sec=harbor_timeout_sec,
+            )
+            return current, controls, {
+                "repaired": attempt > 0,
+                "rounds": attempt,
+                "repair_receipts": repair_receipts,
+                "final_task_tree_digest": volc_rollout._task_tree_digest(current),
+            }
+        except harbor_launcher.HarborLauncherError as exc:
+            failure_class = factory_runtime_repair.classify_failure(str(exc))
+            bundle_out = (
+                root / "failure" if attempt == 0 else root / "repair" / f"round-{attempt}" / "failure"
+            )
+            bundle = factory_runtime_repair.save_failure_bundle(
+                out=bundle_out,
+                scope=scope,
+                task=current,
+                controls_root=controls_out,
+                failure_class=failure_class,
+                message=str(exc),
+                attempt=attempt,
+                reserved_liability_usd=0.0,
+            )
+            if failure_class == "infra":
+                # Transient: never mutate the task; the barrier resumes and the
+                # launcher's own reuse/top-up preserves any confirmed jobs.
+                raise FactoryInfraRetry(bundle) from None
+            if attempt >= max_repair_rounds:
+                raise FactoryRuntimeQuarantine(
+                    {
+                        "reason": "runtime-control-unrepaired",
+                        "scope": scope,
+                        "failure_class": failure_class,
+                        "failure_bundle_digest": bundle["bundle_digest"],
+                        "failure_bundle_path": str(bundle_out / "failure-bundle.json"),
+                        "rounds": attempt,
+                        "repair_receipts": [r["receipt_digest"] for r in repair_receipts],
+                    }
+                ) from None
+            repair = factory_runtime_repair.repair_task_once(
+                task=current,
+                failure_bundle_path=bundle_out / "failure-bundle.json",
+                paper_ancestors=[p for p in paper_ancestors if p.is_file()],
+                out=root / "repair" / f"round-{attempt + 1}",
+                claude_executable=claude_executable,
+                model=model,
+                provider_env=provider_env,
+                max_budget_usd=repair_max_budget_usd,
+                timeout_sec=harbor_timeout_sec,
+                round_number=attempt + 1,
+                parent_task_digest=volc_rollout._task_tree_digest(current),
+                failure_bundle_digest=bundle["bundle_digest"],
+            )
+            repair_receipts.append(repair)
+            if repair["status"] != "produced" or repair["static_decision"] == "blocked":
+                raise FactoryRuntimeQuarantine(
+                    {
+                        "reason": "runtime-repair-failed",
+                        "scope": scope,
+                        "failure_class": failure_class,
+                        "repair_status": repair["status"],
+                        "static_decision": repair["static_decision"],
+                        "failure_bundle_digest": bundle["bundle_digest"],
+                        "rounds": attempt + 1,
+                    }
+                ) from None
+            current = Path(repair["repaired_task_path"])
+    raise FactoryRuntimeQuarantine(
+        {"reason": "runtime-repair-exhausted", "scope": scope, "rounds": max_repair_rounds}
+    )
+
+
 SCHEMA_VERSION = "orbenchlab.factory-autopilot.v1"
 TRUSTED_BUNDLE_SCHEMA_VERSION = "orbenchlab.factory-trusted-bundle.v1"
 REQUIRED_STAGES = frozenset(
@@ -501,23 +628,41 @@ def _ensure_baseline(
     max_turns: int,
     harbor_timeout_sec: float,
     max_job_attempts: int,
+    max_repair_rounds: int = 0,
+    repair_max_budget_usd: float = 4.0,
 ) -> dict[str, Any]:
-    task = factory_gates.resolve_task_root(
+    original_task = factory_gates.resolve_task_root(
         _stage_output_path(plan, workdir, "task-repair-v2", kind="directory")
     )
-    task_digest = volc_rollout._task_tree_digest(task)
     root = evidence_root / "baseline"
     static_receipt, quarantine = _static_gate(
-        task, workdir=workdir, out=root / "static-gate", label="baseline"
+        original_task, workdir=workdir, out=root / "static-gate", label="baseline"
     )
     if quarantine is not None:
         raise FactoryStaticGateBlocked(quarantine)
-    controls = harbor_launcher.launch_controls(
-        task,
+    task, controls, repair_state = _controls_with_repair(
+        task=original_task,
+        workdir=workdir,
+        root=root,
         harbor_executable=harbor_executable,
-        out=root / "controls",
-        timeout_sec=harbor_timeout_sec,
+        claude_executable=claude_executable,
+        model=models[0],
+        provider_env=provider_env,
+        harbor_timeout_sec=harbor_timeout_sec,
+        max_repair_rounds=max_repair_rounds,
+        repair_max_budget_usd=repair_max_budget_usd,
+        scope="baseline",
     )
+    task_digest = volc_rollout._task_tree_digest(task)
+    if task is not original_task:
+        # A repaired task passed controls: re-run the static gate over the
+        # repaired tree so the trusted bundle binds a fully gated task.
+        repaired_static, repaired_quarantine = _static_gate(
+            task, workdir=workdir, out=root / "static-gate-repaired", label="baseline-repaired"
+        )
+        if repaired_quarantine is not None:
+            raise FactoryStaticGateBlocked(repaired_quarantine)
+        static_receipt = repaired_static
     matrix = harbor_model_matrix.launch_matrix(
         task,
         harbor_executable=harbor_executable,
@@ -549,8 +694,9 @@ def _ensure_baseline(
     shutil.copy2(root / "controls" / "harbor-control-screening.json", trusted_source)
     shutil.copy2(root / "matrix" / "harbor-model-matrix.json", trusted_source)
     shutil.copy2(root / "matrix" / "screening-report.json", trusted_source)
+    static_gate_dir = "static-gate-repaired" if repair_state["repaired"] else "static-gate"
     shutil.copy2(
-        root / "static-gate" / "authoring-receipt.json",
+        root / static_gate_dir / "authoring-receipt.json",
         trusted_source / "static-authoring-receipt.json",
     )
     _atomic_json(trusted_source / "runtime-capability.json", _runtime_capability(task_digest))
@@ -575,6 +721,19 @@ def _ensure_baseline(
         "trace_manifest_digest": trace["manifest_digest"],
         "trusted_bundle_digest": bundle["bundle_digest"],
         "observed_usage": _usage_summary(matrix),
+        "runtime_repair": {
+            "repaired": repair_state["repaired"],
+            "rounds": repair_state["rounds"],
+            "final_task_tree_digest": repair_state["final_task_tree_digest"],
+            "repaired_task_path": (
+                repair_state["repair_receipts"][-1]["repaired_task_path"]
+                if repair_state["repaired"]
+                else None
+            ),
+            "repair_receipt_digests": [
+                r["receipt_digest"] for r in repair_state["repair_receipts"]
+            ],
+        },
     }
 
 
@@ -671,12 +830,40 @@ def _ensure_difficulty(
         if quarantine is not None:
             raise FactoryStaticGateBlocked(quarantine)
         variant_static_receipts[variant_id] = static_receipt["receipt_digest"]
-        controls = harbor_launcher.launch_controls(
-            task,
-            harbor_executable=harbor_executable,
-            out=root / "controls",
-            timeout_sec=harbor_timeout_sec,
-        )
+        from . import factory_runtime_repair
+
+        try:
+            controls = harbor_launcher.launch_controls(
+                task,
+                harbor_executable=harbor_executable,
+                out=root / "controls",
+                timeout_sec=harbor_timeout_sec,
+            )
+        except harbor_launcher.HarborLauncherError as exc:
+            # A variant whose controls fail is isolated with a machine bundle
+            # instead of crashing the run; infrastructure failures resume.
+            failure_class = factory_runtime_repair.classify_failure(str(exc))
+            bundle = factory_runtime_repair.save_failure_bundle(
+                out=root / "failure",
+                scope=f"variant:{variant_id}",
+                task=task,
+                controls_root=root / "controls",
+                failure_class=failure_class,
+                message=str(exc),
+                attempt=0,
+                reserved_liability_usd=0.0,
+            )
+            if failure_class == "infra":
+                raise FactoryInfraRetry(bundle) from None
+            raise FactoryRuntimeQuarantine(
+                {
+                    "reason": "variant-control-failed",
+                    "scope": f"variant:{variant_id}",
+                    "failure_class": failure_class,
+                    "failure_bundle_digest": bundle["bundle_digest"],
+                    "failure_bundle_path": str(root / "failure" / "failure-bundle.json"),
+                }
+            ) from None
         matrix = harbor_model_matrix.launch_matrix(
             task,
             harbor_executable=harbor_executable,
@@ -1122,6 +1309,8 @@ def run(
     intervention_treatment: int = 3,
     intervention_timeout_sec: float = 900.0,
     max_intervention_liability_usd: float = 20.0,
+    max_runtime_repair_rounds: int = 1,
+    repair_max_budget_usd: float = 4.0,
 ) -> dict[str, Any]:
     """Run or resume the complete semantic-and-runtime factory state machine."""
 
@@ -1323,6 +1512,8 @@ def run(
                         max_turns=max_turns,
                         harbor_timeout_sec=harbor_timeout_sec,
                         max_job_attempts=max_job_attempts,
+                        max_repair_rounds=max_runtime_repair_rounds,
+                        repair_max_budget_usd=repair_max_budget_usd,
                     )
                     state = _write_state(state_path, state)
                 if (
@@ -1365,9 +1556,17 @@ def run(
                         max_job_attempts=max_job_attempts,
                     )
                     state = _write_state(state_path, state)
-            except FactoryStaticGateBlocked as blocked:
+            except (FactoryStaticGateBlocked, FactoryRuntimeQuarantine) as blocked:
                 state["status"] = "quarantined"
                 state["quarantine"] = blocked.quarantine
+                state = _write_state(state_path, state)
+                return dict(state)
+            except FactoryInfraRetry as infra:
+                # Transient infrastructure failure: record the machine bundle,
+                # keep the run active, and return so a resume retries without
+                # mutating the task or discarding confirmed jobs.
+                state["status"] = "active"
+                state["last_infra_retry"] = infra.bundle
                 state = _write_state(state_path, state)
                 return dict(state)
             result = agentic_factory.run_factory(
