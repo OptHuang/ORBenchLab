@@ -610,11 +610,13 @@ def _validate_session_receipt(
             or sandbox.get("hard_enforced") is not True
             or sandbox.get("kind")
             not in {
+                "bubblewrap-minimal-root-v1",
                 "bubblewrap-read-only-bindings-v1",
                 "sandbox-exec-read-only-subpaths-v1",
             }
             or sandbox.get("policy")
             not in {
+                "minimal-root-runtime-inputs-workdir-only-v1",
                 "root-ro-workdir-rw-protected-ro-private-tmp-v1",
                 "default-deny-write-workdir-rw-protected-ro-v1",
             }

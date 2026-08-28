@@ -215,41 +215,93 @@ def _read_only_command(
         if not sandbox:
             raise AgentSessionError("Bubblewrap is required for read-only factory inputs")
         sandbox_path = Path(sandbox).resolve()
+        # Minimal root: expose only the runtime the agent CLI needs plus the
+        # declared inputs and writable workspace.  The host filesystem is NOT
+        # bound, so /home, /root, /etc secrets, ~/.ssh, ~/.aws, other repos and
+        # even /etc/hostname are ENOENT — disabling Bash was never enough,
+        # because Read/Glob/Grep could still walk absolute host paths.
         wrapped = [
             str(sandbox_path),
             "--die-with-parent",
-            "--ro-bind",
-            "/",
+            "--unshare-all",
+            "--share-net",
+            "--tmpfs",
             "/",
             "--tmpfs",
             "/tmp",
-            "--bind",
-            str(cwd),
-            str(cwd),
             "--proc",
             "/proc",
             "--dev-bind",
             "/dev",
             "/dev",
         ]
-        for path in resolved_paths:
-            wrapped.extend(["--ro-bind", str(path), str(path)])
-        for path, path_kind in resolved_hidden:
-            if path_kind == "directory":
-                wrapped.extend(["--tmpfs", str(path), "--remount-ro", str(path)])
-            else:
-                wrapped.extend(["--ro-bind", "/dev/null", str(path)])
-        # The private /tmp tmpfs would otherwise shadow an executable that lives
-        # under /tmp (e.g. a pytest tmp_path fixture). Re-materialize the exact
-        # executable path read-only so callers never need to stage binaries
-        # outside /tmp to be visible inside the sandbox.
+        # Read-only runtime allowlist: shared libraries, interpreters and the
+        # TLS/DNS material an HTTPS agent needs — none of these hold secrets.
+        runtime_ro = [
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/lib",
+            "/lib64",
+            "/lib32",
+            "/libx32",
+            "/etc/ssl",
+            "/etc/ca-certificates",
+            "/etc/pki",
+            "/etc/resolv.conf",
+            "/etc/nsswitch.conf",
+            "/etc/hosts",
+            "/etc/localtime",
+            "/etc/ld.so.cache",
+            "/etc/ld.so.conf",
+            "/etc/ld.so.conf.d",
+            "/etc/alternatives",
+        ]
+        bound: set[str] = set()
+
+        def bind_ro(target: str) -> None:
+            resolved = Path(target)
+            if str(resolved) in bound:
+                return
+            if resolved.is_symlink():
+                # Bind both the link and its resolved target so /lib -> /usr/lib
+                # style layouts work.
+                try:
+                    real = resolved.resolve()
+                except OSError:
+                    return
+                wrapped.extend(["--ro-bind-try", str(real), str(real)])
+                wrapped.extend(["--symlink", str(real), str(resolved)])
+                bound.add(str(resolved))
+                bound.add(str(real))
+            elif resolved.exists():
+                wrapped.extend(["--ro-bind-try", str(resolved), str(resolved)])
+                bound.add(str(resolved))
+
+        for target in runtime_ro:
+            bind_ro(target)
+        # The agent executable and its whole install directory (bundled node
+        # modules / runtime) are made visible, even under /tmp or /home, without
+        # exposing the rest of that tree.
         executable_path = Path(command[0])
         if executable_path.is_file() and not executable_path.is_symlink():
-            executable_resolved = str(executable_path.resolve())
-            wrapped.extend(["--ro-bind", executable_resolved, executable_resolved])
+            install_dir = executable_path.resolve().parent
+            wrapped.extend(["--ro-bind", str(install_dir), str(install_dir)])
+            bound.add(str(install_dir))
+        # Declared inputs (read-only) and the writable workspace.
+        for path in resolved_paths:
+            wrapped.extend(["--ro-bind", str(path), str(path)])
+        wrapped.extend(["--bind", str(cwd), str(cwd)])
+        # Hidden paths are simply never bound (ENOENT); an explicit mask keeps a
+        # hidden path unreadable even if it lives under a bound input tree.
+        for path, path_kind in resolved_hidden:
+            if path_kind == "directory":
+                wrapped.extend(["--tmpfs", str(path)])
+            else:
+                wrapped.extend(["--ro-bind", "/dev/null", str(path)])
         wrapped.extend(["--chdir", str(cwd), "--", *command])
-        kind = "bubblewrap-read-only-bindings-v1"
-        policy = "root-ro-workdir-rw-protected-ro-private-tmp-v1"
+        kind = "bubblewrap-minimal-root-v1"
+        policy = "minimal-root-runtime-inputs-workdir-only-v1"
     elif sys.platform == "darwin":
         sandbox = shutil.which("sandbox-exec")
         if not sandbox:

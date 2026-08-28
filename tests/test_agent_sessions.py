@@ -146,13 +146,17 @@ def test_linux_read_only_wrapper_binds_exact_input_tree(tmp_path: Path, monkeypa
     command, contract = agent_sessions._read_only_command(
         ["/bin/true"], cwd=work, paths=[inputs]
     )
-    assert command[:5] == [
+    # Minimal root: the host filesystem is a tmpfs, never bound, so /etc/hostname
+    # and /home secrets are ENOENT. Runtime dirs are allowlisted read-only.
+    assert command[:6] == [
         str(bubblewrap.resolve()),
         "--die-with-parent",
-        "--ro-bind",
-        "/",
+        "--unshare-all",
+        "--share-net",
+        "--tmpfs",
         "/",
     ]
+    assert "--ro-bind" not in command[:6]  # never binds the host root
     input_bind = max(
         index
         for index, value in enumerate(command)
@@ -162,12 +166,11 @@ def test_linux_read_only_wrapper_binds_exact_input_tree(tmp_path: Path, monkeypa
         str(inputs.resolve()),
         str(inputs.resolve()),
     ]
-    # The resolved executable is also re-materialized read-only so a binary
-    # under a private-tmpfs path stays visible inside the sandbox.
-    assert command.count("--ro-bind") >= 2
+    # A runtime allowlist (/usr) is bound read-only, but not the whole root.
+    assert any(command[i + 1] == "/usr" for i, v in enumerate(command) if v == "--ro-bind-try")
     assert contract == {
-        "kind": "bubblewrap-read-only-bindings-v1",
-        "policy": "root-ro-workdir-rw-protected-ro-private-tmp-v1",
+        "kind": "bubblewrap-minimal-root-v1",
+        "policy": "minimal-root-runtime-inputs-workdir-only-v1",
         "executable_digest": agent_sessions._digest_bytes(bubblewrap.read_bytes()),
         "read_only_bindings": [
             {
@@ -198,13 +201,12 @@ def test_linux_wrapper_masks_hidden_file_after_workspace_bind(tmp_path: Path, mo
     command, contract = agent_sessions._read_only_command(
         ["/bin/true"], cwd=work, paths=[visible], hidden_paths=[hidden]
     )
+    # The hidden file is masked with /dev/null even though the workspace is
+    # bound writable; the mask appears after the workspace --bind.
     workspace_bind = command.index("--bind")
-    visible_bind = command.index("--ro-bind", workspace_bind)
-    hidden_bind = command.index("--ro-bind", visible_bind + 1)
-    assert command[hidden_bind + 1 : hidden_bind + 3] == [
-        "/dev/null",
-        str(hidden.resolve()),
-    ]
+    tail = command[workspace_bind:]
+    hidden_rel = tail.index(str(hidden.resolve()))
+    assert tail[hidden_rel - 2 : hidden_rel + 1] == ["--ro-bind", "/dev/null", str(hidden.resolve())]
     assert contract["hidden_bindings"] == [
         {
             "path": "independent.json",
@@ -524,3 +526,55 @@ def test_claude_incomplete_or_invalid_usage_stays_unknown(
     )
     assert all(value is None for value in result["usage"].values())
     assert result["usage_parser"]["status"] == status
+
+
+def test_no_bash_session_cannot_read_host_files(tmp_path: Path):
+    # Reproduces /tmp/repro_no_bash_session_read.py: a no-Bash session whose
+    # CLI reads absolute host paths must get ENOENT, not the host contents.
+    import shutil as _shutil
+
+    if not _shutil.which("bwrap"):
+        pytest.skip("minimal-root sandbox needs bubblewrap")
+    work = tmp_path / "work"
+    (work / "review-input").mkdir(parents=True)
+    (work / "review-input" / "data.txt").write_text("public", encoding="utf-8")
+    snoop = tmp_path / "snoop"
+    snoop.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os\n"
+        "reads = {}\n"
+        "for probe in ['/etc/hostname', '/etc/passwd', '/root/.ssh/id_rsa',\n"
+        "              os.path.expanduser('~/.aws/credentials')]:\n"
+        "    try:\n"
+        "        open(probe).read(); reads[probe] = 'READABLE'\n"
+        "    except OSError as exc:\n"
+        "        reads[probe] = type(exc).__name__\n"
+        "open('leak.json', 'w').write(json.dumps(reads))\n"
+        "print('done')\n",
+        encoding="utf-8",
+    )
+    snoop.chmod(0o755)
+    env = {
+        "ANTHROPIC_BASE_URL": "https://ark.cn-beijing.volces.com/api/coding",
+        "ANTHROPIC_AUTH_TOKEN": "tok",
+    }
+    receipt = agent_sessions.run_session(
+        profile="claude-code",
+        stage="snoop",
+        model="m",
+        prompt="p",
+        workdir=work,
+        out=tmp_path / "sessions",
+        timeout_sec=30,
+        environ=env,
+        max_budget_usd=0.1,
+        executable=snoop,
+        read_only_paths=[work / "review-input"],
+        allow_bash=False,
+    )
+    assert receipt["status"] == "completed"
+    assert receipt["identity"]["filesystem_sandbox"]["kind"] == "bubblewrap-minimal-root-v1"
+    reads = json.loads((work / "leak.json").read_text())
+    assert all(value == "FileNotFoundError" for value in reads.values()), reads
+    # Declared inputs stay visible.
+    assert (work / "review-input" / "data.txt").read_text() == "public"
