@@ -127,7 +127,7 @@ def test_launches_reuses_and_validates_rectangular_atif_matrix(tmp_path: Path):
     # The relay keeps the real token out of Harbor entirely: it never appears
     # in any artifact, and the receipt records the credential-safe transport.
     assert "fixture-provider-secret" not in evidence
-    assert first["agent"]["credential_transport"] == "host-side-relay-single-run-token"
+    assert first["agent"]["credential_transport"] == "host-side-relay-per-job-scoped-token"
 
     bundle = harbor_model_matrix.write_trace_bundle(
         first,

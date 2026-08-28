@@ -357,6 +357,8 @@ def launch_matrix(
     preregistration_digest: str | None = None,
     credential_transport: str = "relay",
     relay_host: str = "127.0.0.1",
+    relay_bind_host: str = "127.0.0.1",
+    relay_prober=None,
 ) -> dict[str, Any]:
     """Run or resume a rectangular Harbor model matrix for one frozen task.
 
@@ -364,8 +366,13 @@ def launch_matrix(
     Harbor agent.  ``relay`` (default) starts a host-side credential relay so
     the real key never enters Harbor's environment/argv/container; ``direct``
     is refused because Harbor forwards agent env via ``docker compose exec -e
-    KEY=value`` onto the host argv.  ``relay_host`` is the address the container
-    reaches the relay on (the Docker bridge gateway on a real host).
+    KEY=value`` onto the host argv.  ``relay_bind_host`` is the interface the
+    relay listens on (``0.0.0.0`` on a real host so a container can reach it),
+    and ``relay_host`` is the address the container connects to (the Docker
+    bridge gateway or ``host.docker.internal``).  ``relay_prober`` — required
+    for a real paid run — is a callable ``(url, token) -> (ok, detail)`` that
+    proves the relay is reachable from inside the actual Harbor container
+    before any trial is bought.
     """
 
     from . import harbor_credentials
@@ -407,10 +414,21 @@ def launch_matrix(
         for name, value in provider_env.items()
         if ("KEY" in name.upper() or "TOKEN" in name.upper()) and str(value)
     )
+    real_token = str(
+        provider_env.get("ANTHROPIC_AUTH_TOKEN")
+        or provider_env.get("ANTHROPIC_API_KEY")
+        or ""
+    )
+    # Caps derive from the worst-case work, not a fixed constant: one message
+    # request per turn per trial per job attempt, with generous headroom.
+    per_job_request_cap = max(8, (max_turns + 4))
+    total_request_cap = per_job_request_cap * len(selected) * repetitions * max_job_attempts
     relay = harbor_credentials.CredentialRelay(
         real_base_url=route,
-        real_token=str(provider_env.get("ANTHROPIC_AUTH_TOKEN", "")),
-        host=relay_host,
+        real_token=real_token,
+        bind_host=relay_bind_host,
+        advertise_host=relay_host,
+        max_requests=total_request_cap,
     )
     relay.start()
     try:
@@ -430,6 +448,8 @@ def launch_matrix(
             preregistration_digest=preregistration_digest,
             route_digest=route_digest,
             secrets=secrets,
+            relay_prober=relay_prober,
+            per_job_request_cap=per_job_request_cap,
         )
     finally:
         relay.stop()
@@ -452,11 +472,13 @@ def _launch_matrix_relayed(
     preregistration_digest: str | None,
     route_digest: str,
     secrets: tuple[str, ...],
+    relay_prober=None,
+    per_job_request_cap: int = 64,
 ) -> dict[str, Any]:
     from . import harbor_credentials
 
-    child_env = relay.relay_env()
-    route_host = relay.agent_host
+    route_host = relay.advertise_host
+    reachability: dict[str, Any] | None = None
     root = Path(out).resolve()
     root.mkdir(parents=True, exist_ok=True)
     task_id = _task_id(task)
@@ -518,6 +540,27 @@ def _launch_matrix_relayed(
                 preregistration_digest=preregistration_digest,
             )
             command_log = root / "commands" / f"{_model_key(model)}-attempt-{attempt:03d}"
+            # A per-job, short-lived, revocable token bound to this exact
+            # model/task/job/budget scope — a leaked token cannot buy the whole
+            # matrix, only this job's capped requests.
+            job_token = relay.issue_token(
+                {
+                    "model": model,
+                    "task_tree_digest": task_digest,
+                    "job_name": job_name,
+                    "max_budget_usd_per_trial": max_budget_usd,
+                    "request_cap": per_job_request_cap,
+                }
+            )
+            child_env = relay.relay_env(job_token)
+            if relay_prober is not None and reachability is None:
+                reachability = harbor_credentials.probe_reachability(
+                    prober=relay_prober,
+                    advertise_host=relay.advertise_host,
+                    port=relay.port,
+                    route_path=urlsplit(child_env["ANTHROPIC_BASE_URL"]).path,
+                    token=job_token,
+                )
             argv = [
                 str(harbor),
                 "run",
@@ -582,6 +625,9 @@ def _launch_matrix_relayed(
             finally:
                 stop_scanner.set()
                 scanner.join(timeout=5)
+                # The per-job token is revoked the moment the job ends, so it
+                # cannot be replayed even if it leaked into the container.
+                relay.revoke_token(job_token)
             # Fail closed on any real-credential leak in argv or artifacts.
             harbor_credentials.assert_no_credential_leak(
                 secret_values=secrets,
@@ -600,6 +646,19 @@ def _launch_matrix_relayed(
         surplus_trials += max(0, len(valid) - repetitions)
         for attempt_number, row in enumerate(valid[:repetitions], start=1):
             all_trials.append({**row, "attempt": attempt_number})
+    # Final full-tree scan across the whole matrix output, plus the relay's
+    # non-secret security receipt (policy digest, endpoint allowlist, token
+    # scope digests, request/byte counts, scan results).
+    artifact_scan = harbor_credentials.assert_no_credential_leak(
+        secret_values=secrets, artifact_roots=[root], scan_proc=False
+    )
+    security_receipt = relay.security_receipt(
+        scan_results={"artifact_scan": artifact_scan, "reachability": reachability}
+    )
+    # The full security receipt carries per-run token digests and counts, which
+    # are not part of the deterministic matrix identity; write it beside the
+    # matrix receipt and bind only its stable policy digest.
+    harbor_launcher._atomic_json(root / "credential-security.json", security_receipt)
     receipt: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "task": task_id,
@@ -625,8 +684,8 @@ def _launch_matrix_relayed(
                 6,
             ),
             "liability_accounting": "crash-safe whole-job reservation before subprocess launch",
-            "credential_transport": "host-side-relay-single-run-token",
-            "relay_request_count": relay.request_count,
+            "credential_transport": "host-side-relay-per-job-scoped-token",
+            "credential_security_policy_digest": security_receipt["policy_digest"],
         },
         "evidence_level": "E3",
         "checkpoint_capability": False,
