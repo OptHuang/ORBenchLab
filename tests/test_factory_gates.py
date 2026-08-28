@@ -306,3 +306,51 @@ def test_variant_conformance_passes_distinct_static_clean_variants(tmp_path: Pat
     for target in targets:
         assert target["diff_vs_base"]["added"] == ["data/scale.json"]
         assert target["diff_vs_base"]["changed"] == ["task.toml"]
+
+
+def test_variant_conformance_rejects_rename_only_axis_change(tmp_path: Path):
+    # A variant that only renames the task (task.toml slug) with no
+    # instance/instruction/verifier content change fails the axis-evidence check.
+    plan = _variant_stage_plan()
+    workdir = _workspace(tmp_path)
+    base = workdir / "factory/tasks/task-v2"
+    shutil.copytree(GOOD_TASK, base)
+    variants = workdir / "factory/tasks/variants"
+    rows = []
+    for level in ("small", "medium", "large"):
+        slug = f"alphaevolve-scheduling-{level}"
+        target = variants / slug
+        shutil.copytree(GOOD_TASK, target)
+        toml_path = target / "task.toml"
+        toml_path.write_text(
+            toml_path.read_text(encoding="utf-8").replace(
+                "terminal-bench-science/alphaevolve-scheduling",
+                f"terminal-bench-science/{slug}",
+            ),
+            encoding="utf-8",
+        )
+        rows.append(
+            {
+                "variant_id": f"variant-{level}",
+                "relative_path": slug,
+                "level": level,
+                "axis_levels": {"instance_scale": level},
+            }
+        )
+    manifest = {
+        "schema_version": "orbenchlab.variant-manifest.v1",
+        "primary_axis": {
+            "name": "instance_scale",
+            "expected_direction": "solve rate decreases",
+            "ordered_levels": ["small", "medium", "large"],
+        },
+        "variants": rows,
+        "evaluation_mode": "exploratory",
+    }
+    (variants / "variant-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    stage = next(s for s in plan["stages"] if s["id"] == "variant-author")
+    findings = factory_gates.run_postchecks(
+        stage, workspace=workdir, plan=plan, attempt_number=1
+    )
+    assert findings["passed"] is False
+    assert any("only renames the task" in p for p in findings["postchecks"][0]["problems"])

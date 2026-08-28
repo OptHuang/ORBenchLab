@@ -237,6 +237,23 @@ def _run_variant_conformance(
                     "a difficulty variant must change declared axis content"
                 )
                 target["passed"] = False
+            else:
+                # A declared difficulty axis must correspond to substantive
+                # content, not a rename: at least one changed/added file must
+                # live outside task.toml/README (the instance data, the
+                # instruction, the verifier tolerance, the resource config).
+                substantive = [
+                    path
+                    for path in (diff["added"] + diff["changed"])
+                    if path.rsplit("/", 1)[-1] not in {"task.toml", "README.md"}
+                ]
+                target["substantive_axis_changes"] = substantive
+                if not substantive:
+                    problems.append(
+                        f"variant {variant_id} only renames the task; its declared "
+                        "difficulty axis changes no instance/instruction/verifier content"
+                    )
+                    target["passed"] = False
         targets.append(target)
         if not target["passed"]:
             problems.extend(
