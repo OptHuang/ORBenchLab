@@ -40,6 +40,31 @@ class FactoryPromotionError(ORBenchError):
 SCHEMA_VERSION = "orbenchlab.factory-promotion.v1"
 
 
+def classify_license(license_status: Any) -> dict[str, Any]:
+    """Machine-decidable license gate; unknown is never 'publishable'."""
+
+    raw = str(license_status or "").strip().lower().replace("-", "_")
+    if raw == "registry_resolved":
+        decision = "allowed"
+    elif raw == "pending_human":
+        decision = "needs-human-review"
+    else:
+        decision = "rejected"
+    return {
+        "license_status": str(license_status or "") or None,
+        "decision": decision,
+        "publishable": False,
+        "note": (
+            "License is registry-resolved; still requires the human release review that this "
+            "E3 candidate is bound to."
+            if decision == "allowed"
+            else "License is unresolved; the task is not publishable until a human resolves it."
+            if decision == "needs-human-review"
+            else "License is unknown/unsupported; the task must not be published."
+        ),
+    }
+
+
 def _canonical(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
@@ -394,6 +419,9 @@ def run_promotion(
         "runtime_task_tree_digest": runtime_digest,
         "authoring_task_tree_digest": authoring_digest,
         "reviewer_models": reviewers,
+        "license_gate": classify_license(
+            task_authoring._load_document(paper_provenance).get("license_status")
+        ),
         "semantic_review_mechanism": "cli-agent-session",
         "semantic_review_liability_usd": round(
             len(reviewers) * float(review_max_budget_usd), 6
@@ -509,6 +537,12 @@ def write_final_report(
     for key in ("title", "url", "paper_provenance_digest", "source_content_digest"):
         if source.get(key):
             lines.append(f"- {key}: `{source[key]}`")
+    license_gate = promotion.get("license_gate") or {}
+    lines.append(
+        f"- 许可证 gate：`{license_gate.get('decision')}`（status "
+        f"`{license_gate.get('license_status')}`，publishable "
+        f"`{license_gate.get('publishable')}`）—— {license_gate.get('note')}"
+    )
     lines += [
         "",
         "## 验证等级与 gate 结果",

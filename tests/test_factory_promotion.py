@@ -534,3 +534,31 @@ def _static_receipt(tmp_path: Path, task: Path) -> Path:
     out = tmp_path / f"static-{task.name}"
     task_authoring.write_receipt(r, out)
     return out / "authoring-receipt.json"
+
+
+def test_license_gate_never_calls_unknown_publishable():
+    allowed = factory_promotion.classify_license("registry-resolved")
+    assert allowed["decision"] == "allowed" and allowed["publishable"] is False
+    pending = factory_promotion.classify_license("pending-human")
+    assert pending["decision"] == "needs-human-review" and pending["publishable"] is False
+    unknown = factory_promotion.classify_license("")
+    assert unknown["decision"] == "rejected" and unknown["publishable"] is False
+    weird = factory_promotion.classify_license("cc-by-maybe")
+    assert weird["decision"] == "rejected" and weird["publishable"] is False
+
+
+def test_promotion_summary_carries_license_gate(tmp_path: Path):
+    plan, workdir, factory_out = _run_semantic_factory(tmp_path)
+    evidence_root = tmp_path / "autopilot"
+    _runtime_evidence(evidence_root, workdir / SELECTED)
+    review_cli = _review_cli(tmp_path)
+    summary = factory_promotion.run_promotion(
+        plan=plan, workdir=workdir, factory_out=factory_out, evidence_root=evidence_root,
+        out=evidence_root / "promotion", provider_env=PROVIDER, state={},
+        review_executable=review_cli,
+    )
+    # The AlphaEvolve fixture provenance is pending-human.
+    assert summary["license_gate"]["decision"] == "needs-human-review"
+    assert summary["license_gate"]["publishable"] is False
+    report = (evidence_root / "promotion" / "final-report.md").read_text(encoding="utf-8")
+    assert "许可证 gate" in report
