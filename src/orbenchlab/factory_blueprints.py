@@ -452,9 +452,10 @@ def paper_to_benchmark_plan(
             common
             + " Audit paper-derivation-primary.json against the complete paper. Correct unsupported "
             "claims, missing assumptions, licenses, reproducibility blockers and source anchors.",
-            "factory/evidence/paper-derivation-critic.json",
+            "factory/evidence/paper-derivation-critic.md",
             model=reviewers[0],
             profile=profile,
+            kind="text",
             depends_on=("paper-derive-normalize",),
             max_budget_usd=2.0,
             artifact_max_bytes=32_000,
@@ -466,9 +467,10 @@ def paper_to_benchmark_plan(
             + " Propose several strict Terminal-Bench Science tasks from the audited evidence. For "
             "each give terminal contract, scientific value, verifier oracle, anti-shortcut design, "
             "estimated model bottlenecks and orthogonal difficulty controls.",
-            "factory/design/task-design-a.json",
+            "factory/design/task-design-a.md",
             model=author_model,
             profile=profile,
+            kind="text",
             depends_on=("paper-derive-critic",),
         ),
         _stage(
@@ -478,21 +480,23 @@ def paper_to_benchmark_plan(
             + " Independently propose paper-faithful tasks and attack likely triviality, leakage, "
             "brittleness, solver dependence and verifier gaming. Prefer tasks with multiple "
             "controllable difficulty axes.",
-            "factory/design/task-design-b.json",
+            "factory/design/task-design-b.md",
             model=reviewers[1],
             profile=profile,
+            kind="text",
             depends_on=("paper-derive-critic",),
         ),
         _stage(
             "task-design-synthesis",
             "senior task selection agent",
             common
-            + " Compare both designs and autonomously select one task. Record rejected alternatives, "
+            + " Compare factory/design/task-design-a.md and task-design-b.md and autonomously select one task. Record rejected alternatives, "
             "a full rubric/test plan, Oracle and NOP behavior, expected bottlenecks, and a preliminary "
             "difficulty lattice. Selection is provisional until runtime calibration.",
-            "factory/design/task-design-selected.json",
+            "factory/design/task-design-selected.md",
             model=author_model,
             profile=profile,
+            kind="text",
             depends_on=("task-design-a", "task-design-b"),
         ),
         _stage(
@@ -516,9 +520,10 @@ def paper_to_benchmark_plan(
             common
             + " Review task-v1 against the paper evidence and TB-Science expectations. Inspect every "
             "file and write prioritized, source-grounded defects. Do not edit task-v1 or claim runtime tests.",
-            "factory/reviews/task-review-science.json",
+            "factory/reviews/task-review-science.md",
             model=reviewers[0],
             profile=profile,
+            kind="text",
             depends_on=("task-author-v1",),
         ),
         _stage(
@@ -528,16 +533,17 @@ def paper_to_benchmark_plan(
             + " Attack task-v1's verifier, rubric, hidden/public separation, determinism, resource limits, "
             "Oracle/NOP semantics and shortcut resistance by complete code inspection. Do not edit task-v1 "
             "or claim that this semantic session executed tests.",
-            "factory/reviews/task-review-verifier.json",
+            "factory/reviews/task-review-verifier.md",
             model=reviewers[1],
             profile=profile,
+            kind="text",
             depends_on=("task-author-v1",),
         ),
         _stage(
             "task-repair-v2",
             "senior task repair agent",
             common
-            + " Copy task-v1 to factory/tasks/task-v2, resolve every supported finding from both reviews, "
+            + " Copy task-v1 to factory/tasks/task-v2, resolve every supported finding from both Markdown reviews, "
             "and prepare it for the repository's deterministic task-authoring gate plus task tests, which "
             "the trusted harness will execute after this stage. Preserve a "
             "machine-readable repair ledger inside task-v2/data.",
@@ -557,9 +563,10 @@ def paper_to_benchmark_plan(
             "factory-input/trusted/baseline/harbor-control-screening.json. Validate that receipt with the "
             "existing ORBenchLab code, bind its exact digest and task digest, and write a runtime index. "
             "If the trusted receipt is absent, malformed or binds another task, fail instead of fabricating it.",
-            "factory/runtime/control-index.json",
+            "factory/runtime/control-index.md",
             model=author_model,
             profile=profile,
+            kind="text",
             depends_on=("task-repair-v2",),
             timeout_sec=7200,
             max_attempts=2,
@@ -572,9 +579,10 @@ def paper_to_benchmark_plan(
             "factory-input/trusted/baseline/harbor-model-matrix.json and its sanitized ATIF trace bundle. "
             f"Extract only model {frontier_model!r}'s repeated no-hint trials, verifier outcomes, budgets and "
             "trace digests into a pilot index. Fail if the matrix is non-rectangular or incomplete.",
-            "factory/runtime/pilot-frontier.json",
+            "factory/runtime/pilot-frontier.md",
             model=frontier_model,
             profile=profile,
+            kind="text",
             depends_on=("runtime-controls",),
             timeout_sec=10_800,
         ),
@@ -586,9 +594,10 @@ def paper_to_benchmark_plan(
             "factory-input/trusted/baseline/harbor-model-matrix.json and its sanitized ATIF trace bundle. "
             f"Extract only model {weak_model!r}'s trials under the exact same baseline budget into a pilot "
             "index. Fail if the matrix is non-rectangular or incomplete.",
-            "factory/runtime/pilot-weak.json",
+            "factory/runtime/pilot-weak.md",
             model=weak_model,
             profile=profile,
+            kind="text",
             depends_on=("runtime-controls",),
             timeout_sec=10_800,
         ),
@@ -596,12 +605,13 @@ def paper_to_benchmark_plan(
             "trajectory-diagnosis",
             "agent trajectory analyst",
             common
-            + " Analyse the frontier and weak pilot traces with verifier outcomes. Separate observations "
+            + " Analyse the frontier and weak pilot Markdown reports with verifier outcomes. Separate observations "
             "from hypotheses; identify repeated bottlenecks and candidate intervention anchors. Evidence "
             "is E3 unless a real same-checkpoint continuation experiment is available.",
-            "factory/analysis/trajectory-diagnosis.json",
+            "factory/analysis/trajectory-diagnosis.md",
             model=reviewers[0],
             profile=profile,
+            kind="text",
             depends_on=("pilot-frontier", "pilot-weak"),
             timeout_sec=3600,
         ),
@@ -613,9 +623,10 @@ def paper_to_benchmark_plan(
             "currently exposes no resumable same-checkpoint injection, so record checkpoint_capability=false, "
             "E4 as unavailable, and a concrete future paired-continuation design. Do not call a model and do "
             "not run restart-with-hint while masquerading it as causal evidence.",
-            "factory/analysis/intervention-study.json",
+            "factory/analysis/intervention-study.md",
             model=author_model,
             profile=profile,
+            kind="text",
             depends_on=("trajectory-diagnosis",),
             timeout_sec=10_800,
         ),
@@ -626,16 +637,17 @@ def paper_to_benchmark_plan(
             + " Convert validated bottlenecks into orthogonal difficulty axes: instance scale/structure, "
             "information in instructions, tool/budget limits, verifier tolerance/coverage and hint levels. "
             "Specify monotonicity expectations and anti-confounding checks for a variant lattice.",
-            "factory/difficulty/difficulty-lattice.json",
+            "factory/difficulty/difficulty-lattice.md",
             model=reviewers[1],
             profile=profile,
+            kind="text",
             depends_on=("intervention-study",),
         ),
         _stage(
             "variant-author",
             "difficulty variant implementer",
             common
-            + " Copy task-v2 into factory/tasks/variants and implement the smallest useful lattice of "
+            + " Read factory/difficulty/difficulty-lattice.md, copy task-v2 into factory/tasks/variants and implement the smallest useful lattice of "
             "versioned variants. Each variant must state exactly one or a controlled combination of changed "
             "axes, preserve paper fidelity, be ready for trusted static checks and keep distinct task identities. Include at "
             "least three ordered levels and write factory/tasks/variants/variant-manifest.json with schema_version "
@@ -663,9 +675,10 @@ def paper_to_benchmark_plan(
             "uncertainty, infra exclusions, monotonicity checks and model-gap metrics, and write a bounded "
             "calibration index. Quarantine variants lacking a complete equal-budget rectangle or clean "
             "Oracle/NOP controls.",
-            "factory/calibration/calibration-index.json",
+            "factory/calibration/calibration-index.md",
             model=author_model,
             profile=profile,
+            kind="text",
             depends_on=("variant-author",),
             timeout_sec=21_600,
         ),
@@ -684,18 +697,61 @@ def paper_to_benchmark_plan(
             "levels, meaning and expected_direction. source.paper_provenance_digest must be the SHA-256 digest "
             "of factory-input/paper-provenance.json. Record the selected task path relative to the workspace in "
             "both outputs as selected_task. Never promote "
-            "from agent opinion alone.",
+            "from agent opinion alone. The review JSON must include selected_task, a non-empty task_summary, "
+            "the bounded evidence_level, and a non-empty limitations array.",
             "factory/final/task-review-summary.json",
             model=reviewers[0],
             profile=profile,
             depends_on=("calibration",),
             timeout_sec=3600,
             artifact_max_bytes=64_000,
+            json_required_keys=(
+                "selected_task",
+                "task_summary",
+                "evidence_level",
+                "limitations",
+            ),
+            json_key_types={
+                "selected_task": "string",
+                "task_summary": "string",
+                "evidence_level": "string",
+                "limitations": "array",
+            },
+            json_nonempty_keys=(
+                "selected_task",
+                "task_summary",
+                "evidence_level",
+                "limitations",
+            ),
             additional_outputs=(
                 {
                     "path": "factory/final/task-genome.json",
                     "kind": "json",
                     "max_bytes": 64_000,
+                    "json_required_keys": [
+                        "family",
+                        "title",
+                        "design_goal",
+                        "selected_task",
+                        "source",
+                        "difficulty_axes",
+                    ],
+                    "json_key_types": {
+                        "family": "string",
+                        "title": "string",
+                        "design_goal": "string",
+                        "selected_task": "string",
+                        "source": "object",
+                        "difficulty_axes": "object",
+                    },
+                    "json_nonempty_keys": [
+                        "family",
+                        "title",
+                        "design_goal",
+                        "selected_task",
+                        "source",
+                        "difficulty_axes",
+                    ],
                 },
             ),
         ),

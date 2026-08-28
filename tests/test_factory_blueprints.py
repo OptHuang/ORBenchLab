@@ -176,6 +176,35 @@ def test_default_plan_assigns_all_semantic_stages_to_agent_sessions(tmp_path: Pa
     ]
     assert all(stage["profile"] == "claude-code" for stage in plan["stages"])
     assert all(stage["required_outputs"] for stage in plan["stages"])
+    text_outputs = {
+        "paper-derive-primary": "factory/evidence/paper-derivation-raw.md",
+        "paper-derive-critic": "factory/evidence/paper-derivation-critic.md",
+        "task-design-a": "factory/design/task-design-a.md",
+        "task-design-b": "factory/design/task-design-b.md",
+        "task-design-synthesis": "factory/design/task-design-selected.md",
+        "task-review-science": "factory/reviews/task-review-science.md",
+        "task-review-verifier": "factory/reviews/task-review-verifier.md",
+        "runtime-controls": "factory/runtime/control-index.md",
+        "pilot-frontier": "factory/runtime/pilot-frontier.md",
+        "pilot-weak": "factory/runtime/pilot-weak.md",
+        "trajectory-diagnosis": "factory/analysis/trajectory-diagnosis.md",
+        "intervention-study": "factory/analysis/intervention-study.md",
+        "difficulty-design": "factory/difficulty/difficulty-lattice.md",
+        "calibration": "factory/calibration/calibration-index.md",
+    }
+    by_id = {stage["id"]: stage for stage in plan["stages"]}
+    for stage_id, path in text_outputs.items():
+        assert by_id[stage_id]["required_outputs"] == [
+            {
+                "path": path,
+                "kind": "text",
+                "max_bytes": by_id[stage_id]["required_outputs"][0]["max_bytes"],
+                "json_required_keys": [],
+                "json_key_types": {},
+                "json_nonempty_keys": [],
+                "json_digest_bindings": {},
+            }
+        ]
     primary = next(stage for stage in plan["stages"] if stage["id"] == "paper-derive-primary")
     assert primary["required_outputs"][0]["path"] == "factory/evidence/paper-derivation-raw.md"
     assert primary["required_outputs"][0]["kind"] == "text"
@@ -219,6 +248,20 @@ def test_default_plan_assigns_all_semantic_stages_to_agent_sessions(tmp_path: Pa
     assert [output["path"] for output in final["required_outputs"]] == [
         "factory/final/task-review-summary.json",
         "factory/final/task-genome.json",
+    ]
+    assert final["required_outputs"][0]["json_required_keys"] == [
+        "selected_task",
+        "task_summary",
+        "evidence_level",
+        "limitations",
+    ]
+    assert final["required_outputs"][1]["json_required_keys"] == [
+        "family",
+        "title",
+        "design_goal",
+        "selected_task",
+        "source",
+        "difficulty_axes",
     ]
     assert plan["maximum_model_liability_usd"] == 42.5
     assert agentic_factory.validate_plan(plan) == plan
