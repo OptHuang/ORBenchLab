@@ -628,6 +628,7 @@ def _ensure_baseline(
     max_turns: int,
     harbor_timeout_sec: float,
     max_job_attempts: int,
+    harbor_relay_host: str = "127.0.0.1",
     max_repair_rounds: int = 0,
     repair_max_budget_usd: float = 4.0,
 ) -> dict[str, Any]:
@@ -675,6 +676,7 @@ def _ensure_baseline(
         max_turns=max_turns,
         timeout_sec=harbor_timeout_sec,
         max_job_attempts=max_job_attempts,
+        relay_host=harbor_relay_host,
     )
     trace = harbor_model_matrix.write_trace_bundle(
         matrix,
@@ -778,6 +780,7 @@ def _ensure_difficulty(
     max_variants: int,
     held_out: bool,
     max_job_attempts: int,
+    harbor_relay_host: str = "127.0.0.1",
 ) -> dict[str, Any]:
     variants_root = _stage_output_path(plan, workdir, "variant-author", kind="directory")
     manifest_path = variants_root / "variant-manifest.json"
@@ -877,6 +880,7 @@ def _ensure_difficulty(
             timeout_sec=harbor_timeout_sec,
             max_job_attempts=max_job_attempts,
             preregistration_digest=preregistration_digest,
+            relay_host=harbor_relay_host,
         )
         harbor_model_matrix.write_trace_bundle(
             matrix,
@@ -1259,6 +1263,7 @@ def run(
     max_intervention_liability_usd: float = 20.0,
     max_runtime_repair_rounds: int = 1,
     repair_max_budget_usd: float = 4.0,
+    harbor_relay_host: str = "127.0.0.1",
 ) -> dict[str, Any]:
     """Run or resume the complete semantic-and-runtime factory state machine."""
 
@@ -1460,6 +1465,7 @@ def run(
                         max_turns=max_turns,
                         harbor_timeout_sec=harbor_timeout_sec,
                         max_job_attempts=max_job_attempts,
+                        harbor_relay_host=harbor_relay_host,
                         max_repair_rounds=max_runtime_repair_rounds,
                         repair_max_budget_usd=repair_max_budget_usd,
                     )
@@ -1502,6 +1508,7 @@ def run(
                         max_variants=max_variants,
                         held_out=held_out,
                         max_job_attempts=max_job_attempts,
+                        harbor_relay_host=harbor_relay_host,
                     )
                     state = _write_state(state_path, state)
             except (FactoryStaticGateBlocked, FactoryRuntimeQuarantine) as blocked:

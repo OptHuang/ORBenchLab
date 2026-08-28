@@ -124,8 +124,10 @@ def test_launches_reuses_and_validates_rectangular_atif_matrix(tmp_path: Path):
         for path in out.rglob("*")
         if path.is_file()
     )
+    # The relay keeps the real token out of Harbor entirely: it never appears
+    # in any artifact, and the receipt records the credential-safe transport.
     assert "fixture-provider-secret" not in evidence
-    assert "[REDACTED_PROVIDER_CREDENTIAL]" in evidence
+    assert first["agent"]["credential_transport"] == "host-side-relay-single-run-token"
 
     bundle = harbor_model_matrix.write_trace_bundle(
         first,
@@ -350,3 +352,72 @@ def test_inconclusive_trial_is_topped_up_without_rebuying_confirmed_trials(
     assert resumed["receipt_digest"] == receipt["receipt_digest"]
     assert len(list((out / "jobs").glob("demo_task-frontier-*"))) == 2
     assert len(list((out / "reservations").glob("*.json"))) == 3
+
+
+def test_direct_credential_transport_is_refused(tmp_path: Path):
+    from orbenchlab import harbor_credentials
+
+    with pytest.raises(harbor_credentials.CredentialRelayError):
+        harbor_model_matrix.launch_matrix(
+            _task(tmp_path),
+            harbor_executable=_harbor(tmp_path),
+            claude_executable=_claude(tmp_path),
+            out=tmp_path / "out",
+            models=["frontier", "weak"],
+            repetitions=2,
+            provider_env=PROVIDER,
+            max_budget_usd=0.5,
+            max_turns=10,
+            timeout_sec=5,
+            credential_transport="direct",
+        )
+
+
+def _leaky_harbor(root: Path) -> Path:
+    """A Harbor stub that writes its ANTHROPIC token into a job artifact."""
+
+    executable = root / "leaky-harbor"
+    executable.write_text(
+        """#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+def value(flag): return args[args.index(flag) + 1]
+model = value('--model')
+repetitions = int(value('--n-attempts'))
+job = pathlib.Path(value('--jobs-dir')) / value('--job-name')
+job.mkdir(parents=True, exist_ok=True)
+# Simulate a leak: write whatever token the harness handed us.
+job.joinpath('leaked-token.txt').write_text(os.environ.get('ANTHROPIC_AUTH_TOKEN', ''))
+job.joinpath('result.json').write_text(json.dumps({'id': model, 'n_total_trials': repetitions,
+    'stats': {'n_completed_trials': repetitions, 'n_errored_trials': 0}}))
+""",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    return executable
+
+
+def test_relay_leaves_only_the_relay_token_in_artifacts(tmp_path: Path):
+    # Even a Harbor that writes its handed token into an artifact only ever
+    # gets the single-run relay token, never the real Volc secret.
+    out = tmp_path / "out"
+    try:
+        harbor_model_matrix.launch_matrix(
+            _task(tmp_path),
+            harbor_executable=_leaky_harbor(tmp_path),
+            claude_executable=_claude(tmp_path),
+            out=out,
+            models=["frontier"],
+            repetitions=1,
+            provider_env=PROVIDER,
+            max_budget_usd=0.5,
+            max_turns=10,
+            timeout_sec=5,
+        )
+    except Exception:
+        pass  # the stub does not produce full trials; we only inspect the leak
+    leaked = list(out.rglob("leaked-token.txt"))
+    assert leaked
+    content = leaked[0].read_text()
+    assert PROVIDER["ANTHROPIC_AUTH_TOKEN"] not in content
+    assert content and content != PROVIDER["ANTHROPIC_AUTH_TOKEN"]

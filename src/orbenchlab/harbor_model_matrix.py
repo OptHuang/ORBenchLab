@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import threading
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
@@ -354,8 +355,20 @@ def launch_matrix(
     max_output_bytes: int = 32 * 1024 * 1024,
     max_job_attempts: int = 2,
     preregistration_digest: str | None = None,
+    credential_transport: str = "relay",
+    relay_host: str = "127.0.0.1",
 ) -> dict[str, Any]:
-    """Run or resume a rectangular Harbor model matrix for one frozen task."""
+    """Run or resume a rectangular Harbor model matrix for one frozen task.
+
+    ``credential_transport`` controls how the provider credential reaches the
+    Harbor agent.  ``relay`` (default) starts a host-side credential relay so
+    the real key never enters Harbor's environment/argv/container; ``direct``
+    is refused because Harbor forwards agent env via ``docker compose exec -e
+    KEY=value`` onto the host argv.  ``relay_host`` is the address the container
+    reaches the relay on (the Docker bridge gateway on a real host).
+    """
+
+    from . import harbor_credentials
 
     selected = [str(model).strip() for model in models if str(model).strip()]
     if (
@@ -381,9 +394,69 @@ def launch_matrix(
     for executable in (harbor, claude):
         if executable.is_symlink() or not executable.is_file() or not os.access(executable, os.X_OK):
             raise HarborModelMatrixError("Harbor and Claude executables must be real executable files")
-    child_env, route_digest = agent_sessions._session_env("claude-code", provider_env)
+    # Validate and bind the real Volc route for the receipt, but never hand the
+    # real token to Harbor: it would land on the host argv.
+    _, route_digest = agent_sessions._session_env("claude-code", provider_env)
     route = str(provider_env.get("ANTHROPIC_BASE_URL", ""))
-    route_host = urlsplit(route).hostname or ""
+    if credential_transport != "relay":
+        raise harbor_credentials.CredentialRelayError(
+            "Harbor forwards agent env onto the host argv; only credential_transport='relay' is allowed"
+        )
+    secrets = tuple(
+        str(value)
+        for name, value in provider_env.items()
+        if ("KEY" in name.upper() or "TOKEN" in name.upper()) and str(value)
+    )
+    relay = harbor_credentials.CredentialRelay(
+        real_base_url=route,
+        real_token=str(provider_env.get("ANTHROPIC_AUTH_TOKEN", "")),
+        host=relay_host,
+    )
+    relay.start()
+    try:
+        return _launch_matrix_relayed(
+            relay=relay,
+            harbor=harbor,
+            claude=claude,
+            task=task,
+            selected=selected,
+            out=out,
+            repetitions=repetitions,
+            max_budget_usd=max_budget_usd,
+            max_turns=max_turns,
+            timeout_sec=timeout_sec,
+            max_output_bytes=max_output_bytes,
+            max_job_attempts=max_job_attempts,
+            preregistration_digest=preregistration_digest,
+            route_digest=route_digest,
+            secrets=secrets,
+        )
+    finally:
+        relay.stop()
+
+
+def _launch_matrix_relayed(
+    *,
+    relay: Any,
+    harbor: Path,
+    claude: Path,
+    task: Path,
+    selected: Sequence[str],
+    out: str | Path,
+    repetitions: int,
+    max_budget_usd: float,
+    max_turns: int,
+    timeout_sec: float,
+    max_output_bytes: int,
+    max_job_attempts: int,
+    preregistration_digest: str | None,
+    route_digest: str,
+    secrets: tuple[str, ...],
+) -> dict[str, Any]:
+    from . import harbor_credentials
+
+    child_env = relay.relay_env()
+    route_host = relay.agent_host
     root = Path(out).resolve()
     root.mkdir(parents=True, exist_ok=True)
     task_id = _task_id(task)
@@ -392,11 +465,6 @@ def launch_matrix(
     jobs = root / "jobs"
     all_trials: list[dict[str, Any]] = []
     job_rows = []
-    secrets = tuple(
-        str(value)
-        for name, value in provider_env.items()
-        if ("KEY" in name.upper() or "TOKEN" in name.upper()) and str(value)
-    )
     excluded_trials: list[dict[str, Any]] = []
     surplus_trials = 0
     for model in selected:
@@ -449,53 +517,81 @@ def launch_matrix(
                 max_job_attempts=max_job_attempts,
                 preregistration_digest=preregistration_digest,
             )
-            harbor_launcher._bounded_command(
-                [
-                    str(harbor),
-                    "run",
-                    "--path",
-                    str(snapshot),
-                    "--agent",
-                    "claude-code",
-                    "--model",
-                    model,
-                    "--agent-kwarg",
-                    f"max_budget_usd={max_budget_usd:.12g}",
-                    "--agent-kwarg",
-                    f"max_turns={max_turns}",
-                    "--mounts",
-                    json.dumps(
-                        [
-                            {
-                                "type": "bind",
-                                "source": str(claude),
-                                "target": "/usr/local/bin/claude",
-                                "read_only": True,
-                            }
-                        ]
-                    ),
-                    "--allow-agent-host",
-                    route_host,
-                    "--jobs-dir",
-                    str(jobs),
-                    "--job-name",
-                    job_name,
-                    "--n-attempts",
-                    str(missing),
-                    "--n-concurrent",
-                    "1",
-                    "--max-retries",
-                    "0",
-                    "--yes",
-                    "--quiet",
-                ],
-                cwd=root,
-                log_root=root / "commands" / f"{_model_key(model)}-attempt-{attempt:03d}",
-                timeout_sec=timeout_sec,
-                max_output_bytes=max_output_bytes,
-                extra_env=child_env,
+            command_log = root / "commands" / f"{_model_key(model)}-attempt-{attempt:03d}"
+            argv = [
+                str(harbor),
+                "run",
+                "--path",
+                str(snapshot),
+                "--agent",
+                "claude-code",
+                "--model",
+                model,
+                "--agent-kwarg",
+                f"max_budget_usd={max_budget_usd:.12g}",
+                "--agent-kwarg",
+                f"max_turns={max_turns}",
+                "--mounts",
+                json.dumps(
+                    [
+                        {
+                            "type": "bind",
+                            "source": str(claude),
+                            "target": "/usr/local/bin/claude",
+                            "read_only": True,
+                        }
+                    ]
+                ),
+                "--allow-agent-host",
+                route_host,
+                "--jobs-dir",
+                str(jobs),
+                "--job-name",
+                job_name,
+                "--n-attempts",
+                str(missing),
+                "--n-concurrent",
+                "1",
+                "--max-retries",
+                "0",
+                "--yes",
+                "--quiet",
+            ]
+            # A background scanner watches host process argv for the real
+            # credential while Harbor runs; with the relay the real key is never
+            # in Harbor's env, so this stays empty and proves the transport.
+            proc_leak: list[int] = []
+            stop_scanner = threading.Event()
+
+            def _scan() -> None:
+                while not stop_scanner.wait(0.5):
+                    proc_leak.extend(harbor_credentials.scan_proc_for_secret(secrets))
+
+            scanner = threading.Thread(target=_scan, daemon=True)
+            scanner.start()
+            try:
+                harbor_launcher._bounded_command(
+                    argv,
+                    cwd=root,
+                    log_root=command_log,
+                    timeout_sec=timeout_sec,
+                    max_output_bytes=max_output_bytes,
+                    extra_env=child_env,
+                    secret_values=secrets,
+                )
+            finally:
+                stop_scanner.set()
+                scanner.join(timeout=5)
+            # Fail closed on any real-credential leak in argv or artifacts.
+            harbor_credentials.assert_no_credential_leak(
                 secret_values=secrets,
+                artifact_roots=[command_log, jobs / job_name],
+                scan_proc=False,
             )
+            if proc_leak:
+                raise harbor_credentials.CredentialSecurityBarrier(
+                    "provider credential leak detected in host process argv"
+                )
             consume_job(jobs / job_name, missing, reservation)
         # Deterministic order and stable renumbering; a resumed run that finds
         # more than ``repetitions`` valid trials keeps the earliest ones and
@@ -529,6 +625,8 @@ def launch_matrix(
                 6,
             ),
             "liability_accounting": "crash-safe whole-job reservation before subprocess launch",
+            "credential_transport": "host-side-relay-single-run-token",
+            "relay_request_count": relay.request_count,
         },
         "evidence_level": "E3",
         "checkpoint_capability": False,

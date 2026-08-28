@@ -449,6 +449,12 @@ def _add_agent_factory(sub: argparse._SubParsersAction) -> None:
         help="bounded task-repair rounds when an Oracle/NOP control fails (0 disables)",
     )
     autopilot.add_argument("--repair-max-budget-usd", type=float, default=4.0)
+    autopilot.add_argument(
+        "--harbor-relay-host",
+        default="127.0.0.1",
+        help="host address the Harbor container reaches the credential relay on "
+        "(the Docker bridge gateway on a real host, e.g. 172.17.0.1)",
+    )
     autopilot.set_defaults(handler=_cmd_agent_factory_autopilot)
 
     batch = inner.add_parser(
@@ -680,6 +686,7 @@ def _cmd_agent_factory_autopilot(args: argparse.Namespace) -> int:
         max_intervention_liability_usd=args.max_intervention_liability_usd,
         max_runtime_repair_rounds=args.max_runtime_repair_rounds,
         repair_max_budget_usd=args.repair_max_budget_usd,
+        harbor_relay_host=args.harbor_relay_host,
     )
     promotion = result.get("promotion") if isinstance(result.get("promotion"), dict) else {}
     _print_json(
@@ -1484,6 +1491,11 @@ def _add_harbor_model_matrix(sub: argparse._SubParsersAction) -> None:
     parser.add_argument("--timeout-sec", type=float, default=10_800)
     parser.add_argument("--max-job-attempts", type=int, default=2)
     parser.add_argument(
+        "--relay-host",
+        default="127.0.0.1",
+        help="host address the Harbor container reaches the credential relay on",
+    )
+    parser.add_argument(
         "--harbor-control-receipt",
         help="optional matching Oracle/NOP receipt used to build screening-report.json",
     )
@@ -1513,6 +1525,7 @@ def _cmd_harbor_model_matrix(args: argparse.Namespace) -> int:
         max_turns=args.max_turns,
         timeout_sec=args.timeout_sec,
         max_job_attempts=args.max_job_attempts,
+        relay_host=args.relay_host,
     )
     trace_manifest = harbor_model_matrix_mod.write_trace_bundle(
         receipt,
