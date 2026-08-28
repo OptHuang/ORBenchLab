@@ -562,3 +562,27 @@ def test_promotion_summary_carries_license_gate(tmp_path: Path):
     assert summary["license_gate"]["publishable"] is False
     report = (evidence_root / "promotion" / "final-report.md").read_text(encoding="utf-8")
     assert "许可证 gate" in report
+
+
+def test_discrimination_gate_blocks_contract_review_required():
+    blocked = factory_promotion._discrimination_gate(
+        {"barriers": {"baseline": {"discrimination": {
+            "kind": "degenerate-all-fail",
+            "contract_review_required": True,
+            "reason": "controls pass but no model solved",
+            "feedback_digest": "sha256:" + "a" * 64,
+        }}}}
+    )
+    assert blocked["status"] == "blocked"
+    assert blocked["kind"] == "degenerate-all-fail"
+
+    passing = factory_promotion._discrimination_gate(
+        {"barriers": {"baseline": {"discrimination": {
+            "kind": "discriminating", "contract_review_required": False,
+            "feedback_digest": "sha256:" + "b" * 64,
+        }}}}
+    )
+    assert passing["status"] == "pass"
+
+    # Legacy state with no recorded verdict is non-blocking.
+    assert factory_promotion._discrimination_gate({})["status"] == "unknown"

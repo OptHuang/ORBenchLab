@@ -421,3 +421,54 @@ def test_relay_leaves_only_the_relay_token_in_artifacts(tmp_path: Path):
     content = leaked[0].read_text()
     assert PROVIDER["ANTHROPIC_AUTH_TOKEN"] not in content
     assert content and content != PROVIDER["ANTHROPIC_AUTH_TOKEN"]
+
+
+def _screening(rates, *, controls="pass", rectangular=True, promising=False):
+    cells = [{"model": f"m{i}", "solve_rate": r} for i, r in enumerate(rates)]
+    return {
+        "report_digest": "sha256:" + "d" * 64,
+        "tasks": [
+            {
+                "control_gates": {"oracle": {"gate": controls}, "nop": {"gate": controls}},
+                "discrimination": {
+                    "models": cells,
+                    "rectangular": rectangular,
+                    "promising": promising,
+                    "observed_gap": (max(rates) - min(rates)) if rates else None,
+                },
+            }
+        ],
+    }
+
+
+def test_classify_discrimination_flags_controls_pass_but_all_models_fail():
+    verdict = harbor_model_matrix.classify_discrimination(_screening([0.0, 0.0]))
+    assert verdict["kind"] == "degenerate-all-fail"
+    assert verdict["controls_passed"] is True
+    assert verdict["contract_review_required"] is True
+    assert "contract" in verdict["reason"]
+
+    # All models solve everything -> too-easy, no contract review.
+    easy = harbor_model_matrix.classify_discrimination(_screening([1.0, 1.0]))
+    assert easy["kind"] == "degenerate-all-pass"
+    assert easy["contract_review_required"] is False
+
+    # Healthy separation -> discriminating, no review.
+    good = harbor_model_matrix.classify_discrimination(
+        _screening([0.2, 0.8], promising=True)
+    )
+    assert good["kind"] == "discriminating"
+    assert good["contract_review_required"] is False
+
+    # All-fail but controls also failed -> not a contract-review signal here.
+    broken = harbor_model_matrix.classify_discrimination(
+        _screening([0.0, 0.0], controls="fail")
+    )
+    assert broken["kind"] == "degenerate-all-fail"
+    assert broken["contract_review_required"] is False
+
+    # Incomplete rectangle -> insufficient evidence.
+    thin = harbor_model_matrix.classify_discrimination(
+        _screening([0.0], rectangular=False)
+    )
+    assert thin["kind"] == "insufficient-evidence"

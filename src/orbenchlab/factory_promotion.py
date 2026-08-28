@@ -414,6 +414,17 @@ def run_promotion(
         "receipt_digest": _file_digest(final_dir / "factory-finalization.json"),
     }
 
+    # Auto-feedback gate: a task whose controls pass but which no model solved
+    # is not auto-promoted; it is routed to an instruction/verifier contract
+    # review instead of shipping as release-eligible.
+    discrimination_gate = _discrimination_gate(state)
+    gates["discrimination"] = discrimination_gate
+    promoted = bool(final.get("promoted")) and discrimination_gate["status"] != "blocked"
+    decision = (
+        "blocked-needs-instruction-verifier-contract-review"
+        if discrimination_gate["status"] == "blocked"
+        else final.get("decision")
+    )
     summary = {
         "schema_version": SCHEMA_VERSION,
         "selected_task": selected_relative,
@@ -429,8 +440,8 @@ def run_promotion(
             len(reviewers) * float(review_max_budget_usd), 6
         ),
         "gates": gates,
-        "promoted": bool(final.get("promoted")),
-        "decision": final.get("decision"),
+        "promoted": promoted,
+        "decision": decision,
         "evidence_level": final.get("evidence_level"),
     }
     report_paths = write_final_report(
@@ -455,6 +466,36 @@ def run_promotion(
     )
     _atomic_json(root / "promotion-summary.json", summary)
     return summary
+
+
+def _discrimination_gate(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive the promotion discrimination gate from the baseline barrier.
+
+    Absent a recorded verdict the gate is a non-blocking 'unknown' so legacy
+    runs are unaffected; a baseline that flagged ``contract_review_required``
+    blocks auto-promotion.
+    """
+
+    barrier = {}
+    if isinstance(state, Mapping):
+        barriers = state.get("barriers")
+        if isinstance(barriers, Mapping) and isinstance(barriers.get("baseline"), Mapping):
+            barrier = barriers["baseline"].get("discrimination") or {}
+    if not isinstance(barrier, Mapping) or not barrier:
+        return {"status": "unknown", "reason": "no recorded discrimination verdict"}
+    if barrier.get("contract_review_required"):
+        return {
+            "status": "blocked",
+            "kind": barrier.get("kind"),
+            "reason": barrier.get("reason")
+            or "controls pass but no model solved: instruction/verifier contract review required",
+            "feedback_digest": barrier.get("feedback_digest"),
+        }
+    return {
+        "status": "pass",
+        "kind": barrier.get("kind"),
+        "feedback_digest": barrier.get("feedback_digest"),
+    }
 
 
 def _format_rate(cell: Mapping[str, Any]) -> str:

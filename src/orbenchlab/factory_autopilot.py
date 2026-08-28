@@ -876,8 +876,14 @@ def _ensure_baseline(
     screening = harbor_model_matrix.build_screening_report(
         matrix, harbor_controls=controls, out=root / "matrix"
     )
+    # Auto-feedback: classify the discrimination pattern deterministically. A
+    # 'controls pass but no model solves' result is fed back for contract review
+    # rather than silently promoted or blamed on model quality.
+    discrimination_feedback = harbor_model_matrix.classify_discrimination(screening)
+    _atomic_json(root / "matrix" / "discrimination-feedback.json", discrimination_feedback)
     trusted_source = root / "trusted-source"
     trusted_source.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(root / "matrix" / "discrimination-feedback.json", trusted_source)
     shutil.copy2(root / "controls" / "harbor-control-screening.json", trusted_source)
     shutil.copy2(root / "matrix" / "harbor-model-matrix.json", trusted_source)
     shutil.copy2(root / "matrix" / "screening-report.json", trusted_source)
@@ -895,6 +901,7 @@ def _ensure_baseline(
             "harbor_controls": controls["report_digest"],
             "harbor_model_matrix": matrix["receipt_digest"],
             "screening": screening["report_digest"],
+            "discrimination_feedback": discrimination_feedback["feedback_digest"],
             "static_authoring": static_receipt["receipt_digest"],
             "trace_manifest": trace["manifest_digest"],
             **(
@@ -913,6 +920,12 @@ def _ensure_baseline(
         "trace_manifest_digest": trace["manifest_digest"],
         "trusted_bundle_digest": bundle["bundle_digest"],
         "observed_usage": _usage_summary(matrix),
+        "discrimination": {
+            "kind": discrimination_feedback["kind"],
+            "contract_review_required": discrimination_feedback["contract_review_required"],
+            "feedback_digest": discrimination_feedback["feedback_digest"],
+            "reason": discrimination_feedback["reason"],
+        },
         "runtime_repair": {
             "repaired": repair_state["repaired"],
             "rounds": repair_state["rounds"],

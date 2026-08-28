@@ -907,10 +907,96 @@ def build_screening_report(
     return report
 
 
+DISCRIMINATION_FEEDBACK_SCHEMA = "orbenchlab.discrimination-feedback.v1"
+
+
+def classify_discrimination(screening: Mapping[str, Any]) -> dict[str, Any]:
+    """Classify a screening report's model-discrimination pattern.
+
+    This is a deterministic pattern classifier, not a semantic verdict: it
+    reports *what the numbers show* and whether that warrants a contract review,
+    without itself deciding the instruction/verifier contract is broken. When
+    the controls pass yet no model solves the task (``degenerate-all-fail``),
+    that is the strongest machine-detectable signal of an instruction/verifier
+    contract mismatch or an over-hard task, and it must be fed back for review
+    rather than silently promoted or blamed on model quality.
+    """
+
+    tasks = screening.get("tasks") if isinstance(screening, Mapping) else None
+    task_row = tasks[0] if isinstance(tasks, list) and tasks else {}
+    discrimination = task_row.get("discrimination") if isinstance(task_row, Mapping) else None
+    cells = (
+        list(discrimination.get("models") or [])
+        if isinstance(discrimination, Mapping)
+        else []
+    )
+    controls_passed = False
+    control_gates = task_row.get("control_gates") if isinstance(task_row, Mapping) else None
+    if isinstance(control_gates, Mapping):
+        controls_passed = all(
+            isinstance(control_gates.get(name), Mapping)
+            and control_gates[name].get("gate") == "pass"
+            for name in ("oracle", "nop")
+        )
+    rates = [
+        float(cell["solve_rate"])
+        for cell in cells
+        if isinstance(cell, Mapping) and isinstance(cell.get("solve_rate"), (int, float))
+    ]
+    rectangular = bool(discrimination.get("rectangular")) if isinstance(discrimination, Mapping) else False
+    promising = bool(discrimination.get("promising")) if isinstance(discrimination, Mapping) else False
+
+    if not rectangular or len(rates) < 2:
+        kind = "insufficient-evidence"
+    elif all(rate <= 0.0 for rate in rates):
+        kind = "degenerate-all-fail"
+    elif all(rate >= 1.0 for rate in rates):
+        kind = "degenerate-all-pass"
+    elif promising:
+        kind = "discriminating"
+    else:
+        kind = "weak-signal"
+
+    contract_review_required = kind == "degenerate-all-fail" and controls_passed
+    reasons = {
+        "insufficient-evidence": "model arms are not a complete equal-budget rectangle",
+        "degenerate-all-fail": (
+            "controls pass but no model solved any trial: suspect an instruction/"
+            "verifier contract mismatch or an over-hard task; do not attribute to "
+            "model quality without a contract review"
+            if controls_passed
+            else "no model solved any trial"
+        ),
+        "degenerate-all-pass": "every model solved every trial: the task is too easy to discriminate",
+        "discriminating": "positive conservative model separation on the unassisted cell",
+        "weak-signal": "model arms are complete but separation is not significant",
+    }
+    verdict = {
+        "schema_version": DISCRIMINATION_FEEDBACK_SCHEMA,
+        "kind": kind,
+        "controls_passed": controls_passed,
+        "contract_review_required": contract_review_required,
+        "model_solve_rates": [
+            {"model": cell.get("model"), "solve_rate": cell.get("solve_rate")}
+            for cell in cells
+            if isinstance(cell, Mapping)
+        ],
+        "observed_gap": discrimination.get("observed_gap") if isinstance(discrimination, Mapping) else None,
+        "reason": reasons[kind],
+        "screening_report_digest": screening.get("report_digest"),
+    }
+    verdict["feedback_digest"] = _digest(
+        {key: value for key, value in verdict.items() if key != "feedback_digest"}
+    )
+    return verdict
+
+
 __all__ = [
+    "DISCRIMINATION_FEEDBACK_SCHEMA",
     "HarborModelMatrixError",
     "SCHEMA_VERSION",
     "build_screening_report",
+    "classify_discrimination",
     "launch_matrix",
     "write_trace_bundle",
 ]
