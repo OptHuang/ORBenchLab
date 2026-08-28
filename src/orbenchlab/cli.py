@@ -43,6 +43,7 @@ from . import factory_supervisor as factory_supervisor_mod
 from . import difficulty_matrix as difficulty_matrix_mod
 from . import factory_autopilot as factory_autopilot_mod
 from . import session_interventions as session_interventions_mod
+from . import factory_batch as factory_batch_mod
 
 PROG = "orbench"
 
@@ -429,6 +430,28 @@ def _add_agent_factory(sub: argparse._SubParsersAction) -> None:
     autopilot.add_argument("--promotion-max-review-tokens", type=int, default=2400)
     autopilot.set_defaults(handler=_cmd_agent_factory_autopilot)
 
+    batch = inner.add_parser(
+        "batch",
+        help="screen and run one isolated autopilot per paper candidate",
+    )
+    batch.add_argument("--spec", required=True, help="batch spec YAML/JSON")
+    batch.add_argument("--out", required=True)
+    batch.add_argument("--harbor-executable", required=True)
+    batch.add_argument("--claude-executable", required=True)
+    batch.add_argument("--repetitions", type=int, default=5)
+    batch.add_argument("--max-budget-usd", type=float, default=0.5)
+    batch.add_argument("--max-turns", type=int, default=40)
+    batch.add_argument("--harbor-timeout-sec", type=float, default=10_800)
+    batch.add_argument("--max-variants", type=int, default=3)
+    batch.add_argument("--max-job-attempts", type=int, default=2)
+    batch.add_argument("--max-harbor-liability-usd-per-candidate", type=float, default=40.0)
+    batch.add_argument("--max-total-liability-usd", type=float, default=200.0)
+    batch.add_argument("--max-candidates", type=int)
+    batch.add_argument("--max-parallel", type=int, default=1)
+    batch.add_argument("--held-out", action="store_true")
+    batch.add_argument("--stop-after-semantic", action="store_true")
+    batch.set_defaults(handler=_cmd_agent_factory_batch)
+
     finalize_parser = inner.add_parser(
         "finalize", help="independently gate an E1 factory run into an E3 release candidate"
     )
@@ -635,6 +658,48 @@ def _cmd_agent_factory_autopilot(args: argparse.Namespace) -> int:
     )
     successful = {"promoted"} if not args.stop_after_semantic else {"semantic-complete-e1"}
     return 0 if result["status"] in successful else 8
+
+
+def _cmd_agent_factory_batch(args: argparse.Namespace) -> int:
+    spec = factory_batch_mod.load_batch_spec(args.spec)
+    provider_env = {
+        name: os.environ[name]
+        for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+        if name in os.environ
+    }
+    state = factory_batch_mod.run_batch(
+        spec=spec,
+        out=args.out,
+        provider_env=provider_env,
+        harbor_executable=args.harbor_executable,
+        claude_executable=args.claude_executable,
+        repetitions=args.repetitions,
+        max_budget_usd=args.max_budget_usd,
+        max_turns=args.max_turns,
+        harbor_timeout_sec=args.harbor_timeout_sec,
+        max_variants=args.max_variants,
+        max_job_attempts=args.max_job_attempts,
+        max_harbor_liability_usd_per_candidate=args.max_harbor_liability_usd_per_candidate,
+        max_total_liability_usd=args.max_total_liability_usd,
+        max_candidates=args.max_candidates,
+        max_parallel=args.max_parallel,
+        held_out=args.held_out,
+        promote=not args.stop_after_semantic,
+    )
+    _print_json(
+        {
+            "admitted": state["admitted"],
+            "skipped": state["skipped"],
+            "status_counts": state["status_counts"],
+            "liability": state["liability"],
+            "written": str(Path(args.out) / "batch-state.json"),
+        }
+    )
+    goal = {"semantic-complete-e1"} if args.stop_after_semantic else {"promoted"}
+    complete = state["candidates"] and all(
+        row.get("status") in goal for row in state["candidates"]
+    )
+    return 0 if complete else 8
 
 
 def _cmd_agent_factory_finalize(args: argparse.Namespace) -> int:
