@@ -1049,68 +1049,6 @@ def _build_agent_visible_template(task: Path, out: Path) -> dict[str, Any]:
     }
 
 
-def _isolated_verifier_grade(task: Path, *, out: Path):
-    """Return a trusted separate-verifier grader the solver agent never sees.
-
-    Each grade builds a fresh isolation dir from the frozen task tree (which
-    includes the hidden verifier and reference solution) and overlays only the
-    agent's ``submission/`` before running the task's ``tests/test.sh``.  The
-    agent's session never had ``tests/`` visible, so it cannot have faked the
-    verifier.  When the verifier cannot be grounded locally (for example it
-    requires the Harbor container), the trial is marked infra_error with a
-    machine-readable reason rather than counted as a task outcome.
-    """
-
-    test_script = task / "tests" / "test.sh"
-    out.mkdir(parents=True, exist_ok=True)
-    counter = {"n": 0}
-
-    def grade(workdir: Path) -> dict[str, Any]:
-        counter["n"] += 1
-        if not test_script.is_file():
-            return {
-                "status": "infra_error",
-                "reason": "task has no tests/test.sh to ground the verifier",
-            }
-        isolate = out / f"grade-{counter['n']:03d}"
-        if isolate.exists():
-            shutil.rmtree(isolate)
-        shutil.copytree(task, isolate, symlinks=False)
-        submission_src = workdir / "submission"
-        submission_dst = isolate / "submission"
-        if submission_dst.exists():
-            shutil.rmtree(submission_dst)
-        if submission_src.is_dir() and not submission_src.is_symlink():
-            shutil.copytree(submission_src, submission_dst, symlinks=False)
-        else:
-            submission_dst.mkdir()
-        stdout, stderr, exit_code, failure = agent_sessions._bounded_process(
-            ["bash", str(isolate / "tests" / "test.sh")],
-            cwd=isolate,
-            env={"PATH": os.environ.get("PATH", ""), "ORBENCH_LOCAL_VERIFIER": "1"},
-            stdin=b"",
-            timeout_sec=300.0,
-            max_output_bytes=8 * 1024 * 1024,
-        )
-        if failure in {"launch_error"}:
-            return {"status": "infra_error", "reason": "verifier could not launch locally"}
-        status = "pass" if failure is None and exit_code == 0 else "fail"
-        return {
-            "status": status,
-            "exit_code": exit_code,
-            "failure_class": failure,
-            "stdout_digest": _value_digest_bytes(stdout),
-            "stderr_digest": _value_digest_bytes(stderr),
-            "isolation_dir": str(isolate),
-        }
-
-    return grade
-
-
-def _value_digest_bytes(value: bytes) -> str:
-    return "sha256:" + hashlib.sha256(value).hexdigest()
-
-
 def _ensure_intervention(
     *,
     plan: Mapping[str, Any],
@@ -1126,9 +1064,18 @@ def _ensure_intervention(
     n_treatment: int,
     timeout_sec: float,
     max_output_bytes: int,
+    verifier_adapter: "session_interventions.GradeCallable | None" = None,
 ) -> dict[str, Any]:
-    """Probe the same-session injection channel and, when supported and enabled,
-    run a crash-safe controlled study on the frozen task, feeding trusted input."""
+    """Probe the same-session injection channel and honestly record its evidence.
+
+    A verifier-grounded controlled study runs only when a *trusted* Harbor-
+    equivalent, secret-safe verifier adapter is supplied (``verifier_adapter``).
+    The autopilot ships no such adapter — an untrusted solver agent that needs
+    both a shell and the provider credential cannot be made secret-safe or
+    Harbor-truthful outside a container — so by default it records a
+    machine-readable E0/E1 capability receipt with a precise reason and never
+    fabricates an E4 causal claim from a host-shell verifier.
+    """
 
     task = factory_gates.resolve_task_root(
         _stage_output_path(plan, workdir, "task-repair-v2", kind="directory")
@@ -1147,23 +1094,18 @@ def _ensure_intervention(
     study_receipt: dict[str, Any] | None = None
     study_reason = None
     template_info: dict[str, Any] | None = None
-    has_local_verifier = (task / "tests" / "test.sh").is_file()
     if not capability["same_session_hint_injection"]:
         study_reason = "runtime-unsupported"
     elif not enabled:
         study_reason = "disabled-by-configuration"
-    elif not (has_local_verifier or verifier_argv):
-        study_reason = "no-separate-verifier-adapter"
-    else:
-        # Build the non-leaking agent-visible template (no solution/tests/oracle)
-        # and grade each trial with the frozen verifier in isolation, so the
-        # solver agent can never read the reference solution or hidden verifier.
+    elif verifier_adapter is None:
+        # No Harbor-equivalent, secret-safe, isolated verifier adapter is
+        # available; a host-shell verifier would score an empty submission as
+        # pass and fake E4, so the study is honestly not run.
+        study_reason = "no-harbor-grounded-verifier-adapter"
         template_info = _build_agent_visible_template(task, root / "agent-template")
-        grade = (
-            _isolated_verifier_grade(task, out=root / "grading")
-            if has_local_verifier
-            else None
-        )
+    else:
+        template_info = _build_agent_visible_template(task, root / "agent-template")
         study_receipt = session_interventions.run_intervention_study(
             profile="claude-code",
             model=model,
@@ -1181,7 +1123,7 @@ def _ensure_intervention(
             max_output_bytes=max_output_bytes,
             agent_read_only_names=template_info["agent_read_only_names"],
             agent_allow_bash=True,
-            grade=grade,
+            grade=verifier_adapter,
         )
     capability_receipt = {
         "schema_version": "orbenchlab.runtime-capability.v1",
@@ -1204,14 +1146,20 @@ def _ensure_intervention(
             template_info["hidden_file_count"] if template_info else None
         ),
         "verifier_mechanism": (
-            "separate-isolated-frozen-verifier" if has_local_verifier else None
+            "caller-supplied-trusted-adapter" if verifier_adapter is not None else None
         ),
         "policy_digest": session_interventions._digest(policy),
         "study_status": (
             study_receipt["status"] if study_receipt is not None else "not-run"
         ),
         "study_evidence_level": (
-            study_receipt["evidence_level"] if study_receipt is not None else None
+            study_receipt["evidence_level"]
+            if study_receipt is not None
+            else (
+                "E0-unsupported"
+                if study_reason == "runtime-unsupported"
+                else "E1-capability-only-no-study"
+            )
         ),
         "study_reason": study_reason,
         "causal_intervention_claim_available": bool(

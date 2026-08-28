@@ -436,13 +436,7 @@ def _synthetic_task(root: Path) -> Path:
     return task
 
 
-def test_autopilot_intervention_barrier_runs_sandboxed_study(tmp_path: Path):
-    # The barrier builds a non-leaking template, runs sandboxed sessions, and
-    # grades with verifier_argv (no local tests/test.sh grounding here).
-    if not shutil.which("bwrap"):
-        pytest.skip("intervention sandbox needs bubblewrap")
-    from orbenchlab import factory_autopilot
-
+def _barrier_workdir(tmp_path: Path):
     src = tmp_path / "task-src"; src.mkdir()
     task_src = _synthetic_task(src)
     workdir = tmp_path / "work"
@@ -450,8 +444,6 @@ def test_autopilot_intervention_barrier_runs_sandboxed_study(tmp_path: Path):
     (workdir / "factory-input" / "paper-provenance.json").write_text("{}", encoding="utf-8")
     task_dst = workdir / "factory/tasks/task-v2/demo-task"
     shutil.copytree(task_src, task_dst)
-    # Remove the local tests/test.sh grounding so the study uses verifier_argv.
-    shutil.rmtree(task_dst / "tests")
     (workdir / "factory/analysis").mkdir(parents=True)
     (workdir / "factory/analysis/intervention-policy.json").write_text(
         json.dumps({
@@ -462,21 +454,61 @@ def test_autopilot_intervention_barrier_runs_sandboxed_study(tmp_path: Path):
         }), encoding="utf-8")
     plan = {"stages": [{"id": "task-repair-v2",
                         "required_outputs": [{"path": "factory/tasks/task-v2", "kind": "directory"}]}]}
-    bin_root = tmp_path / "cli"; bin_root.mkdir()
-    executable = _fake_claude(bin_root)
-    verifier = bin_root / "v.sh"
-    verifier.write_text("#!/bin/sh\ntest -f hint.txt\n", encoding="utf-8")
-    verifier.chmod(0o755)
+    return plan, workdir
+
+
+def test_autopilot_intervention_barrier_is_honest_e1_without_a_verifier_adapter(tmp_path: Path):
+    # Default autopilot ships no Harbor-grounded verifier adapter, so the study
+    # must NOT run and must NOT claim E4; a host-shell verifier is never used.
+    if not shutil.which("bwrap"):
+        pytest.skip("intervention barrier install needs the workspace sandbox")
+    from orbenchlab import factory_autopilot
+
+    plan, workdir = _barrier_workdir(tmp_path)
+    cli = tmp_path / "cli"; cli.mkdir()
+    executable = _fake_claude(cli)
     result = factory_autopilot._ensure_intervention(
         plan=plan, workdir=workdir, evidence_root=tmp_path / "evidence",
         claude_executable=executable, model="fixture-model", provider_env=PROVIDER,
-        max_budget_usd=0.1, enabled=True, verifier_argv=[str(verifier)],
-        n_control=3, n_treatment=3, timeout_sec=20, max_output_bytes=8 * 1024 * 1024)
-    assert result["same_session_hint_injection"] is True
+        max_budget_usd=0.1, enabled=True, verifier_argv=[],
+        n_control=3, n_treatment=3, timeout_sec=20, max_output_bytes=8 * 1024 * 1024,
+        verifier_adapter=None)
+    assert result["study_status"] == "not-run"
+    assert result["study_reason"] == "no-harbor-grounded-verifier-adapter"
+    assert result["study_evidence_level"] == "E1-capability-only-no-study"
+    cap = json.loads((tmp_path / "evidence" / "intervention" / "trusted-source" / "runtime-capability.json").read_text())
+    assert cap["causal_intervention_claim_available"] is False
+    assert cap["verifier_mechanism"] is None
+    assert not (tmp_path / "evidence" / "intervention" / "study").exists()
+
+
+def test_autopilot_intervention_barrier_runs_with_trusted_adapter(tmp_path: Path):
+    # With a caller-supplied trusted verifier adapter (representing a Harbor-
+    # equivalent grader), the sandboxed study runs and reaches E4 only when
+    # confirmed; the mechanism is labelled as a caller adapter, never a shell.
+    if not shutil.which("bwrap"):
+        pytest.skip("intervention sandbox needs bubblewrap")
+    from orbenchlab import factory_autopilot
+
+    plan, workdir = _barrier_workdir(tmp_path)
+    cli = tmp_path / "cli"; cli.mkdir()
+    executable = _fake_claude(cli)
+
+    def trusted_adapter(trial_workdir):
+        submission = trial_workdir / "hint.txt"
+        return {"status": "pass" if submission.is_file() else "fail",
+                "mechanism": "test-trusted-verifier"}
+
+    result = factory_autopilot._ensure_intervention(
+        plan=plan, workdir=workdir, evidence_root=tmp_path / "evidence",
+        claude_executable=executable, model="fixture-model", provider_env=PROVIDER,
+        max_budget_usd=0.1, enabled=True, verifier_argv=[],
+        n_control=3, n_treatment=3, timeout_sec=20, max_output_bytes=8 * 1024 * 1024,
+        verifier_adapter=trusted_adapter)
     assert result["study_status"] == "completed"
     assert result["study_evidence_level"] == "E4-controlled-same-session-intervention"
     cap = json.loads((tmp_path / "evidence" / "intervention" / "trusted-source" / "runtime-capability.json").read_text())
-    assert cap["harbor_native"] is False
+    assert cap["verifier_mechanism"] == "caller-supplied-trusted-adapter"
     assert cap["causal_intervention_claim_available"] is True
     assert cap["hidden_from_agent_file_count"] >= 1
 
