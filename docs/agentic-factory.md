@@ -107,9 +107,29 @@ digest-bound logs on completion. The plain factory runner reports
 restarts — a monitor that merely starts a fresh CLI process with a hint stays
 E3.
 
-A separate, capability-gated intervention channel now exists for agent
-sessions: `claude --print --input-format stream-json` accepts additional user
-messages on the open stdin of the same running session.
+The autopilot also runs a bounded, receipt-bound **runtime repair** at its
+control barriers: a failing Oracle/NOP control is classified (infrastructure vs
+task defect) and a sanitized machine failure bundle is written. An
+infrastructure failure raises a resumable signal that never mutates the task or
+discards confirmed jobs; a repairable task defect drives a bounded
+least-visibility repair agent session that produces a new slug-named task
+version, re-runs the static gate and re-runs the controls, with a receipt chain
+binding the parent-task and failure digests. Exhausting the round cap
+quarantines the run with the machine bundle attached instead of crashing;
+variant control failures are likewise isolated. `--max-runtime-repair-rounds`
+bounds it.
+
+Promotion's semantic review is itself run through independent CLI agent
+sessions (one least-visibility no-Bash session per reviewer, hard
+`--max-budget-usd`, session receipts), never a raw provider HTTP call; the
+finalizer re-verifies each reviewer's session receipt and on-disk verdict, and
+a machine-decidable license gate (`allowed` / `needs-human-review` /
+`rejected`, always `publishable=false`) is surfaced so an unresolved license is
+never presented as publishable.
+
+A separate, capability-gated intervention channel exists for agent sessions:
+`claude --print --input-format stream-json` accepts additional user messages on
+the open stdin of the same running session.
 `orbench agent-session capability` reports the machine-readable capability per
 profile/runtime (Codex and Harbor trials are `unsupported`, fail-closed);
 `orbench agent-session intervene` runs one monitored session that fires a
@@ -123,6 +143,21 @@ supported, every treatment injection was confirmed, and both arms have at
 least three verifier-graded trials. Anything less is labelled
 `E3-underpowered` or `E1-incomplete`; an unsupported profile receives an `E0`
 receipt instead of a silently downgraded run.
+
+Crucially, the **autopilot ships no verifier adapter and does not auto-run a
+verifier-grounded study**. A same-session solver needs both a shell and the
+provider credential, which cannot be made secret-safe or Harbor-truthful
+outside a container, and a host-shell verifier would score an empty submission
+as a pass and fabricate E4. The autopilot therefore records a machine-readable
+capability receipt with `study_status: not-run`, a precise
+`study_reason` (`no-harbor-grounded-verifier-adapter`),
+`study_evidence_level: E1-capability-only-no-study` (E0 when the channel is
+unsupported) and `causal_intervention_claim_available: false`. A
+verifier-grounded study runs only when a caller supplies a trusted
+Harbor-equivalent grade adapter, and the receipt records that adapter's own
+mechanism label — never `separate-isolated-frozen-verifier` for a host shell.
+When the study does run, the solver session is sandboxed against a non-leaking
+agent-visible template (solution/tests/oracle removed, hidden digests bound).
 
 ## Commands
 
