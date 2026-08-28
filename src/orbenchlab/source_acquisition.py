@@ -127,7 +127,9 @@ def verify_acquisition(*, receipt: Mapping[str, Any], out: str | Path) -> bool:
         raise SourceAcquisitionError("frozen source bytes are missing")
     if _digest_bytes(frozen_path.read_bytes()) != content_digest:
         raise SourceAcquisitionError("frozen source bytes do not match the provenance receipt")
-    unsigned = {k: v for k, v in receipt.items() if k != "receipt_digest"}
+    # ``reused``/``frozen_path`` are runtime annotations, not signed fields.
+    runtime_keys = {"receipt_digest", "reused", "frozen_path"}
+    unsigned = {k: v for k, v in receipt.items() if k not in runtime_keys}
     if receipt.get("receipt_digest") != _digest(unsigned):
         raise SourceAcquisitionError("acquisition receipt digest mismatch (possible tamper)")
     return True
