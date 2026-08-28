@@ -524,6 +524,11 @@ def paper_to_benchmark_plan(
             kind="directory",
             timeout_sec=3600,
             max_attempts=3,
+            # Implementing a complete strict task is the heaviest semantic
+            # stage. A real doubao-seed-2.0-pro run exhausted a $1 cap twice
+            # (error_max_budget_usd at ~230s/340s) and quarantined the whole
+            # factory; give authoring stages real headroom.
+            max_budget_usd=4.0,
             postchecks=("tb-science-static-gate",),
         ),
         _stage(
@@ -571,6 +576,7 @@ def paper_to_benchmark_plan(
             kind="directory",
             timeout_sec=3600,
             max_attempts=3,
+            max_budget_usd=4.0,
             postchecks=("tb-science-static-gate",),
         ),
         _stage(
@@ -689,6 +695,7 @@ def paper_to_benchmark_plan(
             kind="directory",
             timeout_sec=7200,
             max_attempts=3,
+            max_budget_usd=4.0,
             postchecks=("variant-conformance",),
         ),
         _stage(

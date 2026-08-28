@@ -263,7 +263,7 @@ def test_default_plan_assigns_all_semantic_stages_to_agent_sessions(tmp_path: Pa
         "source",
         "difficulty_axes",
     ]
-    assert plan["maximum_model_liability_usd"] == 44.5
+    assert plan["maximum_model_liability_usd"] == 71.5
     assert agentic_factory.validate_plan(plan) == plan
 
 
