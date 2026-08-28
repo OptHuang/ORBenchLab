@@ -551,6 +551,148 @@ def _stage_output_path(
     return agentic_factory._artifact_path(workdir, matches[0]["path"])
 
 
+RUNTIME_REPAIR_ADOPTION_SCHEMA = "orbenchlab.runtime-repair-adoption.v1"
+
+
+def _adoption_records(workdir: Path) -> list[dict[str, Any]]:
+    """Return validated runtime-repair adoption receipts, ascending by version.
+
+    A recorded adoption whose canonical tree is missing or has drifted from its
+    bound digest is a hard error, never a silent fall-back to the stale task.
+    """
+
+    root = workdir / "factory" / "runtime-repair"
+    if not root.is_dir():
+        return []
+    records: list[dict[str, Any]] = []
+    for receipt_path in sorted(root.glob("adoption-v*.json")):
+        if receipt_path.is_symlink():
+            raise FactoryAutopilotError("runtime-repair adoption receipt is a symlink")
+        record = _load_object(receipt_path)
+        if record.get("schema_version") != RUNTIME_REPAIR_ADOPTION_SCHEMA:
+            raise FactoryAutopilotError("runtime-repair adoption receipt schema mismatch")
+        unsigned = {k: v for k, v in record.items() if k != "adoption_digest"}
+        if record.get("adoption_digest") != _value_digest(unsigned):
+            raise FactoryAutopilotError("runtime-repair adoption receipt digest mismatch")
+        adopted = workdir.joinpath(*_safe_relative(str(record["adopted_task_relpath"])).parts)
+        if adopted.is_symlink() or not adopted.is_dir():
+            raise FactoryAutopilotError("adopted runtime-repair task tree is missing")
+        if volc_rollout._task_tree_digest(adopted) != record["adopted_task_tree_digest"]:
+            raise FactoryAutopilotError("adopted runtime-repair task tree has drifted")
+        records.append(record)
+    records.sort(key=lambda row: int(row["version"]))
+    return records
+
+
+def _current_task_root(plan: Mapping[str, Any], workdir: Path) -> Path:
+    """Resolve the task the pipeline currently operates on.
+
+    This is the latest canonically adopted runtime-repair version when one
+    exists, so every barrier after a baseline repair (difficulty, intervention)
+    and the promoted provenance reference the repaired tree, not the original
+    control-failing ``task-repair-v2`` output.
+    """
+
+    records = _adoption_records(workdir)
+    if records:
+        adopted = workdir.joinpath(
+            *_safe_relative(str(records[-1]["adopted_task_relpath"])).parts
+        )
+        return factory_gates.resolve_task_root(adopted)
+    return factory_gates.resolve_task_root(
+        _stage_output_path(plan, workdir, "task-repair-v2", kind="directory")
+    )
+
+
+def _adopt_repaired_task(
+    *,
+    workdir: Path,
+    scope: str,
+    original_task: Path,
+    repaired_task: Path,
+    repair_state: Mapping[str, Any],
+    failure_bundle_digest: str | None,
+    static_receipt_digest: str | None,
+) -> dict[str, Any]:
+    """Canonically adopt a repaired task as a new runtime-repair DAG version.
+
+    Copies the repaired tree to ``factory/runtime-repair/v{N}/<slug>`` (harness
+    owned, read-only) and writes a lineage receipt binding parent and adopted
+    digests plus the repair receipt chain. Idempotent: an existing adoption for
+    the same (scope, parent, adopted) triple is reused so resume never forks a
+    duplicate version.
+    """
+
+    slug = repaired_task.name
+    adopted_digest = volc_rollout._task_tree_digest(repaired_task)
+    parent_digest = volc_rollout._task_tree_digest(original_task)
+    existing = _adoption_records(workdir)
+    for record in existing:
+        if (
+            record.get("scope") == scope
+            and record.get("parent_task_tree_digest") == parent_digest
+            and record.get("adopted_task_tree_digest") == adopted_digest
+        ):
+            return record
+    version = (max((int(r["version"]) for r in existing), default=0)) + 1
+    repair_root = workdir / "factory" / "runtime-repair"
+    version_dir = repair_root / f"v{version}"
+    canonical = version_dir / slug
+    version_dir.mkdir(parents=True, exist_ok=True)
+    if canonical.exists():
+        _make_writable_tree(canonical)
+        shutil.rmtree(canonical)
+    temporary = version_dir / f".{slug}.{uuid.uuid4().hex}.tmp"
+    shutil.copytree(repaired_task, temporary, symlinks=False)
+    if volc_rollout._task_tree_digest(temporary) != adopted_digest:
+        _make_writable_tree(temporary)
+        shutil.rmtree(temporary)
+        raise FactoryAutopilotError("adopted runtime-repair task copy changed content")
+    os.replace(temporary, canonical)
+    record = {
+        "schema_version": RUNTIME_REPAIR_ADOPTION_SCHEMA,
+        "version": version,
+        "scope": scope,
+        "parent_task_tree_digest": parent_digest,
+        "adopted_task_tree_digest": adopted_digest,
+        "adopted_task_relpath": canonical.relative_to(workdir).as_posix(),
+        "repair_rounds": int(repair_state.get("rounds", 0)),
+        "repair_receipt_digests": [
+            r["receipt_digest"] for r in repair_state.get("repair_receipts", [])
+        ],
+        "failure_bundle_digest": failure_bundle_digest,
+        "repaired_static_receipt_digest": static_receipt_digest,
+    }
+    record["adoption_digest"] = _value_digest(record)
+    _atomic_json(repair_root / f"adoption-v{version}.json", record)
+    _read_only_tree(canonical)
+    return record
+
+
+def _make_writable_tree(root: Path) -> None:
+    for path in sorted(root.rglob("*"), reverse=True):
+        try:
+            path.chmod(0o755)
+        except OSError:
+            pass
+    try:
+        root.chmod(0o755)
+    except OSError:
+        pass
+
+
+def _read_only_tree(root: Path) -> None:
+    for path in sorted(root.rglob("*")):
+        try:
+            path.chmod(0o555 if path.is_dir() else 0o444)
+        except OSError:
+            pass
+    try:
+        root.chmod(0o555)
+    except OSError:
+        pass
+
+
 def _runtime_capability(task_digest: str) -> dict[str, Any]:
     receipt: dict[str, Any] = {
         "schema_version": "orbenchlab.runtime-capability.v1",
@@ -679,6 +821,7 @@ def _ensure_baseline(
         credential_relay=credential_relay,
     )
     task_digest = volc_rollout._task_tree_digest(task)
+    adoption: dict[str, Any] | None = None
     if task is not original_task:
         # A repaired task passed controls: re-run the static gate over the
         # repaired tree so the trusted bundle binds a fully gated task.
@@ -688,6 +831,23 @@ def _ensure_baseline(
         if repaired_quarantine is not None:
             raise FactoryStaticGateBlocked(repaired_quarantine)
         static_receipt = repaired_static
+        # Canonically adopt the repaired tree as a new runtime-repair DAG
+        # version with a lineage receipt, so the model matrix and every barrier
+        # after this one operate on the repaired task, not the original.
+        repair_receipts = repair_state.get("repair_receipts", [])
+        adoption = _adopt_repaired_task(
+            workdir=workdir,
+            scope="baseline",
+            original_task=original_task,
+            repaired_task=task,
+            repair_state=repair_state,
+            failure_bundle_digest=(
+                repair_receipts[0].get("failure_bundle_digest") if repair_receipts else None
+            ),
+            static_receipt_digest=repaired_static["receipt_digest"],
+        )
+        task = _current_task_root(plan, workdir)
+        task_digest = volc_rollout._task_tree_digest(task)
     matrix = harbor_model_matrix.launch_matrix(
         task,
         harbor_executable=harbor_executable,
@@ -737,6 +897,11 @@ def _ensure_baseline(
             "screening": screening["report_digest"],
             "static_authoring": static_receipt["receipt_digest"],
             "trace_manifest": trace["manifest_digest"],
+            **(
+                {"runtime_repair_adoption": adoption["adoption_digest"]}
+                if adoption is not None
+                else {}
+            ),
         },
     )
     return {
@@ -760,6 +925,9 @@ def _ensure_baseline(
             "repair_receipt_digests": [
                 r["receipt_digest"] for r in repair_state["repair_receipts"]
             ],
+            "adoption_digest": adoption["adoption_digest"] if adoption else None,
+            "adopted_task_relpath": adoption["adopted_task_relpath"] if adoption else None,
+            "adopted_version": adoption["version"] if adoption else None,
         },
     }
 
@@ -924,9 +1092,7 @@ def _ensure_difficulty(
             "model_matrix": str(root / "matrix" / "harbor-model-matrix.json"),
         }
         observed.append({"variant_id": variant_id, **_usage_summary(matrix)})
-    base_task = factory_gates.resolve_task_root(
-        _stage_output_path(plan, workdir, "task-repair-v2", kind="directory")
-    )
+    base_task = _current_task_root(plan, workdir)
     receipt = difficulty_matrix.build_receipt(
         manifest_path=manifest_path,
         variants_root=variants_root,
@@ -1108,9 +1274,7 @@ def _ensure_intervention(
     fabricates an E4 causal claim from a host-shell verifier.
     """
 
-    task = factory_gates.resolve_task_root(
-        _stage_output_path(plan, workdir, "task-repair-v2", kind="directory")
-    )
+    task = _current_task_root(plan, workdir)
     task_digest = volc_rollout._task_tree_digest(task)
     policy_path = agentic_factory._artifact_path(
         workdir, "factory/analysis/intervention-policy.json"

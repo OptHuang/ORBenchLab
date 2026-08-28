@@ -436,7 +436,12 @@ def _add_agent_factory(sub: argparse._SubParsersAction) -> None:
     autopilot.add_argument(
         "--intervention-verifier-cmd",
         default="",
-        help="optional JSON array argv override; by default the frozen task verifier grades in isolation",
+        help=(
+            "JSON array argv for a secret-safe, network-isolated, Harbor-grounded "
+            "verifier adapter. Without it there is no grounded verifier, so the "
+            "intervention study is honestly not run (an E0/E1 capability receipt "
+            "only); it is never graded by a host shell against the frozen verifier."
+        ),
     )
     autopilot.add_argument("--intervention-control", type=int, default=3)
     autopilot.add_argument("--intervention-treatment", type=int, default=3)

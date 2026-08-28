@@ -362,3 +362,93 @@ def test_barrier_shape_fails_closed_before_filesystem_lookup(tmp_path: Path):
             {"barriers": {"baseline": "forged", "difficulty": "forged"}},
             tmp_path / "missing",
         )
+
+
+ROOT = Path(__file__).resolve().parents[1]
+GOOD_TASK = ROOT / "examples" / "tasks" / "alphaevolve-scheduling"
+
+
+def test_runtime_repair_adoption_is_canonical_and_propagates(tmp_path: Path):
+    import shutil
+
+    from orbenchlab import factory_gates, volc_rollout
+
+    work = tmp_path / "work"
+    (work / "factory").mkdir(parents=True)
+    original = tmp_path / "task-repair-v2" / "alphaevolve-scheduling"
+    shutil.copytree(GOOD_TASK, original)
+    repaired = tmp_path / "repaired" / "alphaevolve-scheduling"
+    shutil.copytree(GOOD_TASK, repaired)
+    (repaired / "data" / "repair-marker.json").write_text("{}", encoding="utf-8")
+
+    repair_state = {
+        "repaired": True,
+        "rounds": 1,
+        "repair_receipts": [
+            {"receipt_digest": "sha256:" + "a" * 64, "failure_bundle_digest": "sha256:" + "b" * 64}
+        ],
+    }
+    record = factory_autopilot._adopt_repaired_task(
+        workdir=work,
+        scope="baseline",
+        original_task=original,
+        repaired_task=repaired,
+        repair_state=repair_state,
+        failure_bundle_digest="sha256:" + "b" * 64,
+        static_receipt_digest="sha256:" + "c" * 64,
+    )
+    # The lineage receipt binds parent and adopted digests and the repair chain.
+    assert record["version"] == 1
+    assert record["parent_task_tree_digest"] == volc_rollout._task_tree_digest(original)
+    assert record["adopted_task_tree_digest"] == volc_rollout._task_tree_digest(repaired)
+    assert record["repair_receipt_digests"] == ["sha256:" + "a" * 64]
+    adopted_root = work.joinpath(*record["adopted_task_relpath"].split("/"))
+    assert (adopted_root / "data" / "repair-marker.json").is_file()
+
+    # The current task root now resolves to the adopted tree, not task-repair-v2.
+    resolved = factory_autopilot._current_task_root(_repair_plan(), work)
+    assert volc_rollout._task_tree_digest(resolved) == record["adopted_task_tree_digest"]
+
+    # Re-adopting the same triple is idempotent (resume never forks a version).
+    again = factory_autopilot._adopt_repaired_task(
+        workdir=work,
+        scope="baseline",
+        original_task=original,
+        repaired_task=repaired,
+        repair_state=repair_state,
+        failure_bundle_digest="sha256:" + "b" * 64,
+        static_receipt_digest="sha256:" + "c" * 64,
+    )
+    assert again["version"] == 1
+
+    # A drifted adopted tree is a hard error, never a silent stale fall-back.
+    import os as _os
+    for path in sorted(adopted_root.rglob("*")):
+        try:
+            path.chmod(0o755)
+        except OSError:
+            pass
+    adopted_root.chmod(0o755)
+    (adopted_root / "data" / "tamper.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(factory_autopilot.FactoryAutopilotError, match="drifted"):
+        factory_autopilot._current_task_root(_repair_plan(), work)
+
+
+def _repair_plan() -> dict:
+    stages = [
+        {
+            "id": "task-repair-v2",
+            "role": "task-repair-v2",
+            "profile": "claude-code",
+            "model": "m",
+            "prompt": "author",
+            "depends_on": [],
+            "timeout_sec": 5,
+            "max_attempts": 1,
+            "max_budget_usd": 0.1,
+            "required_outputs": [{"path": "task-repair-v2", "kind": "directory"}],
+        }
+    ]
+    return agentic_factory.compile_plan(
+        name="repair plan", source_binding_digest="sha256:" + "a" * 64, stages=stages
+    )
