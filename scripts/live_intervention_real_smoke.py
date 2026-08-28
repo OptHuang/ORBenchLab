@@ -30,9 +30,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from orbenchlab import harbor_container_proxy  # noqa: E402
 from orbenchlab import harbor_credentials  # noqa: E402
 from orbenchlab import harbor_live_agent as hla  # noqa: E402
 from orbenchlab import harbor_live_intervention as hli  # noqa: E402
+
+# The MCP proxy is launched by Claude with Claude's minimal env, so run it by
+# absolute file path (it is stdlib-only and self-contained), not `-m package`.
+PROXY_PATH = os.path.abspath(harbor_container_proxy.__file__)
 
 CLAUDE = os.path.expanduser(
     "~/.local/node/node-v22.12.0-linux-x64/bin/claude"
@@ -116,7 +121,7 @@ def main() -> int:
         backend=hla.DockerBackend(),
         relay_factory=relay_factory,
         claude_executable=CLAUDE,
-        proxy_argv_prefix=[sys.executable, "-m", "orbenchlab.harbor_container_proxy"],
+        proxy_argv_prefix=[sys.executable, PROXY_PATH],
         verifier_argv=VERIFIER_ARGV,
         model=model,
         max_turns=6,
