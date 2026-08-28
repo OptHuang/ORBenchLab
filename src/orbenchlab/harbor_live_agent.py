@@ -210,4 +210,67 @@ def _read_instruction(task_root: Path) -> str:
     raise LiveAgentError("task has no instruction.md/README.md")
 
 
-__all__ = ["ContainerBackend", "ExecOutcome", "LiveAgentError", "build_arm_executor"]
+class DockerBackend:
+    """Production ``ContainerBackend`` backed by the Docker CLI.
+
+    Containers are started with ``--network none`` and no provider credential in
+    their environment, so an agent's tools cannot egress or read the secret.
+    """
+
+    def __init__(self, *, docker_bin: str = "docker", exec_timeout_sec: float = 600.0) -> None:
+        self._docker = docker_bin
+        self._timeout = exec_timeout_sec
+
+    def _run(self, args: Sequence[str], *, stdin: bytes = b"", timeout: float | None = None) -> ExecOutcome:
+        import subprocess
+
+        proc = subprocess.run(
+            [self._docker, *[str(a) for a in args]],
+            input=stdin,
+            capture_output=True,
+            timeout=timeout if timeout is not None else self._timeout,
+        )
+        return ExecOutcome(
+            rc=proc.returncode,
+            stdout=proc.stdout.decode("utf-8", errors="replace"),
+            stderr=proc.stderr.decode("utf-8", errors="replace"),
+        )
+
+    def build_image(self, *, context_dir: Path, tag: str) -> str:
+        out = self._run(["build", "-t", tag, str(context_dir)], timeout=1800)
+        if out.rc != 0:
+            raise LiveAgentError(f"docker build failed: {out.stderr[-500:]}")
+        return tag
+
+    def run_no_network(self, *, image: str, name: str, env: Mapping[str, str]) -> str:
+        if env:
+            raise LiveAgentError("a live task container must not receive any env (no credential)")
+        # Remove a stale container of the same name, then start detached with no
+        # network and a long-lived shell so tools can exec into it.
+        self._run(["rm", "-f", name], timeout=60)
+        out = self._run(
+            ["run", "-d", "--network", "none", "--name", name, "--entrypoint", "/bin/sh", image, "-c", "sleep infinity"],
+            timeout=120,
+        )
+        if out.rc != 0:
+            raise LiveAgentError(f"docker run failed: {out.stderr[-500:]}")
+        return name
+
+    def exec(self, *, container_id: str, argv: Sequence[str], stdin: bytes = b"") -> ExecOutcome:
+        return self._run(["exec", "-i", container_id, *argv], stdin=stdin)
+
+    def read_text(self, *, container_id: str, path: str) -> str | None:
+        out = self._run(["exec", container_id, "/bin/sh", "-c", f"cat -- {path}"], timeout=60)
+        return out.stdout if out.rc == 0 else None
+
+    def stop(self, *, container_id: str) -> None:
+        self._run(["rm", "-f", container_id], timeout=60)
+
+
+__all__ = [
+    "ContainerBackend",
+    "DockerBackend",
+    "ExecOutcome",
+    "LiveAgentError",
+    "build_arm_executor",
+]
