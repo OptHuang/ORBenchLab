@@ -133,8 +133,10 @@ def build_arm_executor(
     def executor(level: str, repeat: int, intervention_id: str, journal_dir: Path) -> dict[str, Any]:
         journal_dir = Path(journal_dir)
         journal_dir.mkdir(parents=True, exist_ok=True)
-        image = backend.build_image(context_dir=env_context, tag=f"orbench-live-{intervention_id[:16]}")
-        container_name = f"orbench-live-{intervention_id[:24]}"
+        # Docker image tags and container names must be lowercase.
+        safe_id = "".join(c if (c.isalnum() or c in "-_") else "-" for c in intervention_id.lower())
+        image = backend.build_image(context_dir=env_context, tag=f"orbench-live-{safe_id[:16]}")
+        container_name = f"orbench-live-{safe_id[:24]}"
         # The container gets NO provider credential and NO network: the agent can
         # neither read the secret nor egress from its tools.
         container_id = backend.run_no_network(image=image, name=container_name, env={})
