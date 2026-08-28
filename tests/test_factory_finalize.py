@@ -110,6 +110,8 @@ def _build_cli_session_review(
                 for name in sorted(REQUIRED_REVIEW_CRITERIA)
             ],
         }
+        from orbenchlab import agent_sessions
+
         (review_root / "review.json").write_text(json.dumps(verdict_doc), encoding="utf-8")
         normalized = factory_review._validate_review_document(verdict_doc)
         session_id = ("%032x" % (index + 1))[:32]
@@ -117,6 +119,7 @@ def _build_cli_session_review(
         session_dir.mkdir(parents=True)
         (session_dir / "stdout.bin").write_bytes(b"stdout-" + slug.encode())
         (session_dir / "stderr.bin").write_bytes(b"")
+        result_tree = agent_sessions._tree_digest(review_root, exclude=review_root / "sessions")
         receipt = {
             "schema_version": "orbenchlab.agent-session.receipt.v1",
             "session_id": session_id,
@@ -129,6 +132,7 @@ def _build_cli_session_review(
                 "max_budget_usd": 1.0,
             },
             "status": "completed",
+            "result_tree_digest": result_tree,
             "stdout_digest": "sha256:" + hashlib.sha256((session_dir / "stdout.bin").read_bytes()).hexdigest(),
             "stderr_digest": "sha256:" + hashlib.sha256(b"").hexdigest(),
         }
@@ -718,3 +722,58 @@ def test_harbor_matrix_calibration_rejects_unverified_trials(tmp_path: Path):
     )
     with pytest.raises(factory_finalize.FactoryFinalizeError):
         validator(forged)
+
+
+def test_post_session_verdict_forgery_is_rejected(tmp_path: Path):
+    # Reproduces the reviewer's exploit: two completed sessions whose real
+    # verdict is 'revise' are rewritten to 'promising' post-session, with every
+    # public sha256 in the aggregate recomputed. The result-tree drift is
+    # detected, so promotion is refused.
+    from orbenchlab import agent_sessions, factory_review
+
+    semantic = tmp_path / "semantic"
+    path = _build_cli_session_review(
+        semantic,
+        authoring_digest="sha256:" + "7" * 64,
+        static_digest="sha256:" + "5" * 64,
+        paper_digest="sha256:" + "8" * 64,
+        models=("review-a", "review-b"),
+        decision="revise",  # honest reviewers said revise
+    )
+    validate = factory_finalize._semantic_validator(
+        "sha256:" + "7" * 64, "sha256:" + "5" * 64, "sha256:" + "8" * 64,
+        semantic_root=semantic,
+    )
+    # The honest document is not promising -> rejected on the decision gate.
+    with pytest.raises(factory_finalize.FactoryFinalizeError):
+        validate(_load_json(path))
+
+    # Forge: flip every reviewer's on-disk verdict + the aggregate to promising
+    # and recompute all public digests, exactly as the exploit does.
+    promising = {
+        "decision": "promising", "shape_complete": True, "rubric_complete": True,
+        "criteria": [
+            {"name": n, "status": "pass", "evidence": "forged " + n}
+            for n in sorted(REQUIRED_REVIEW_CRITERIA)
+        ],
+    }
+    normalized = factory_review._validate_review_document(promising)
+    doc = _load_json(path)
+    for slug_model in doc["models"]:
+        slug = factory_review._model_slug(slug_model)
+        (semantic / slug / "review.json").write_text(json.dumps(promising), encoding="utf-8")
+    for reviewer, binding in zip(doc["reviewers"], doc["session_bindings"]):
+        reviewer["review"] = normalized
+        binding["verdict_digest"] = factory_finalize._value_digest(normalized)
+    doc["aggregate_decision"] = "promising-needs-harbor"
+    doc["review_digest"] = factory_finalize._value_digest(
+        {k: v for k, v in doc.items() if k != "review_digest"}
+    )
+    # The session receipts (with the sealed result_tree_digest) were NOT changed,
+    # so the recomputed result tree drifts from the receipt: forgery rejected.
+    with pytest.raises(factory_finalize.FactoryFinalizeError, match="drifted"):
+        validate(doc)
+
+
+def _load_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))

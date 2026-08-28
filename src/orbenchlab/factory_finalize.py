@@ -168,6 +168,17 @@ def _verify_review_session(
             or _file_digest(artifact) != receipt.get(key)
         ):
             raise FactoryFinalizeError("semantic session output digest mismatch")
+    # The single strongest anti-forgery check: recompute the session's result
+    # tree (its cwd at completion, which contains review.json) and require it to
+    # match the digest the session sealed. Editing review.json after the session
+    # changes this digest, so a post-session verdict rewrite is rejected even
+    # when every public sha256 in the aggregate document was recomputed.
+    output_root = review_root / "sessions"
+    current_result_tree = agent_sessions._tree_digest(review_root, exclude=output_root)
+    if current_result_tree != receipt.get("result_tree_digest"):
+        raise FactoryFinalizeError(
+            "semantic reviewer output tree drifted from the sealed session receipt"
+        )
     # The reviewer's on-disk verdict must reproduce the document's verdict and
     # the binding's verdict digest; a forged in-document verdict cannot pass.
     review_json = review_root / "review.json"
