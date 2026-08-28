@@ -509,7 +509,9 @@ def paper_to_benchmark_plan(
             common
             + " Implement the selected paper-backed task as factory/tasks/task-v1/<task-slug>, where "
             "<task-slug> is exactly the task.toml [task].name basename (the TB-Science gate requires the "
-            "task directory name to match its slug). Start from a copy of factory-input/seed-task, and "
+            "task directory name to match its slug). The version directory factory/tasks/task-v1 must "
+            "NOT itself contain a task.toml and must contain exactly one slug directory; do not leave a "
+            "second nested or root-level task. Start from a copy of factory-input/seed-task, and "
             "replace the seed's paper-provenance.json with a byte-exact copy of "
             "factory-input/paper-provenance.json (the deterministic gate rejects a stale provenance). "
             "Implement task.toml, environment, instruction, solution, data and strict "
@@ -562,12 +564,14 @@ def paper_to_benchmark_plan(
             "task-repair-v2",
             "senior task repair agent",
             common
-            + " Copy the task tree under factory/tasks/task-v1 to factory/tasks/task-v2, keeping the "
-            "slug-named task directory layout (factory/tasks/task-v2/<task-slug> matching the task.toml "
-            "[task].name basename), resolve every supported finding from both Markdown reviews, "
+            + " Copy the task tree under factory/tasks/task-v1/<task-slug> to "
+            "factory/tasks/task-v2/<task-slug>, keeping the slug-named layout: the version directory "
+            "factory/tasks/task-v2 must NOT contain a task.toml itself and must contain exactly one "
+            "slug directory whose basename equals the task.toml [task].name basename. Resolve every "
+            "supported finding from both Markdown reviews, "
             "and prepare it for the repository's deterministic task-authoring gate plus task tests, which "
             "the trusted harness will execute after this stage. Preserve a "
-            "machine-readable repair ledger inside task-v2/data. The harness reruns the deterministic "
+            "machine-readable repair ledger at factory/tasks/task-v2/<task-slug>/data/repair-ledger.json. The harness reruns the deterministic "
             "TB-Science static gate over task-v2 and fails this attempt on any blocked criterion; if "
             "factory/gate/task-repair-v2-postcheck.json exists it lists the previous attempt's exact gate "
             "failures to resolve in place.",

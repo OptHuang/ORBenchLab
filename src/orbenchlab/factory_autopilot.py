@@ -576,6 +576,20 @@ def _static_gate(
     explainable state instead of launching paid trials against a broken task.
     """
 
+    # A task that still resolves to its version directory (rather than a unique
+    # slug child) is a structural defect; name it explicitly instead of failing
+    # obscurely on task_name / no_extraneous_files.
+    if (task / "task.toml").is_file() and task.parent.name.startswith("task-v"):
+        classified = factory_gates.classify_task_root(task.parent)
+        if classified["kind"] != "single-child":
+            return {}, {
+                "reason": "static-gate-blocked",
+                "gate": label,
+                "task": task.name,
+                "failing_criteria": ["task_root_layout"],
+                "task_root_kind": classified["kind"],
+                "detail": classified["detail"],
+            }
     provenance = workdir / "factory-input" / "paper-provenance.json"
     receipt = task_authoring.validate_task(
         task,

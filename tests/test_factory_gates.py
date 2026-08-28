@@ -354,3 +354,72 @@ def test_variant_conformance_rejects_rename_only_axis_change(tmp_path: Path):
     )
     assert findings["passed"] is False
     assert any("only renames the task" in p for p in findings["postchecks"][0]["problems"])
+
+
+def _version_dir(tmp_path: Path, layout: str) -> Path:
+    """Build a factory version directory in one of several layouts."""
+    vdir = tmp_path / "factory" / "tasks" / "task-v2"
+    vdir.mkdir(parents=True)
+    if layout in ("single-child", "root+child", "two-children"):
+        shutil.copytree(GOOD_TASK, vdir / "alphaevolve-scheduling")
+    if layout in ("root-task", "root+child"):
+        shutil.copytree(GOOD_TASK, tmp_path / "_tmp"); 
+        for p in (tmp_path / "_tmp").iterdir():
+            (shutil.copytree if p.is_dir() else shutil.copy2)(p, vdir / p.name)
+        shutil.rmtree(tmp_path / "_tmp")
+    if layout == "two-children":
+        shutil.copytree(GOOD_TASK, vdir / "other-scheduling")
+    return vdir
+
+
+def test_classify_task_root_shapes(tmp_path: Path):
+    single = _version_dir(tmp_path / "a", "single-child")
+    assert factory_gates.classify_task_root(single)["kind"] == "single-child"
+    assert factory_gates.classify_task_root(single)["path"].name == "alphaevolve-scheduling"
+
+    root_only = _version_dir(tmp_path / "b", "root-task")
+    assert factory_gates.classify_task_root(root_only)["kind"] == "root-task-violation"
+
+    both = _version_dir(tmp_path / "c", "root+child")
+    assert factory_gates.classify_task_root(both)["kind"] == "ambiguous"
+
+    two = _version_dir(tmp_path / "d", "two-children")
+    assert factory_gates.classify_task_root(two)["kind"] == "ambiguous"
+
+    empty = tmp_path / "e" / "factory" / "tasks" / "task-v2"
+    empty.mkdir(parents=True)
+    assert factory_gates.classify_task_root(empty)["kind"] == "missing"
+
+
+def test_static_gate_names_ambiguous_task_roots(tmp_path: Path):
+    plan = _gate_plan()
+    workdir = _workspace(tmp_path)
+    # Real syu shape: a root task AND a nested slug task under task-v2.
+    both = workdir / "factory" / "tasks" / "task-v2"
+    shutil.copytree(GOOD_TASK, both / "alphaevolve-scheduling")
+    shutil.copytree(GOOD_TASK, tmp_path / "_seed")
+    for p in (tmp_path / "_seed").iterdir():
+        (shutil.copytree if p.is_dir() else shutil.copy2)(p, both / p.name)
+    stage = plan["stages"][0]
+    findings = factory_gates.run_postchecks(
+        stage, workspace=workdir, plan=plan, attempt_number=1
+    )
+    assert findings["passed"] is False
+    target = findings["postchecks"][0]["targets"][0]
+    assert target["task_root_kind"] == "ambiguous"
+    assert target["failing_criteria"][0]["name"] == "task_root_layout"
+
+
+def test_static_gate_root_task_only_fails_on_layout(tmp_path: Path):
+    plan = _gate_plan()
+    workdir = _workspace(tmp_path)
+    vdir = workdir / "factory" / "tasks" / "task-v2"
+    vdir.mkdir(parents=True)
+    for p in GOOD_TASK.iterdir():
+        (shutil.copytree if p.is_dir() else shutil.copy2)(p, vdir / p.name)
+    stage = plan["stages"][0]
+    findings = factory_gates.run_postchecks(
+        stage, workspace=workdir, plan=plan, attempt_number=1
+    )
+    assert findings["passed"] is False
+    assert findings["postchecks"][0]["targets"][0]["task_root_kind"] == "root-task-violation"

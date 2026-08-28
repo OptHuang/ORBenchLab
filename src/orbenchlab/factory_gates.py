@@ -45,28 +45,72 @@ def _directory_outputs(stage: Mapping[str, Any]) -> list[str]:
     ]
 
 
-def resolve_task_root(path: Path) -> Path:
-    """Resolve a stage output directory to the actual strict-task root.
+def classify_task_root(version_dir: Path) -> dict[str, Any]:
+    """Classify a factory version directory's task-root layout.
 
-    Factory stages own versioned output directories (``factory/tasks/task-v2``)
-    whose names cannot equal the TB-Science task slug that the static gate
-    requires.  The convention is therefore: either the output directory itself
-    is the task root, or it contains exactly one slug-named subdirectory with
-    ``task.toml``.  Anything else is returned unchanged so the gate fails with
-    an explicit missing-``task.toml`` finding.
+    A factory version directory (``factory/tasks/task-v2``) is named after the
+    version, not the TB-Science slug the gate requires, so the contract is:
+    the version directory must NOT itself be a task, and must contain exactly
+    one non-symlink slug child with ``task.toml`` whose basename equals the
+    task's ``[task].name`` basename.  A version directory that is itself a task,
+    or that carries both a root task and a nested task, or that has two sibling
+    tasks, is a structural defect the gate must name explicitly (never resolve
+    by silent preference).  Returns ``{kind, path, detail}`` where ``kind`` is
+    one of single-child / root-task-violation / ambiguous / missing.
     """
 
-    if (path / "task.toml").is_file():
-        return path
-    if path.is_dir() and not path.is_symlink():
-        subdirs = [
-            child
-            for child in sorted(path.iterdir())
-            if child.is_dir() and not child.is_symlink()
-        ]
-        if len(subdirs) == 1 and (subdirs[0] / "task.toml").is_file():
-            return subdirs[0]
-    return path
+    if version_dir.is_symlink() or not version_dir.is_dir():
+        return {"kind": "missing", "path": version_dir, "detail": "version directory is missing"}
+    root_is_task = (version_dir / "task.toml").is_file()
+    child_tasks = [
+        child
+        for child in sorted(version_dir.iterdir())
+        if child.is_dir() and not child.is_symlink() and (child / "task.toml").is_file()
+    ]
+    child_names = [child.name for child in child_tasks]
+    if root_is_task and child_tasks:
+        return {
+            "kind": "ambiguous",
+            "path": version_dir,
+            "detail": (
+                "version directory has both a root task.toml and nested slug "
+                f"task(s) {child_names}; keep exactly one <version>/<slug>/task.toml"
+            ),
+        }
+    if root_is_task:
+        return {
+            "kind": "root-task-violation",
+            "path": version_dir,
+            "detail": (
+                "the version directory is itself a task; the strict task must live "
+                "at <version>/<slug>/task.toml, not at the version-directory root"
+            ),
+        }
+    if len(child_tasks) == 1:
+        return {"kind": "single-child", "path": child_tasks[0], "detail": None}
+    if not child_tasks:
+        return {
+            "kind": "missing",
+            "path": version_dir,
+            "detail": "no <slug>/task.toml found under the version directory",
+        }
+    return {
+        "kind": "ambiguous",
+        "path": version_dir,
+        "detail": f"{len(child_tasks)} sibling slug tasks {child_names}; keep exactly one",
+    }
+
+
+def resolve_task_root(path: Path) -> Path:
+    """Resolve a version directory to its unique slug child task.
+
+    Returns the single slug child when the layout is unambiguous; otherwise
+    returns the version directory unchanged so the caller's static gate fails
+    with an explicit structural finding (see :func:`classify_task_root`).
+    """
+
+    classified = classify_task_root(path)
+    return classified["path"] if classified["kind"] == "single-child" else path
 
 
 def _paper_provenance_path(workspace: Path) -> Path | None:
@@ -137,6 +181,29 @@ def _static_gate_target(task_dir: Path, *, workspace: Path) -> dict[str, Any]:
     }
 
 
+def _version_dir_target(version_dir: Path, *, workspace: Path) -> dict[str, Any]:
+    """Classify the version directory, then static-gate its unique slug child."""
+
+    classified = classify_task_root(version_dir)
+    if classified["kind"] != "single-child":
+        return {
+            "path": version_dir.relative_to(workspace).as_posix(),
+            "decision": "blocked",
+            "failing_criteria": [
+                {
+                    "name": "task_root_layout",
+                    "reason": classified["detail"],
+                    "evidence": [version_dir.relative_to(workspace).as_posix()],
+                }
+            ],
+            "task_root_kind": classified["kind"],
+            "passed": False,
+        }
+    target = _static_gate_target(classified["path"], workspace=workspace)
+    target["task_root_kind"] = "single-child"
+    return target
+
+
 def _run_static_gate(
     stage: Mapping[str, Any], *, workspace: Path, plan: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -145,8 +212,7 @@ def _run_static_gate(
         raise FactoryGateError(
             "tb-science-static-gate requires exactly one directory output"
         )
-    task_dir = resolve_task_root(workspace / outputs[0])
-    targets = [_static_gate_target(task_dir, workspace=workspace)]
+    targets = [_version_dir_target(workspace / outputs[0], workspace=workspace)]
     return {
         "postcheck": "tb-science-static-gate",
         "targets": targets,
