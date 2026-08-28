@@ -187,12 +187,68 @@ def test_batch_isolates_candidates_and_survives_failures(tmp_path: Path, monkeyp
 
 def test_batch_refuses_to_start_over_the_total_liability_cap(tmp_path: Path):
     spec = _spec([_candidate(tmp_path, "alpha"), _candidate(tmp_path, "beta")])
+    out = tmp_path / "batch"
     with pytest.raises(factory_batch.FactoryBatchError, match="liability"):
         factory_batch.run_batch(
             spec=spec,
-            out=tmp_path / "batch",
+            out=out,
             provider_env={},
             harbor_executable="/bin/true",
             claude_executable="/bin/true",
             max_total_liability_usd=50.0,
+        )
+    # Fail-closed before any candidate ran: no ledger, no candidate roots.
+    assert not (out / "batch-ledger.json").exists()
+    assert not (out / "alpha").exists()
+
+
+def test_batch_liability_ledger_is_exact_and_persisted(tmp_path: Path, monkeypatch):
+    candidates = [_candidate(tmp_path, "alpha")]
+    spec = _spec(candidates)
+    monkeypatch.setattr(factory_batch.factory_blueprints, "prepare_workspace", lambda **k: (_ for _ in ()).throw(RuntimeError("stop")))
+    reference = factory_batch._reference_plan_liability(spec)
+    # 1 candidate: exact plan liability + Harbor (1+3)*2*5*0.5*2=40 + promotion 5.
+    state = factory_batch.run_batch(
+        spec=spec,
+        out=tmp_path / "batch",
+        provider_env={},
+        harbor_executable="/bin/true",
+        claude_executable="/bin/true",
+        max_total_liability_usd=1000.0,
+        max_promotion_review_usd=5.0,
+    )
+    per = state["liability"]["per_candidate"]
+    assert per["semantic_plan_usd"] == reference
+    assert per["harbor_usd"] == 40.0
+    assert per["promotion_review_usd"] == 5.0
+    assert per["total_usd"] == round(reference + 40.0 + 5.0, 6)
+    ledger = json.loads((tmp_path / "batch" / "batch-ledger.json").read_text())
+    assert ledger["worst_case_total_usd"] == per["total_usd"]
+    assert ledger["admitted"] == ["alpha"]
+    # The one admitted candidate crashed inside its worker but was isolated.
+    assert state["candidates"][0]["status"] == "error"
+    assert state["candidates"][0]["error_class"] == "RuntimeError"
+
+
+def test_batch_rejects_a_different_spec_on_the_same_root(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(factory_batch.factory_blueprints, "prepare_workspace", lambda **k: (_ for _ in ()).throw(RuntimeError("stop")))
+    spec_a = _spec([_candidate(tmp_path, "alpha")])
+    out = tmp_path / "batch"
+    factory_batch.run_batch(
+        spec=spec_a,
+        out=out,
+        provider_env={},
+        harbor_executable="/bin/true",
+        claude_executable="/bin/true",
+        max_total_liability_usd=1000.0,
+    )
+    spec_b = _spec([_candidate(tmp_path, "beta")])
+    with pytest.raises(factory_batch.FactoryBatchError, match="different immutable spec"):
+        factory_batch.run_batch(
+            spec=spec_b,
+            out=out,
+            provider_env={},
+            harbor_executable="/bin/true",
+            claude_executable="/bin/true",
+            max_total_liability_usd=1000.0,
         )

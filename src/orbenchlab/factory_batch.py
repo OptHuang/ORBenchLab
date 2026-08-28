@@ -17,6 +17,7 @@ itself is idempotent.
 from __future__ import annotations
 
 import concurrent.futures
+import fcntl
 import hashlib
 import json
 import os
@@ -123,6 +124,44 @@ _PROVIDERS: dict[str, Callable[[Mapping[str, Any]], list[dict[str, Any]]]] = {
     "explicit-list": _provider_explicit_list,
     "paper-binding-dir": _provider_paper_binding_dir,
 }
+
+
+def _reference_plan_liability(spec: Mapping[str, Any]) -> float:
+    """Compile a blueprint plan with a dummy binding to read its exact bound.
+
+    The paper-to-benchmark blueprint's per-stage budgets and attempts are
+    independent of the specific paper, so one representative compilation gives
+    the exact worst-case semantic session liability every candidate plan will
+    carry (compile_plan itself enforces <= 100 USD).
+    """
+
+    models = spec["models"]
+    plan = factory_blueprints.paper_to_benchmark_plan(
+        source_binding_digest="sha256:" + "0" * 64,
+        author_model=models["author_model"],
+        reviewer_models=models["reviewer_models"],
+        frontier_model=models["frontier_model"],
+        weak_model=models["weak_model"],
+    )
+    return float(plan["maximum_model_liability_usd"])
+
+
+def _candidate_liability(
+    *,
+    reference_semantic_usd: float,
+    per_candidate_harbor_usd: float,
+    promotion_review_usd: float,
+    promote: bool,
+) -> dict[str, Any]:
+    promotion = promotion_review_usd if promote else 0.0
+    total = round(reference_semantic_usd + per_candidate_harbor_usd + promotion, 6)
+    return {
+        "semantic_plan_usd": reference_semantic_usd,
+        "harbor_usd": per_candidate_harbor_usd,
+        "promotion_review_usd": promotion,
+        "intervention_usd": 0.0,
+        "total_usd": total,
+    }
 
 
 def load_batch_spec(path: str | Path) -> dict[str, Any]:
@@ -257,7 +296,10 @@ def _candidate_worker(
                 "autopilot_out": str(root / "autopilot"),
             },
         }
-    except ORBenchError as exc:
+    except BaseException as exc:  # noqa: BLE001 - isolate every candidate crash
+        # A single candidate's failure (ORBench error, OS error, JSON error,
+        # even an unexpected crash) is archived and never aborts the batch or
+        # its sibling candidates.
         return {
             "id": candidate["id"],
             "status": "error",
@@ -282,6 +324,7 @@ def run_batch(
     max_job_attempts: int = 2,
     max_harbor_liability_usd_per_candidate: float = 40.0,
     max_total_liability_usd: float = 200.0,
+    max_promotion_review_usd: float = 5.0,
     max_candidates: int | None = None,
     max_parallel: int = 1,
     held_out: bool = False,
@@ -291,12 +334,71 @@ def run_batch(
 
     if max_parallel < 1 or max_parallel > 8:
         raise FactoryBatchError("max_parallel must be in 1..8")
+    if max_promotion_review_usd < 0:
+        raise FactoryBatchError("max_promotion_review_usd must be non-negative")
     root = Path(out).resolve()
     root.mkdir(parents=True, exist_ok=True)
+    # A single batch state chain is serialized; two writers on the same root
+    # cannot race the ledger.
+    batch_lock = (root / ".batch.lock").open("a+b")
+    fcntl.flock(batch_lock.fileno(), fcntl.LOCK_EX)
+    try:
+        return _run_batch_locked(
+            spec=spec,
+            root=root,
+            provider_env=provider_env,
+            harbor_executable=harbor_executable,
+            claude_executable=claude_executable,
+            repetitions=repetitions,
+            max_budget_usd=max_budget_usd,
+            max_turns=max_turns,
+            harbor_timeout_sec=harbor_timeout_sec,
+            max_variants=max_variants,
+            max_job_attempts=max_job_attempts,
+            max_harbor_liability_usd_per_candidate=max_harbor_liability_usd_per_candidate,
+            max_total_liability_usd=max_total_liability_usd,
+            max_promotion_review_usd=max_promotion_review_usd,
+            max_candidates=max_candidates,
+            max_parallel=max_parallel,
+            held_out=held_out,
+            promote=promote,
+        )
+    finally:
+        fcntl.flock(batch_lock.fileno(), fcntl.LOCK_UN)
+        batch_lock.close()
+
+
+def _run_batch_locked(
+    *,
+    spec: Mapping[str, Any],
+    root: Path,
+    provider_env: Mapping[str, str],
+    harbor_executable: str | Path,
+    claude_executable: str | Path,
+    repetitions: int,
+    max_budget_usd: float,
+    max_turns: int,
+    harbor_timeout_sec: float,
+    max_variants: int,
+    max_job_attempts: int,
+    max_harbor_liability_usd_per_candidate: float,
+    max_total_liability_usd: float,
+    max_promotion_review_usd: float,
+    max_candidates: int | None,
+    max_parallel: int,
+    held_out: bool,
+    promote: bool,
+) -> dict[str, Any]:
     candidates = discover_candidates(spec)
     ids = [row["id"] for row in candidates]
     if len(set(ids)) != len(ids):
         raise FactoryBatchError("candidate ids must be unique")
+    spec_digest = _digest(dict(spec))
+    ledger_path = root / "batch-ledger.json"
+    if ledger_path.is_file() and not ledger_path.is_symlink():
+        prior = json.loads(ledger_path.read_text(encoding="utf-8"))
+        if prior.get("spec_digest") != spec_digest:
+            raise FactoryBatchError("batch output binds a different immutable spec")
     screening = [screen_candidate(row) for row in candidates]
     promising = [
         row
@@ -312,17 +414,40 @@ def run_batch(
         raise FactoryBatchError(
             "per-candidate Harbor liability exceeds its configured cap"
         )
-    # Semantic session liability comes from the compiled plan bound; use the
-    # blueprint's declared maximum by compiling one representative plan lazily
-    # per candidate. The pre-admission bound uses the blueprint constant.
-    semantic_bound = 100.0  # compile_plan enforces <= 100 per candidate plan
-    total_liability = len(promising) * (per_candidate_harbor + semantic_bound)
+    reference_semantic = _reference_plan_liability(spec)
+    per_candidate = _candidate_liability(
+        reference_semantic_usd=reference_semantic,
+        per_candidate_harbor_usd=per_candidate_harbor,
+        promotion_review_usd=max_promotion_review_usd,
+        promote=promote,
+    )
+    total_liability = round(len(promising) * per_candidate["total_usd"], 6)
     if total_liability > max_total_liability_usd:
         raise FactoryBatchError(
             f"worst-case batch liability {total_liability:.2f} USD exceeds the "
             f"configured cap {max_total_liability_usd:.2f}; admit fewer candidates "
             "or raise the cap explicitly"
         )
+    # Persist an immutable liability ledger before any candidate can produce a
+    # provider or Harbor marker.  A resumed batch revalidates the same digest.
+    ledger = {
+        "schema_version": SCHEMA_VERSION,
+        "spec_digest": spec_digest,
+        "per_candidate": per_candidate,
+        "admitted": [row["id"] for row in promising],
+        "worst_case_total_usd": total_liability,
+        "cap_usd": max_total_liability_usd,
+        "promote": promote,
+    }
+    ledger["ledger_digest"] = _digest(
+        {key: value for key, value in ledger.items() if key != "ledger_digest"}
+    )
+    if ledger_path.is_file() and not ledger_path.is_symlink():
+        existing = json.loads(ledger_path.read_text(encoding="utf-8"))
+        if existing != ledger:
+            raise FactoryBatchError("batch ledger differs from the admitted contract")
+    else:
+        _atomic_json(ledger_path, ledger)
     autopilot_kwargs = {
         "harbor_executable": str(harbor_executable),
         "claude_executable": str(claude_executable),
@@ -362,13 +487,13 @@ def run_batch(
     results.sort(key=lambda row: row["id"])
     state = {
         "schema_version": SCHEMA_VERSION,
-        "spec_digest": _digest(dict(spec)),
+        "spec_digest": spec_digest,
+        "ledger_digest": ledger["ledger_digest"],
         "screening": screening,
         "admitted": [row["id"] for row in promising],
         "skipped": [row["id"] for row in screening if not row["promising"]],
         "liability": {
-            "per_candidate_harbor_usd": per_candidate_harbor,
-            "per_candidate_semantic_bound_usd": semantic_bound,
+            "per_candidate": per_candidate,
             "worst_case_total_usd": total_liability,
             "cap_usd": max_total_liability_usd,
         },
