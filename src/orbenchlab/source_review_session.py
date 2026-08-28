@@ -51,7 +51,7 @@ def _digest_file(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def build_sandboxed_review_runner(
+def build_review_runner(
     *,
     frozen_source_path: str | Path,
     claude_executable: str | Path,
@@ -117,4 +117,4 @@ def build_sandboxed_review_runner(
     return review
 
 
-__all__ = ["SourceReviewSessionError", "build_sandboxed_review_runner"]
+__all__ = ["SourceReviewSessionError", "build_review_runner"]

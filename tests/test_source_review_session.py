@@ -30,7 +30,7 @@ def test_sandboxed_review_runner_composes_session_and_parses(tmp_path: Path):
         receipt.write_text("{}")
         return {"status": "completed", "receipt_path": str(receipt)}
 
-    runner = srs.build_sandboxed_review_runner(
+    runner = srs.build_review_runner(
         frozen_source_path=frozen,
         claude_executable="/opt/claude",
         provider_env={"ANTHROPIC_BASE_URL": "https://ark.cn-beijing.volces.com/api/coding",
@@ -64,7 +64,7 @@ def test_review_runner_returns_none_decision_when_no_review_written(tmp_path: Pa
     def fake_session(**kwargs):
         return {"status": "failed", "receipt_path": None}
 
-    runner = srs.build_sandboxed_review_runner(
+    runner = srs.build_review_runner(
         frozen_source_path=frozen, claude_executable="/opt/claude",
         provider_env={"ANTHROPIC_BASE_URL": "https://ark.cn-beijing.volces.com/api/coding",
                       "ANTHROPIC_AUTH_TOKEN": "tok"},
