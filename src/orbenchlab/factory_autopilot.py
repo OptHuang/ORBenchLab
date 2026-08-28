@@ -113,7 +113,10 @@ def _controls_with_repair(
                 "final_task_tree_digest": volc_rollout._task_tree_digest(current),
             }
         except harbor_launcher.HarborLauncherError as exc:
-            failure_class = factory_runtime_repair.classify_failure(str(exc))
+            stderr_tail = getattr(exc, "stderr_tail", "") or ""
+            failure_class = factory_runtime_repair.classify_failure(
+                str(exc), stderr=stderr_tail
+            )
             bundle_out = (
                 root / "failure" if attempt == 0 else root / "repair" / f"round-{attempt}" / "failure"
             )
@@ -123,7 +126,9 @@ def _controls_with_repair(
                 task=current,
                 controls_root=controls_out,
                 failure_class=failure_class,
-                message=str(exc),
+                # Record the real stderr so the failure bundle and any repair
+                # session diagnose the actual defect, not the coarse class.
+                message=(stderr_tail.strip() or str(exc)),
                 attempt=attempt,
                 reserved_liability_usd=0.0,
             )
@@ -1316,6 +1321,13 @@ def run(
         or not 1 <= max_job_attempts <= 5
     ):
         raise FactoryAutopilotError("autopilot model, repetition or budget bounds are invalid")
+    if (
+        not isinstance(max_runtime_repair_rounds, int)
+        or isinstance(max_runtime_repair_rounds, bool)
+        or not 0 <= max_runtime_repair_rounds <= 5
+        or not 0 < repair_max_budget_usd <= 100
+    ):
+        raise FactoryAutopilotError("runtime-repair round or budget bounds are invalid")
     maximum_harbor_liability = (
         (1 + max_variants)
         * len(models)
@@ -1325,6 +1337,38 @@ def run(
     )
     if maximum_harbor_liability > max_harbor_liability_usd:
         raise FactoryAutopilotError("maximum Harbor model liability exceeds the configured cap")
+    # Worst-case spend is not the model matrix alone: every control scope
+    # (baseline plus each variant) may drive up to max_runtime_repair_rounds
+    # repair sessions, the intervention study runs control+treatment sessions,
+    # and promotion runs one review session per reviewer model. Bind the whole
+    # ledger into identity and cap it so a resume cannot silently widen it.
+    maximum_repair_liability = (
+        (1 + max_variants) * max_runtime_repair_rounds * repair_max_budget_usd
+    )
+    maximum_intervention_liability = (
+        (intervention_control + intervention_treatment) * max_budget_usd
+        if intervention_study
+        else 0.0
+    )
+    maximum_promotion_liability = (
+        len(factory_promotion._reviewer_models(checked)) * max_budget_usd if promote else 0.0
+    )
+    maximum_total_liability = round(
+        maximum_harbor_liability
+        + maximum_repair_liability
+        + maximum_intervention_liability
+        + maximum_promotion_liability,
+        6,
+    )
+    configured_total_cap = round(
+        max_harbor_liability_usd
+        + maximum_repair_liability
+        + (max_intervention_liability_usd if intervention_study else 0.0)
+        + maximum_promotion_liability,
+        6,
+    )
+    if maximum_total_liability > configured_total_cap:
+        raise FactoryAutopilotError("maximum total factory liability exceeds the configured caps")
     workspace = Path(workdir).resolve()
     factory_root = Path(factory_out).resolve()
     root = Path(out).resolve()
@@ -1361,6 +1405,20 @@ def run(
         "max_job_attempts_per_model": max_job_attempts,
         "provider_route_digest": route_digest,
         "held_out_confirmation": bool(held_out),
+        "credential_transport": (
+            "host-side-relay-per-session-scoped-token" if credential_relay else "direct-provider-env"
+        ),
+        "runtime_repair": {
+            "max_runtime_repair_rounds": max_runtime_repair_rounds,
+            "repair_max_budget_usd": repair_max_budget_usd,
+        },
+        "liability_ledger": {
+            "harbor_matrix_usd": round(maximum_harbor_liability, 6),
+            "runtime_repair_usd": round(maximum_repair_liability, 6),
+            "intervention_usd": round(maximum_intervention_liability, 6),
+            "promotion_review_usd": round(maximum_promotion_liability, 6),
+            "maximum_total_usd": maximum_total_liability,
+        },
         "intervention": {
             "enabled": bool(intervention_study),
             "verifier_argv": [str(item) for item in intervention_verifier_argv],

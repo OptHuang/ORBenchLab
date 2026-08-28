@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from orbenchlab import factory_autopilot, factory_runtime_repair
+from orbenchlab import agent_sessions, factory_autopilot, factory_runtime_repair
 
 ROOT = Path(__file__).resolve().parents[1]
 GOOD_TASK = ROOT / "examples" / "tasks" / "alphaevolve-scheduling"
@@ -15,11 +15,26 @@ PROVIDER = {"ANTHROPIC_BASE_URL": VOLC, "ANTHROPIC_AUTH_TOKEN": "fixture-secret"
 
 
 def test_classify_failure_distinguishes_infra_from_task():
+    # Descriptive control-validation messages are task defects.
     assert factory_runtime_repair.classify_failure(
         "Harbor oracle attempt did not produce a valid control job: bad reward"
     ) == "task"
+    # Launcher-level transients are infra irrespective of stderr.
     assert factory_runtime_repair.classify_failure("Harbor command failed: timeout") == "infra"
-    assert factory_runtime_repair.classify_failure("Harbor command failed: nonzero_exit") == "infra"
+    # Classification is grounded in the real stderr, not the coarse class:
+    # a nonzero exit with a Docker-daemon signature is a transient...
+    assert factory_runtime_repair.classify_failure(
+        "Harbor command failed: nonzero_exit",
+        stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+    ) == "infra"
+    # ...one with a Docker-build / verifier signature is a repairable task defect...
+    assert factory_runtime_repair.classify_failure(
+        "Harbor command failed: nonzero_exit",
+        stderr="TASK_DOCKERFILE_BUILD_FAILED: missing dependency",
+    ) == "task"
+    # ...and a bare nonzero exit with no infra signature is a task defect to
+    # repair, not a transient to resume forever.
+    assert factory_runtime_repair.classify_failure("Harbor command failed: nonzero_exit") == "task"
 
 
 def _repairing_harbor(root: Path) -> Path:
@@ -64,7 +79,14 @@ trial.joinpath('artifacts/manifest.json').write_text(json.dumps([
 
 def _infra_harbor(root: Path) -> Path:
     executable = root / "harbor-infra"
-    executable.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    # A genuine infrastructure failure is identified by its real stderr
+    # signature, not merely by a nonzero exit.
+    executable.write_text(
+        "#!/bin/sh\n"
+        "echo 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock' >&2\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
     executable.chmod(0o755)
     return executable
 
@@ -186,3 +208,82 @@ def test_infra_failure_raises_resumable_without_mutation(tmp_path: Path):
     assert excinfo.value.bundle["failure_class"] == "infra"
     # The task tree is untouched by an infrastructure failure.
     assert factory_autopilot.volc_rollout._task_tree_digest(task) == before
+
+
+def _task_build_harbor(root: Path) -> Path:
+    executable = root / "harbor-build-fail"
+    executable.write_text(
+        "#!/bin/sh\n"
+        "echo 'TASK_DOCKERFILE_BUILD_FAILED missing dependency' >&2\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    return executable
+
+
+def test_task_build_failure_is_repaired_not_resumed(tmp_path: Path):
+    # A Docker-build failure surfaces as nonzero_exit but its real stderr marks a
+    # task defect: classification must be 'task' (repair), never 'infra' (resume
+    # forever), and the failure bundle must record the real stderr.
+    workdir = tmp_path / "work"
+    (workdir / "factory-input").mkdir(parents=True)
+    task = tmp_path / "task" / "alphaevolve-scheduling"
+    shutil.copytree(GOOD_TASK, task)
+    harbor = _task_build_harbor(tmp_path)
+    with pytest.raises(agent_sessions.AgentSessionError):
+        # Repair is attempted (and only fails because the repair CLI is absent),
+        # proving the failure was routed to repair rather than infra-resume.
+        factory_autopilot._controls_with_repair(
+            task=task,
+            workdir=workdir,
+            root=tmp_path / "baseline",
+            harbor_executable=harbor,
+            claude_executable=tmp_path / "absent-cli",
+            model="fixture-model",
+            provider_env=PROVIDER,
+            harbor_timeout_sec=60,
+            max_repair_rounds=1,
+            repair_max_budget_usd=0.5,
+            scope="baseline",
+        )
+    bundle = json.loads((tmp_path / "baseline" / "failure" / "failure-bundle.json").read_text())
+    assert bundle["failure_class"] == "task"
+    assert "TASK_DOCKERFILE_BUILD_FAILED" in bundle["failure_message"]
+
+
+def test_failed_repair_session_adopts_no_task_even_with_planted_output(tmp_path: Path):
+    # A failed repair session must adopt nothing, even if a task-vnext tree was
+    # planted in the round directory before the session ran.
+    root = tmp_path / "repair-round-1"
+    task = tmp_path / "task" / "alphaevolve-scheduling"
+    shutil.copytree(GOOD_TASK, task)
+    failure = tmp_path / "failure-bundle.json"
+    failure.write_text(json.dumps({"failure": "fixture"}), encoding="utf-8")
+    planted = root / "task-vnext" / task.name
+    shutil.copytree(task, planted)
+    (planted / "planted-marker.json").write_text("{}", encoding="utf-8")
+    failing_cli = tmp_path / "failing-claude"
+    failing_cli.write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
+    failing_cli.chmod(0o755)
+
+    receipt = factory_runtime_repair.repair_task_once(
+        task=task,
+        failure_bundle_path=failure,
+        paper_ancestors=[task / "paper-provenance.json"],
+        out=root,
+        claude_executable=failing_cli,
+        model="fixture-model",
+        provider_env=PROVIDER,
+        max_budget_usd=0.1,
+        timeout_sec=30,
+        round_number=1,
+        parent_task_digest=factory_runtime_repair.volc_rollout._task_tree_digest(task),
+        failure_bundle_digest="sha256:" + "f" * 64,
+    )
+    assert receipt["session_status"] == "failed"
+    assert receipt["status"] == "session-failed"
+    assert receipt["repaired_task_path"] is None
+    assert receipt["static_decision"] is None
+    # The planted stale tree was cleared before the (failed) session ran.
+    assert not planted.joinpath("planted-marker.json").is_file()

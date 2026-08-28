@@ -36,15 +36,45 @@ class RuntimeRepairError(ORBenchError):
 SCHEMA_VERSION = "orbenchlab.runtime-repair.v1"
 FAILURE_BUNDLE_SCHEMA = "orbenchlab.runtime-failure-bundle.v1"
 
-# Failure-class substrings the Harbor launcher raises for pure infrastructure
-# problems (a transient the autopilot should resume, never a task defect).
-_INFRA_MARKERS = ("timeout", "output_limit_exceeded", "launch", "nonzero_exit")
+# Launcher-level failure classes that are transient by construction: the
+# command was killed by a resource bound or never launched. These are infra
+# regardless of stderr (the autopilot resumes, never mutating the task).
+_INFRA_LAUNCHER_MARKERS = ("timeout", "output_limit_exceeded", "launch")
+# Descriptive control-validation messages the launcher raises for a task defect.
 _TASK_MARKERS = (
     "did not produce a valid control job",
     "reward and CTRF",
     "did not pass",
     "control job task identity",
     "artifact manifest",
+)
+# Genuine infrastructure signatures in a command's real stderr: a nonzero exit
+# carrying one of these is a transient host problem, not a task defect.
+_INFRA_STDERR_MARKERS = (
+    "cannot connect to the docker daemon",
+    "docker: error during connect",
+    "is the docker daemon running",
+    "connection refused",
+    "network is unreachable",
+    "temporary failure in name resolution",
+    "no space left on device",
+    "i/o timeout",
+    "context deadline exceeded",
+    "permission denied while trying to connect",
+)
+# Task-build / verifier / contract signatures in a command's real stderr: a
+# nonzero exit carrying one of these is a repairable task defect.
+_TASK_STDERR_MARKERS = (
+    "task_dockerfile_build_failed",
+    "dockerfile",
+    "failed to solve",
+    "build failed",
+    "verifier",
+    "ctrf",
+    "reward",
+    "test.sh",
+    "solution",
+    "traceback (most recent call last)",
 )
 
 
@@ -67,14 +97,50 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     os.replace(temporary, path)
 
 
-def classify_failure(message: str) -> str:
-    """Return 'infra', 'task', or 'unknown' for a Harbor failure message."""
+def _has_completed_session(sessions_root: Path) -> bool:
+    """True if a prior agent session under ``sessions_root`` completed."""
 
-    lowered = message.lower()
+    if not sessions_root.is_dir():
+        return False
+    for receipt in sessions_root.glob("*/receipt.json"):
+        try:
+            doc = json.loads(receipt.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if doc.get("status") == "completed":
+            return True
+    return False
+
+
+def classify_failure(message: str, stderr: str = "") -> str:
+    """Classify a Harbor failure as 'infra', 'task', or 'unknown'.
+
+    Classification is grounded in the command's real stderr, not only the
+    launcher's coarse failure class: a ``nonzero_exit`` carrying a Docker-build,
+    verifier or contract signature is a repairable task defect, while one
+    carrying a Docker-daemon/network signature is a transient the autopilot
+    resumes without mutating the task. Only genuine launcher transients
+    (timeout, output-limit, launch failure) are infra irrespective of stderr.
+    """
+
+    lowered_msg = message.lower()
+    blob = (message + "\n" + stderr).lower()
+    # Descriptive control-validation messages are always task defects.
     if any(marker in message for marker in _TASK_MARKERS):
         return "task"
-    if any(marker in lowered for marker in _INFRA_MARKERS):
+    # Genuine infrastructure signatures in the real stderr win first.
+    if any(marker in blob for marker in _INFRA_STDERR_MARKERS):
         return "infra"
+    # Launcher-level transients (killed by a bound or never launched).
+    if any(marker in lowered_msg for marker in _INFRA_LAUNCHER_MARKERS):
+        return "infra"
+    # Task-build / verifier / contract signatures in the real stderr.
+    if any(marker in blob for marker in _TASK_STDERR_MARKERS):
+        return "task"
+    # A control command that ran and exited nonzero with no infra signature is a
+    # task/verifier defect, not a transient: repair rather than resume forever.
+    if "nonzero_exit" in lowered_msg:
+        return "task"
     return "unknown"
 
 
@@ -215,6 +281,16 @@ def repair_task_once(
     """Run one bounded repair agent session and static-gate its output."""
 
     out.mkdir(parents=True, exist_ok=True)
+    # A repair round adopts only output this session actually writes. Any
+    # pre-existing task-vnext with no completed session behind it is stale
+    # (a crashed prior attempt or a planted tree) and must be cleared before
+    # the session runs; a genuine resume keeps its completed session's output.
+    vnext = out / "task-vnext"
+    if vnext.exists() and not _has_completed_session(out / "sessions"):
+        if vnext.is_dir() and not vnext.is_symlink():
+            shutil.rmtree(vnext)
+        else:
+            vnext.unlink()
     read_only = _stage_repair_inputs(
         task=task,
         failure_bundle_path=failure_bundle_path,
@@ -237,6 +313,7 @@ def repair_task_once(
         allow_bash=False,
         credential_relay=credential_relay,
     )
+    session_ok = session.get("status") == "completed"
     produced = out / "task-vnext" / slug
     if produced.is_dir() and not produced.is_symlink():
         repaired = produced
@@ -244,7 +321,14 @@ def repair_task_once(
         # Accept either task-vnext/<slug> or task-vnext being the task root.
         alt = out / "task-vnext"
         repaired = alt if (alt / "task.toml").is_file() else produced
-    status = "produced" if repaired.is_dir() and (repaired / "task.toml").is_file() else "no-task"
+    if not session_ok:
+        # A failed or crashed repair session produces no adoptable task,
+        # regardless of any files left in the workspace.
+        status = "session-failed"
+    elif repaired.is_dir() and (repaired / "task.toml").is_file():
+        status = "produced"
+    else:
+        status = "no-task"
     static: dict[str, Any] | None = None
     static_decision = None
     if status == "produced":

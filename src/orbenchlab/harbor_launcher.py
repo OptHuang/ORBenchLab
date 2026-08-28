@@ -21,6 +21,23 @@ from .volc_rollout import _task_id, _task_tree_digest
 class HarborLauncherError(ORBenchError):
     exit_code = 8
 
+    def __init__(self, *args: Any, failure_class: str | None = None, stderr_tail: str = "") -> None:
+        super().__init__(*args)
+        # Sanitized diagnostics so downstream classification can reason from the
+        # command's real stderr, not only the coarse launcher failure class.
+        self.failure_class = failure_class
+        self.stderr_tail = stderr_tail
+
+
+def _sanitized_tail(path: Path, *, limit: int = 4000) -> str:
+    """Return a bounded, decoded tail of an already-redacted log file."""
+
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    return data[-limit:].decode("utf-8", errors="replace")
+
 
 def _file_digest(path: Path) -> str:
     digest = hashlib.sha256()
@@ -109,7 +126,11 @@ def _bounded_command(
     }
     _atomic_json(log_root / "command-receipt.json", receipt)
     if failure:
-        raise HarborLauncherError(f"Harbor command failed: {failure}")
+        raise HarborLauncherError(
+            f"Harbor command failed: {failure}",
+            failure_class=failure,
+            stderr_tail=_sanitized_tail(stderr_path),
+        )
     return receipt
 
 
