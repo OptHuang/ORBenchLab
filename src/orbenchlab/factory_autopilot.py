@@ -408,6 +408,20 @@ def _static_gate(
         paper_provenance=provenance if provenance.is_file() else None,
     )
     task_authoring.write_receipt(receipt, out)
+    task_provenance = task / "paper-provenance.json"
+    if provenance.is_file() and (
+        task_provenance.is_symlink()
+        or not task_provenance.is_file()
+        or task_provenance.read_bytes() != provenance.read_bytes()
+    ):
+        return receipt, {
+            "reason": "static-gate-blocked",
+            "gate": label,
+            "task": task.name,
+            "receipt_digest": receipt["receipt_digest"],
+            "receipt_path": str(out / "authoring-receipt.json"),
+            "failing_criteria": ["workspace_paper_provenance_binding"],
+        }
     if receipt["decision"] == "blocked":
         failing = sorted(
             str(row.get("name"))

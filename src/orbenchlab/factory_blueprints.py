@@ -509,7 +509,9 @@ def paper_to_benchmark_plan(
             common
             + " Implement the selected paper-backed task as factory/tasks/task-v1/<task-slug>, where "
             "<task-slug> is exactly the task.toml [task].name basename (the TB-Science gate requires the "
-            "task directory name to match its slug). Start from a copy of factory-input/seed-task. "
+            "task directory name to match its slug). Start from a copy of factory-input/seed-task, and "
+            "replace the seed's paper-provenance.json with a byte-exact copy of "
+            "factory-input/paper-provenance.json (the deterministic gate rejects a stale provenance). "
             "Implement task.toml, environment, instruction, solution, data and strict "
             "rubric tests. Inspect the complete result and leave no placeholder or human TODO; the trusted "
             "harness, not this no-Bash semantic session, owns command execution. The harness then runs the "

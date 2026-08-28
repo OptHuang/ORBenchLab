@@ -103,14 +103,37 @@ def _static_gate_target(task_dir: Path, *, workspace: Path) -> dict[str, Any]:
             "failing_criteria": [],
             "passed": False,
         }
+    failing = _failing_criteria(receipt)
+    # The task must carry this run's exact paper provenance: downstream
+    # semantic-review and finalize gates bind the paper digest from the file
+    # inside the task tree, so an unchanged seed provenance would only fail
+    # much later, after Harbor money was spent.
+    if provenance is not None:
+        task_provenance = task_dir / "paper-provenance.json"
+        if (
+            task_provenance.is_symlink()
+            or not task_provenance.is_file()
+            or task_provenance.read_bytes() != provenance.read_bytes()
+        ):
+            failing.append(
+                {
+                    "name": "workspace_paper_provenance_binding",
+                    "reason": (
+                        "task paper-provenance.json must be a byte-exact copy of "
+                        "factory-input/paper-provenance.json"
+                    ),
+                    "evidence": ["paper-provenance.json"],
+                }
+            )
+    passed = receipt.get("decision") != "blocked" and not failing
     return {
         "path": task_dir.relative_to(workspace).as_posix(),
-        "decision": str(receipt.get("decision")),
+        "decision": "blocked" if not passed else str(receipt.get("decision")),
         "task_tree_digest": receipt.get("task_tree_digest"),
         "receipt_digest": receipt.get("receipt_digest"),
         "counts": receipt.get("counts"),
-        "failing_criteria": _failing_criteria(receipt),
-        "passed": receipt.get("decision") != "blocked",
+        "failing_criteria": failing,
+        "passed": passed,
     }
 
 
