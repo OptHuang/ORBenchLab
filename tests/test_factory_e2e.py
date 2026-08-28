@@ -84,13 +84,23 @@ def generic(spec):
         document.update(trusted.get(spec["path"], {}))
         path.write_text(json.dumps(document, indent=2), encoding="utf-8")
 
+def make_writable(root):
+    # A real no-Bash agent recreates files with Write and never inherits the
+    # 0444 bits of the immutable factory-input tree; this scripted double
+    # copies trees wholesale, so it must normalise permissions itself.
+    for child in Path(root).rglob("*"):
+        child.chmod(0o755 if child.is_dir() else 0o644)
+    Path(root).chmod(0o755)
+
 def copy_task(dest_root):
     dest = Path(dest_root) / SLUG
     if Path(dest_root).exists():
         shutil.rmtree(dest_root)
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(SEED, dest)
+    make_writable(dest)
     shutil.copy2(PROV, dest / "paper-provenance.json")
+    (dest / "paper-provenance.json").chmod(0o644)
     return dest
 
 if stage == "task-author-v1":
