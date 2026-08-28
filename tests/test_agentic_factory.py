@@ -379,7 +379,9 @@ def test_visibility_exposes_only_dependency_ancestor_outputs(tmp_path: Path):
         stage_id="design-b",
         completed_stage_ids=["design-a"],
     )
-    assert visible == [tmp_path / "factory-input"]
+    assert visible == [
+        {"path": tmp_path / "factory-input", "digest_exclude": ["trusted"]}
+    ]
     assert hidden == [tmp_path / "factory/design-a.json"]
     visible, hidden = agentic_factory._visibility_paths(
         plan,
@@ -387,7 +389,10 @@ def test_visibility_exposes_only_dependency_ancestor_outputs(tmp_path: Path):
         stage_id="synthesis",
         completed_stage_ids=["design-a", "design-b"],
     )
-    assert visible == [tmp_path / "factory-input", tmp_path / "factory/design-a.json"]
+    assert visible == [
+        {"path": tmp_path / "factory-input", "digest_exclude": ["trusted"]},
+        tmp_path / "factory/design-a.json",
+    ]
     assert hidden == [tmp_path / "factory/design-b.json"]
 
 

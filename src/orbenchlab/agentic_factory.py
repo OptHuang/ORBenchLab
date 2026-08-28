@@ -28,6 +28,7 @@ from typing import Any, Mapping, Sequence
 from .agent_sessions import (
     DEFAULT_MAX_OUTPUT_BYTES,
     AgentSessionError,
+    _binding_spec as _session_binding_spec,
     _tree_digest as _session_tree_digest,
     run_session,
 )
@@ -567,27 +568,32 @@ def _validate_session_receipt(
         bindings = sandbox.get("read_only_bindings") if isinstance(sandbox, Mapping) else None
         hidden_bindings = sandbox.get("hidden_bindings") if isinstance(sandbox, Mapping) else None
         completed_snapshot = attempt.get("visibility_completed_stage_ids")
+        bundle_snapshot = attempt.get("visibility_trusted_bundles") or []
         if workspace is None or not isinstance(completed_snapshot, list):
             raise AgenticFactoryError("factory attempt lacks a replayable visibility snapshot")
+        if not isinstance(bundle_snapshot, list):
+            raise AgenticFactoryError("factory attempt trusted-bundle snapshot is malformed")
         visible_paths, hidden_paths = _visibility_paths(
             plan,
             workspace=workspace,
             stage_id=stage["id"],
             completed_stage_ids=completed_snapshot,
+            trusted_bundle_names=[str(name) for name in bundle_snapshot],
         )
 
-        def expected_rows(paths: Sequence[Path]) -> dict[str, dict[str, str]]:
-            return {
-                path.relative_to(workspace).as_posix(): {
+        def expected_rows(specs: Sequence[Any]) -> dict[str, dict[str, str]]:
+            rows: dict[str, dict[str, str]] = {}
+            for spec in specs:
+                path, digest_exclude = _session_binding_spec(spec)
+                rows[path.relative_to(workspace).as_posix()] = {
                     "kind": "directory" if path.is_dir() else "file",
                     "content_digest": (
-                        _session_tree_digest(path)
+                        _session_tree_digest(path, exclude_children=digest_exclude)
                         if path.is_dir()
                         else _file_digest(path)
                     ),
                 }
-                for path in paths
-            }
+            return rows
 
         def supplied_rows(value: Any) -> dict[str, dict[str, str]] | None:
             if not isinstance(value, list) or any(not isinstance(row, Mapping) for row in value):
@@ -876,14 +882,32 @@ def _stage_ancestors(plan: Mapping[str, Any], stage_id: str) -> set[str]:
     return ancestors
 
 
+def _current_trusted_bundles(workspace: Path) -> list[str]:
+    trusted = workspace / "factory-input" / "trusted"
+    if trusted.is_symlink() or not trusted.is_dir():
+        return []
+    return sorted(
+        child.name
+        for child in trusted.iterdir()
+        if child.is_dir() and not child.is_symlink()
+    )
+
+
 def _visibility_paths(
     plan: Mapping[str, Any],
     *,
     workspace: Path,
     stage_id: str,
     completed_stage_ids: Sequence[str],
-) -> tuple[list[Path], list[Path]]:
-    """Resolve the exact least-visibility view for one stage attempt."""
+    trusted_bundle_names: Sequence[str] | None = None,
+) -> tuple[list[Any], list[Path]]:
+    """Resolve the exact least-visibility view for one stage attempt.
+
+    ``factory-input`` is digest-bound excluding its append-only ``trusted``
+    subtree; each trusted bundle installed at attempt time is bound as its own
+    immutable path.  ``trusted_bundle_names`` replays a recorded snapshot; when
+    ``None`` the currently installed bundles are enumerated.
+    """
 
     by_id = {stage["id"]: stage for stage in plan["stages"]}
     known = set(by_id)
@@ -893,7 +917,23 @@ def _visibility_paths(
     ancestors = _stage_ancestors(plan, stage_id)
     if not plan.get("workspace_manifest"):
         return [], []
-    visible = [workspace / "factory-input"]
+    input_root = workspace / "factory-input"
+    bundle_names = (
+        list(trusted_bundle_names)
+        if trusted_bundle_names is not None
+        else _current_trusted_bundles(workspace)
+    )
+    if len(bundle_names) != len(set(bundle_names)) or any(
+        not isinstance(name, str) or "/" in name or name in {"", ".", ".."}
+        for name in bundle_names
+    ):
+        raise AgenticFactoryError("factory visibility snapshot has invalid trusted bundles")
+    visible: list[Any] = [{"path": input_root, "digest_exclude": ["trusted"]}]
+    for name in sorted(bundle_names):
+        bundle = input_root / "trusted" / name
+        if bundle.is_symlink() or not bundle.is_dir():
+            raise AgenticFactoryError(f"recorded trusted bundle is missing: {name}")
+        visible.append(bundle)
     hidden: list[Path] = []
     for completed_id in completed:
         destination = visible if completed_id in ancestors else hidden
@@ -1377,11 +1417,17 @@ def _run_factory_locked(
             for completed_id, completed_state in run["stages"].items()
             if completed_state["status"] == "completed"
         ]
+        visibility_trusted_bundles = (
+            _current_trusted_bundles(workspace)
+            if checked.get("workspace_manifest")
+            else []
+        )
         protected_inputs, hidden_inputs = _visibility_paths(
             checked,
             workspace=workspace,
             stage_id=stage_id,
             completed_stage_ids=visibility_completed_stage_ids,
+            trusted_bundle_names=visibility_trusted_bundles,
         )
         try:
             session = run_session(
@@ -1430,16 +1476,17 @@ def _run_factory_locked(
                         for binding in value
                     }
 
-                def path_map(paths: Sequence[Path]) -> dict[str, tuple[str, str]]:
-                    return {
-                        path.relative_to(workspace).as_posix(): (
+                def path_map(specs: Sequence[Any]) -> dict[str, tuple[str, str]]:
+                    rows: dict[str, tuple[str, str]] = {}
+                    for spec in specs:
+                        path, digest_exclude = _session_binding_spec(spec)
+                        rows[path.relative_to(workspace).as_posix()] = (
                             "directory" if path.is_dir() else "file",
-                            _session_tree_digest(path)
+                            _session_tree_digest(path, exclude_children=digest_exclude)
                             if path.is_dir()
                             else "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
                         )
-                        for path in paths
-                    }
+                    return rows
                 if (
                     binding_map(bindings) != path_map(protected_inputs)
                     or binding_map(hidden_bindings) != path_map(hidden_inputs)
@@ -1541,6 +1588,7 @@ def _run_factory_locked(
             "retry_safe": retry_safe,
             "workspace_usage": workspace_usage,
             "visibility_completed_stage_ids": visibility_completed_stage_ids,
+            "visibility_trusted_bundles": visibility_trusted_bundles,
         }
         # Trusted inputs and already-completed outputs are rechecked before the
         # attempt receipt is made immutable. If this check fails, there is no

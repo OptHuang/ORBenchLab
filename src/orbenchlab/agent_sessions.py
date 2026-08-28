@@ -143,11 +143,25 @@ def _session_env(profile: str, supplied: Mapping[str, str]) -> tuple[dict[str, s
     return child, _digest({"host": host, "path": parsed.path.rstrip("/")})
 
 
+def _binding_spec(value: Any) -> tuple[Path, tuple[str, ...]]:
+    """Normalize a read-only path spec to (path, digest-excluded child names).
+
+    A directory may declare harness-owned append-only children (for example
+    ``factory-input/trusted``) whose contents are digest-bound separately; the
+    parent's digest then stays stable while bundles are installed.
+    """
+
+    if isinstance(value, Mapping):
+        excluded = tuple(sorted(str(name) for name in value.get("digest_exclude", ())))
+        return Path(str(value["path"])), excluded
+    return Path(value), ()
+
+
 def _read_only_command(
     command: Sequence[str],
     *,
     cwd: Path,
-    paths: Sequence[str | Path],
+    paths: Sequence[Any],
     hidden_paths: Sequence[str | Path] = (),
 ) -> tuple[list[str], dict[str, Any] | None]:
     """Wrap a command with immutable visible inputs and unreadable hidden paths."""
@@ -155,10 +169,10 @@ def _read_only_command(
     if not paths and not hidden_paths:
         return list(command), None
     cwd = cwd.resolve()
-    def bindings_for(values: Sequence[str | Path], *, label: str) -> list[dict[str, Any]]:
+    def bindings_for(values: Sequence[Any], *, label: str) -> list[dict[str, Any]]:
         rows = []
         for value in values:
-            requested = Path(value)
+            requested, digest_exclude = _binding_spec(value)
             if requested.is_symlink() or not requested.exists():
                 raise AgentSessionError(f"{label} session path must exist and not be a symlink")
             resolved = requested.resolve()
@@ -166,17 +180,18 @@ def _read_only_command(
                 relative = resolved.relative_to(cwd).as_posix()
             except ValueError:
                 raise AgentSessionError(f"{label} session path must be inside the workdir") from None
-            rows.append(
-                {
-                    "path": relative,
-                    "kind": "directory" if resolved.is_dir() else "file",
-                    "content_digest": (
-                        _tree_digest(resolved)
-                        if resolved.is_dir()
-                        else _digest_bytes(resolved.read_bytes())
-                    ),
-                }
-            )
+            row = {
+                "path": relative,
+                "kind": "directory" if resolved.is_dir() else "file",
+                "content_digest": (
+                    _tree_digest(resolved, exclude_children=digest_exclude)
+                    if resolved.is_dir()
+                    else _digest_bytes(resolved.read_bytes())
+                ),
+            }
+            if digest_exclude:
+                row["digest_exclude"] = list(digest_exclude)
+            rows.append(row)
         if len({row["path"] for row in rows}) != len(rows):
             raise AgentSessionError(f"{label} session paths must be unique")
         return rows
@@ -285,11 +300,19 @@ def _valid_reuse(path: Path, session_id: str) -> dict[str, Any] | None:
         return None
 
 
-def _tree_digest(root: Path, *, exclude: Path | None = None) -> str:
+def _tree_digest(
+    root: Path,
+    *,
+    exclude: Path | None = None,
+    exclude_children: Sequence[str] = (),
+) -> str:
     rows: list[tuple[str, str]] = []
+    excluded = {str(name) for name in exclude_children}
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root)
         if exclude is not None and (path == exclude or exclude in path.parents):
+            continue
+        if relative.parts and relative.parts[0] in excluded:
             continue
         if ".git" in relative.parts or not path.is_file() or path.is_symlink():
             continue
