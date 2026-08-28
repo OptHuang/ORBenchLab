@@ -47,6 +47,33 @@ factory execution and promotion fail closed because the current Codex CLI does
 not expose a hard provider-spend flag. A stage may retry under a new attempt
 identity, but it may not overwrite a historical attempt receipt.
 
+### Deterministic in-loop gates (repair loop)
+
+Task-producing stages declare harness-owned postchecks that run immediately
+after their outputs validate:
+
+- `tb-science-static-gate` reruns the complete deterministic TB-Science
+  authoring gate over the stage's task tree (`task-author-v1`,
+  `task-repair-v2`);
+- `variant-conformance` additionally validates the variant manifest and
+  rejects rename-only lattices: every variant must pass the static gate and no
+  variant may be byte-identical to the base task or to another variant
+  (`variant-author`).
+
+A failed postcheck fails the attempt with `deterministic_gate_failed`, keeps
+the outputs in place, and writes the exact findings to
+`factory/gate/<stage>-postcheck.json`; the next bounded attempt reads them and
+repairs in place. Exhausting `max_attempts` quarantines the run with the gate
+findings attached — the repair loop is the existing attempt machinery, not a
+separate mutable workflow. Stage output directories follow a slug convention:
+the strict task lives at `factory/tasks/task-v2/<task-slug>` where the slug
+equals the `task.toml` name basename, because the gate requires the task
+directory name to match its slug.
+
+The autopilot repeats the static gate immediately before every Harbor barrier
+(baseline task and each difficulty variant); a blocked tree quarantines the
+run with machine-readable `static-gate-blocked` before any model spend.
+
 Runtime nodes do not ask a semantic agent to assert that it ran Harbor. The
 trusted harness must first write control/model/difficulty receipts under the
 read-only `factory-input/trusted/` boundary; the following agent session may
@@ -75,10 +102,27 @@ runtime cannot resume exact state, the intervention stage must record E4 as
 unavailable.
 
 The session runner exposes live trace bytes for monitoring and seals them as
-digest-bound logs on completion. It deliberately reports
-`hint_injection_supported: false`: true E4 injection still requires a runtime
-that can pause and continue the same checkpoint. A monitor that merely starts
-a fresh CLI process with a hint must remain E3.
+digest-bound logs on completion. The plain factory runner reports
+`hint_injection_supported: false`, and Harbor trials remain independent full
+restarts — a monitor that merely starts a fresh CLI process with a hint stays
+E3.
+
+A separate, capability-gated intervention channel now exists for agent
+sessions: `claude --print --input-format stream-json` accepts additional user
+messages on the open stdin of the same running session.
+`orbench agent-session capability` reports the machine-readable capability per
+profile/runtime (Codex and Harbor trials are `unsupported`, fail-closed);
+`orbench agent-session intervene` runs one monitored session that fires a
+fixed predeclared policy hint into the same session, recording event arrival
+times, the injection instant, pre/post-checkpoint event counts, and whether
+the runtime *confirmed* a post-hint event; and `orbench intervention-study`
+pairs treatment sessions with identically instrumented no-injection controls,
+grades every trial with the caller's verifier, and emits
+`E4-controlled-same-session-intervention` only when the capability is
+supported, every treatment injection was confirmed, and both arms have at
+least three verifier-graded trials. Anything less is labelled
+`E3-underpowered` or `E1-incomplete`; an unsupported profile receives an `E0`
+receipt instead of a silently downgraded run.
 
 ## Commands
 
@@ -129,6 +173,22 @@ orbench agent-factory autopilot \
   --max-job-attempts 2 \
   --max-harbor-liability-usd 100
 ```
+
+The autopilot no longer stops at `semantic-complete-e1`. After the semantic
+DAG and both trusted barriers finish, a deterministic promotion phase runs
+unattended: static gate over the selected task, digest-matched reuse of the
+Harbor control/calibration receipts the barriers already produced (a selected
+variant reuses its own validated matrix; a missing binding blocks with
+`promotion_evidence_missing` instead of relaunching paid jobs), the
+independent two-model Volc semantic review, the deterministic pipeline task
+card, the fail-closed finalizer, and one operator-facing
+`promotion/final-report.md` binding every receipt (task purpose, provenance,
+per-gate outcomes, frontier/weak Wilson intervals, per-variant difficulty
+calibration, graded trajectory/intervention evidence, observed costs, open
+items and reproduction commands). Terminal states are `promoted` or
+`promotion-blocked`, both resumable; `--stop-after-semantic` restores the old
+boundary. The real Harbor model-matrix screening report is first-class
+calibration evidence for `finalize`.
 
 The state file is content-bound and resumable. The worst-case Harbor model
 liability includes the baseline plus every allowed variant and every crash-safe
@@ -202,6 +262,26 @@ The receipt requires every trial to have a complete verifier result and a
 non-empty ATIF trace. Agent budget exhaustion is recorded as a model outcome
 when the verifier still completed; setup/network failures without verifier
 evidence are rejected. This remains E3 because every arm is a fresh restart.
+
+## Batch orchestration
+
+`orbench agent-factory batch` consumes a candidate queue from a pluggable
+provider (`explicit-list`, or `paper-binding-dir` over the output of
+`orbench intake bind-paper`), screens each candidate deterministically
+(provenance binding digest against the actual paper bytes, strict seed task —
+no model calls), refuses to start when the admitted set's worst-case provider
+liability exceeds `--max-total-liability-usd`, and drives one isolated
+autopilot per candidate (own workspace, budgets, receipts, resume). A failed
+or quarantined candidate never blocks the rest, and re-running the same batch
+resumes every non-terminal candidate; daily scheduling belongs to external
+automation invoking this one idempotent CLI.
+
+Difficulty genomes are machine-readable end to end: the variant manifest may
+declare bounded `secondary_axes`, every per-variant `axis_levels` key must be
+a declared axis, and the trusted difficulty receipt embeds a
+`difficulty_genome` (axes plus per-variant levels and frozen task-tree
+digests) with pairwise-distinct variant trees that also differ from the base
+task.
 
 ## Current security boundary
 

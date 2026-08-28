@@ -59,11 +59,16 @@ injection is not inferred from this report.
 ## Paper to Terminal-Bench Science task
 
 For the autonomous Codex/Claude Code DAG—paper evidence, two task-design
-agents, strict author/review/repair, Harbor pilots, trajectory diagnosis,
+agents, strict author/review/repair with deterministic in-loop TB-Science
+gates, Harbor pilots, trajectory diagnosis, capability-gated same-session
 interventions, difficulty variants and calibration—see
-[`docs/agentic-factory.md`](docs/agentic-factory.md). Its terminal state is
-deliberately `semantic-complete-e1`; deterministic and Harbor gates still own
-acceptance and promotion.
+[`docs/agentic-factory.md`](docs/agentic-factory.md). `agent-factory
+autopilot` now continues past `semantic-complete-e1` through a deterministic
+promotion phase (static gate, digest-matched Harbor evidence reuse,
+independent semantic review, task card, fail-closed finalizer and an
+operator-facing final report); deterministic and Harbor gates still own every
+acceptance decision, and `agent-factory batch` runs the same loop over a
+screened multi-paper candidate queue.
 
 For a paper-backed candidate, run the authoring gate before packaging anything
 for Harbor:
