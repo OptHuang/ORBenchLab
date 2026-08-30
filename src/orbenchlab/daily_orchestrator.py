@@ -51,6 +51,39 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+def sources_from_intake(items: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Adapt deterministic G0 intake items into ``run_daily`` source rows.
+
+    Only items with a fetchable canonical url are forwarded; the metadata-only
+    intake carries no license, so the license stays unresolved and the harness
+    defers it (never admits) until acquisition/authority settles it.
+    """
+
+    import re
+
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        url = item.get("canonical_url") or item.get("url")
+        if not isinstance(url, str) or not url.strip():
+            continue
+        row: dict[str, Any] = {
+            "url": url,
+            "channel": item.get("source_kind") or "unknown",
+            "intake_content_digest": item.get("content_digest"),
+        }
+        external = str(item.get("external_id") or "")
+        if re.fullmatch(r"[0-9]{4}\.[0-9]{4,5}(v[0-9]+)?", external):
+            row["arxiv_id"] = re.sub(r"v[0-9]+$", "", external)
+        elif re.fullmatch(r"10\.\d{4,9}/\S+", external):
+            row["doi"] = external
+        elif external:
+            row["canonical_id"] = external
+        if item.get("license"):
+            row["license"] = item["license"]
+        rows.append(row)
+    return rows
+
+
 def run_daily(
     *,
     day: str,
@@ -181,4 +214,4 @@ def _counts(results: Sequence[Mapping[str, Any]]) -> dict[str, int]:
     return counts
 
 
-__all__ = ["DAILY_SCHEMA", "DailyOrchestratorError", "run_daily"]
+__all__ = ["DAILY_SCHEMA", "DailyOrchestratorError", "run_daily", "sources_from_intake"]

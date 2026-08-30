@@ -114,3 +114,20 @@ def test_daily_resume_reuses_per_source_results(tmp_path: Path):
     second = do.run_daily(day="d", sources=sources, out=tmp_path, fetcher=fetch, make_review_runner=r2.make)
     assert first["admitted_count"] == second["admitted_count"] == 1
     assert r2.calls == 0  # resume reused the per-source result, no re-review
+
+
+def test_sources_from_intake_maps_ids_and_skips_unfetchable():
+    items = [
+        {"canonical_url": "https://arxiv.org/abs/2401.01234", "source_kind": "arxiv",
+         "external_id": "2401.01234v2", "content_digest": "sha256:aa"},
+        {"canonical_url": "https://doi.org/10.1000/xyz", "source_kind": "rss",
+         "external_id": "10.1000/xyz", "content_digest": "sha256:bb"},
+        {"canonical_url": None, "source_kind": "arxiv", "external_id": "9999.99999"},  # unfetchable
+    ]
+    rows = do.sources_from_intake(items)
+    assert len(rows) == 2
+    assert rows[0]["arxiv_id"] == "2401.01234"  # version suffix stripped
+    assert rows[0]["channel"] == "arxiv"
+    assert rows[1]["doi"] == "10.1000/xyz"
+    # No license from metadata-only intake -> the pipeline will defer it.
+    assert "license" not in rows[0]
