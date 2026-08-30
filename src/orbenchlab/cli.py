@@ -93,7 +93,97 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_agent_session(sub)
     _add_intervention_study(sub)
     _add_agent_factory(sub)
+    _add_source_daily(sub)
     return parser
+
+
+def _add_source_daily(sub: argparse._SubParsersAction) -> None:
+    parser = sub.add_parser(
+        "source-daily",
+        help="run the daily source discovery -> license -> dual-review triage -> admit pipeline",
+    )
+    parser.add_argument("--feeds", required=True, help="feed config path")
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--day", required=True, help="YYYY-MM-DD run day")
+    parser.add_argument("--model", help="triage reviewer model (required unless --dry-run)")
+    parser.add_argument("--claude-executable", help="Claude CLI path (required unless --dry-run)")
+    parser.add_argument("--registry", help="cross-day registry path (default <out>/registry.json)")
+    parser.add_argument("--per-triage-session-usd", type=float, default=0.25)
+    parser.add_argument("--max-daily-triage-liability-usd", type=float, default=20.0)
+    parser.add_argument("--hidden-sentinel", action="append", default=[])
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="collect + adapt sources only; no acquisition, no license/triage spend",
+    )
+    parser.set_defaults(handler=_cmd_source_daily)
+
+
+def _cmd_source_daily(args: argparse.Namespace) -> int:
+    from . import (
+        daily_orchestrator,
+        source_acquisition,
+        source_intake,
+        source_review_session,
+    )
+
+    feeds = source_intake.load_feed_config(args.feeds)
+    result = source_intake.collect(feeds)
+    sources = daily_orchestrator.sources_from_intake([item.to_dict() for item in result.items])
+    if args.dry_run:
+        _print_json(
+            {
+                "collected_items": len(result.items),
+                "fetchable_sources": len(sources),
+                "feed_errors": result.feed_errors,
+                "intake_id": result.intake_id,
+            }
+        )
+        return 0 if not result.has_errors else 8
+    if not args.model or not args.claude_executable:
+        print(f"{PROG}: error: --model and --claude-executable are required without --dry-run", file=sys.stderr)
+        return 2
+    provider_env = {
+        name: os.environ[name]
+        for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+        if name in os.environ
+    }
+    out_root = Path(args.out)
+    hidden = list(args.hidden_sentinel)
+
+    def make_runner(acquisition):
+        return source_review_session.build_review_runner(
+            frozen_source_path=acquisition["frozen_path"],
+            claude_executable=args.claude_executable,
+            provider_env=provider_env,
+            model=args.model,
+            out=out_root / "reviews" / str(acquisition["source_id"]),
+            hidden_sentinels=hidden,
+        )
+
+    receipt = daily_orchestrator.run_daily(
+        day=args.day,
+        sources=sources,
+        out=out_root,
+        fetcher=source_acquisition.bounded_https_fetcher,
+        make_review_runner=make_runner,
+        make_adjudicator_runner=make_runner,
+        registry_path=args.registry,
+        per_triage_session_usd=args.per_triage_session_usd,
+        max_daily_triage_liability_usd=args.max_daily_triage_liability_usd,
+    )
+    _print_json(
+        {
+            "day": receipt["day"],
+            "source_count": receipt["source_count"],
+            "status_counts": receipt["status_counts"],
+            "admitted_count": receipt["admitted_count"],
+            "total_triage_liability_usd": receipt["total_triage_liability_usd"],
+            "candidate_manifest": receipt["candidate_manifest"],
+            "candidate_manifest_digest": receipt["candidate_manifest_digest"],
+        }
+    )
+    return 0
 
 
 def _add_intervention_study(sub: argparse._SubParsersAction) -> None:
