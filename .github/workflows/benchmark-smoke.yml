@@ -421,7 +421,7 @@ jobs:
           echo "evidence_label=$evidence_label" >> "$GITHUB_OUTPUT"
 
       - name: Upload the plan and the preflight receipts
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: preflight-${{ inputs.integration }}
@@ -526,7 +526,7 @@ jobs:
           fi
 
       - name: Upload the shareable control evidence only
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         # Never publish a partial control pair: if either control or the
         # share-bundle guard fails, the evidence remains on the runner.
         if: success()
@@ -660,7 +660,7 @@ jobs:
           echo "::notice::a single smoke rollout supports case diagnosis only; the report renderer rejects comparative claims at R0"
 
       - name: Upload the shareable normalized evidence only
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: success()
         with:
           name: agent-evidence-oragentbench
@@ -757,7 +757,7 @@ jobs:
           echo "::notice::a run against the public dataset is an integration test, not a leaderboard score"
 
       - name: Upload the sanitized receipt only
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: agent-receipt-frontieror
