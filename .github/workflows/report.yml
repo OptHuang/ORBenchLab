@@ -198,7 +198,7 @@ jobs:
 
       - name: Upload the rendered reports
         if: steps.select.outputs.have_input == 'true'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: reports
           path: out/reports
